@@ -119,25 +119,33 @@ pub async fn extract_links(input_url: &str) -> Result<ExtractedMediaMetadata> {
 }
 
 fn parse_reddit_video(vid: &Value, post_data: &Value) -> Option<MediaItem> {
-    let has_audio = vid.get("has_audio").and_then(|b| b.as_bool()).unwrap_or(false);
+    let has_audio = vid.get("has_audio").and_then(|b| b.as_bool()).unwrap_or(true);
     let fallback_url = vid.get("fallback_url").and_then(|u| u.as_str())?;
-    let hls_url = vid.get("hls_url").and_then(|u| u.as_str());
 
-    let clean_fallback = fallback_url.split('?').next().unwrap_or(fallback_url);
+    let (url_path, query_params) = match fallback_url.split_once('?') {
+        Some((path, query)) => (path, format!("?{query}")),
+        None => (fallback_url, String::new()),
+    };
 
-    // If HLS is absent but audio exists, target the DASH 128kbps audio channel
-    let audio_url = if has_audio && hls_url.is_none() {
-        clean_fallback.rsplit_once('/').map(|(base, _)| format!("{base}/DASH_AUDIO_128.mp4"))
+    let audio_url = if has_audio {
+        url_path.rsplit_once('/').map(|(base, filename)| {
+            // Detect if video is CMAF or DASH
+            let audio_file = if filename.starts_with("CMAF_") {
+                "CMAF_AUDIO_128.mp4"
+            } else {
+                "DASH_AUDIO_128.mp4"
+            };
+            format!("{base}/{audio_file}{query_params}")
+        })
     } else {
         None
     };
 
-    let high_res_url = hls_url.unwrap_or(fallback_url);
-    let thumbnail_url = extract_preview_thumbnail(post_data).unwrap_or_else(|| clean_fallback.to_string());
+    let thumbnail_url = extract_preview_thumbnail(post_data).unwrap_or_else(|| fallback_url.to_string());
 
     Some(MediaItem {
         media_type: MediaType::Video,
-        high_res_url: clean_url_str(high_res_url),
+        high_res_url: clean_url_str(fallback_url),
         audio_url,
         thumbnail_url: clean_url_str(&thumbnail_url),
     })
