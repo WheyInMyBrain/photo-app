@@ -1,0 +1,15 @@
+/* frontend/src/app.css */
+@import "tailwindcss";
+
+:root {
+	color-scheme: dark;
+}
+
+body {
+	background-color: #0b0c10;
+	color: #e0e2ec;
+	font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+	margin: 0;
+	padding: 0;
+	overflow-x: hidden;
+}

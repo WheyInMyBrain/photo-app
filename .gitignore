@@ -1,0 +1,51 @@
+# ==========================================
+# Rust & Cargo
+# ==========================================
+# Root and crate build targets (Cargo workspaces output to root target/)
+target/
+backend/target/
+crates/**/target/
+**/*.rs.bk
+
+# ==========================================
+# Node / Svelte / Vite
+# ==========================================
+node_modules/
+frontend/node_modules/
+frontend/.svelte-kit/
+frontend/build/
+frontend/dist/
+frontend/.vite/
+frontend/src/app.d.ts.timestamp-*
+
+# ==========================================
+# Local storage and user data
+# ==========================================
+storage/originals/*
+storage/thumbs/*
+storage/db/*.db
+storage/db/*.db-wal
+storage/db/*.db-shm
+storage/models/**
+
+# Keep files in storage subdirectories
+!storage/**/.keep
+!storage/**/.gitkeep
+
+# ==========================================
+# Environment Variables & Secrets
+# ==========================================
+*.env
+*.env.*
+!.env.example
+
+# ==========================================
+# OS & Editor Artifacts
+# ==========================================
+.DS_Store
+Thumbs.db
+.vscode/*
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+.idea/

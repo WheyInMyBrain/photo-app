@@ -1,0 +1,6 @@
+[workspace]
+members = [
+    "backend",
+    "crates/media_downloader",
+]
+resolver = "2"
