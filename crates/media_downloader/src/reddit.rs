@@ -1,81 +1,10 @@
 use anyhow::{bail, Context, Result};
-use bytes::Bytes;
 use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, ACCEPT_LANGUAGE, USER_AGENT};
 use reqwest::Client;
 use serde_json::Value;
-use std::process::Command;
 
-use crate::models::{DownloadedAsset, DownloadedBatch, ExtractedMediaMetadata, MediaItem, MediaType};
+use crate::models::{ExtractedMediaMetadata, MediaItem, MediaType};
 
-const BROWSER_UA: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:155.0) Gecko/20100101 Firefox/155.0";
-
-// -----------------------------------------------------------------------------
-// Public Downloader Entrypoint
-// -----------------------------------------------------------------------------
-pub async fn download(input_url: &str) -> Result<DownloadedBatch> {
-    let meta = extract_links(input_url).await?;
-
-    let download_client = Client::builder()
-        .user_agent(BROWSER_UA)
-        .build()?;
-
-    let clean_caption = sanitize_caption_for_filename(&meta.caption);
-    let target_folder = format!("reddit/{}", meta.author);
-    let total_items = meta.items.len();
-
-    let mut assets = Vec::new();
-
-    for (idx, item) in meta.items.iter().enumerate() {
-        let raw_bytes: Bytes = match item.media_type {
-            MediaType::Video => {
-                // Remux via FFmpeg if audio is separate or stream is HLS
-                let video_buf = fetch_and_remux_video(&item.high_res_url, item.audio_url.as_deref(), &download_client).await?;
-                Bytes::from(video_buf)
-            }
-            MediaType::Image => {
-                let resp = download_client
-                    .get(&item.high_res_url)
-                    .send()
-                    .await
-                    .context(format!("Failed downloading image asset: {}", item.high_res_url))?;
-
-                if !resp.status().is_success() {
-                    bail!("CDN returned HTTP {} for image: {}", resp.status(), item.high_res_url);
-                }
-
-                resp.bytes().await?
-            }
-        };
-
-        let ext = match item.media_type {
-            MediaType::Video => "mp4",
-            MediaType::Image => "jpg",
-        };
-
-        let file_name = if total_items > 1 {
-            format!("{}_{}.{}", clean_caption, idx + 1, ext)
-        } else {
-            format!("{}.{}", clean_caption, ext)
-        };
-
-        assets.push(DownloadedAsset {
-            file_name,
-            bytes: raw_bytes,
-        });
-    }
-
-    Ok(DownloadedBatch {
-        platform: meta.platform,
-        author: meta.author,
-        caption: meta.caption,
-        target_folder,
-        assets,
-    })
-}
-
-// -----------------------------------------------------------------------------
-// Link Extraction
-// -----------------------------------------------------------------------------
 pub async fn extract_links(input_url: &str) -> Result<ExtractedMediaMetadata> {
     let mut headers = HeaderMap::new();
     headers.insert(
@@ -142,7 +71,11 @@ pub async fn extract_links(input_url: &str) -> Result<ExtractedMediaMetadata> {
     }
 
     // 2. Galleries (media_metadata)
-    if let Some(gallery_items) = post_data.get("gallery_data").and_then(|g| g.get("items")).and_then(|i| i.as_array()) {
+    if let Some(gallery_items) = post_data
+        .get("gallery_data")
+        .and_then(|g| g.get("items"))
+        .and_then(|i| i.as_array())
+    {
         if let Some(metadata) = post_data.get("media_metadata") {
             for item in gallery_items {
                 if let Some(media_id) = item.get("media_id").and_then(|id| id.as_str()) {
@@ -185,9 +118,6 @@ pub async fn extract_links(input_url: &str) -> Result<ExtractedMediaMetadata> {
     })
 }
 
-// -----------------------------------------------------------------------------
-// Parsers
-// -----------------------------------------------------------------------------
 fn parse_reddit_video(vid: &Value, post_data: &Value) -> Option<MediaItem> {
     let has_audio = vid.get("has_audio").and_then(|b| b.as_bool()).unwrap_or(false);
     let fallback_url = vid.get("fallback_url").and_then(|u| u.as_str())?;
@@ -202,7 +132,6 @@ fn parse_reddit_video(vid: &Value, post_data: &Value) -> Option<MediaItem> {
         None
     };
 
-    // Prefer HLS master playlist for video+audio sync
     let high_res_url = hls_url.unwrap_or(fallback_url);
     let thumbnail_url = extract_preview_thumbnail(post_data).unwrap_or_else(|| clean_fallback.to_string());
 
@@ -222,7 +151,6 @@ fn parse_reddit_gallery_node(media_obj: &Value) -> Option<MediaItem> {
         .and_then(|p| p.get("u"))
         .and_then(|u| u.as_str());
 
-    // 1. Video / GIF item in gallery
     if let Some(mp4) = media_obj.get("s").and_then(|s| s.get("mp4")).and_then(|u| u.as_str()) {
         return Some(MediaItem {
             media_type: MediaType::Video,
@@ -232,7 +160,6 @@ fn parse_reddit_gallery_node(media_obj: &Value) -> Option<MediaItem> {
         });
     }
 
-    // 2. Photo item in gallery
     if let Some(img) = media_obj.get("s").and_then(|s| s.get("u")).and_then(|u| u.as_str()) {
         return Some(MediaItem {
             media_type: MediaType::Image,
@@ -260,85 +187,6 @@ fn extract_preview_thumbnail(post_data: &Value) -> Option<String> {
         .and_then(|s| s.get("url"))
         .and_then(|u| u.as_str())
         .map(|s| s.to_string())
-}
-
-// -----------------------------------------------------------------------------
-// In-Memory Video Remuxing via FFmpeg
-// -----------------------------------------------------------------------------
-async fn fetch_and_remux_video(
-    video_url: &str,
-    audio_url: Option<&str>,
-    client: &Client,
-) -> Result<Vec<u8>> {
-    // Case 1: Master HLS Stream (.m3u8)
-    if video_url.contains(".m3u8") {
-        let output = Command::new("ffmpeg")
-            .args([
-                "-y",
-                "-user_agent", BROWSER_UA,
-                "-i", video_url,
-                "-c", "copy",
-                "-bsf:a", "aac_adtstoasc",
-                "-movflags", "frag_keyframe+empty_moov",
-                "-f", "mp4",
-                "pipe:1",
-            ])
-            .output()
-            .context("Failed executing ffmpeg for HLS stream")?;
-
-        if !output.status.success() {
-            bail!("ffmpeg HLS remux failed: {}", String::from_utf8_lossy(&output.stderr));
-        }
-
-        return Ok(output.stdout);
-    }
-
-    // Case 2: Split DASH streams (separate video + audio inputs over network)
-    if let Some(audio) = audio_url {
-        let output = Command::new("ffmpeg")
-            .args([
-                "-y",
-                "-user_agent", BROWSER_UA,
-                "-i", video_url,
-                "-i", audio,
-                "-c", "copy",
-                "-movflags", "frag_keyframe+empty_moov",
-                "-f", "mp4",
-                "pipe:1",
-            ])
-            .output()
-            .context("Failed executing ffmpeg for split DASH streams")?;
-
-        if output.status.success() {
-            return Ok(output.stdout);
-        }
-    }
-
-    // Case 3: Silent or standalone direct video stream
-    let resp = client.get(video_url).send().await?;
-    if !resp.status().is_success() {
-        bail!("Failed to download direct video stream with HTTP {}", resp.status());
-    }
-
-    Ok(resp.bytes().await?.to_vec())
-}
-
-// -----------------------------------------------------------------------------
-// Utilities
-// -----------------------------------------------------------------------------
-fn sanitize_caption_for_filename(caption: &str) -> String {
-    let clean: String = caption
-        .chars()
-        .take(30)
-        .map(|c| if c.is_alphanumeric() { c } else { '_' })
-        .collect();
-
-    let trimmed = clean.trim_matches('_');
-    if trimmed.is_empty() {
-        "post".to_string()
-    } else {
-        trimmed.to_lowercase()
-    }
 }
 
 fn clean_url_str(raw: &str) -> String {

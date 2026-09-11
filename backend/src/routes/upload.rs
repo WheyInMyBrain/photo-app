@@ -4,7 +4,6 @@ use axum::{
     http::HeaderMap,
     response::Json,
 };
-use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::path::Path;
 use tokio::fs::{create_dir_all, File};
@@ -13,7 +12,7 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::db::AssetRepo;
-use crate::domain::upload::{BatchUploadReceipt, UploadItemResult}; 
+use crate::domain::upload::{StagedFile, BatchUploadReceipt, UploadItemResult, InspectLinkRequest, InspectResult, InspectLinkResponse, CandidateItem, CommitLinkRequest, RawUploadQuery}; 
 use crate::error::AppError;
 use crate::services::queue::ProcessJob;
 use crate::services::storage::StorageService;
@@ -22,11 +21,6 @@ use crate::AppState;
 // ==========================================
 // 1. FRONTEND HANDLER (Multipart Form-Data)
 // ==========================================
-
-struct StagedFile {
-    file_name: String,
-    bytes: Bytes,
-}
 
 pub async fn upload_photo(
     State(state): State<AppState>,
@@ -235,14 +229,6 @@ fn detect_extension_from_magic_bytes(bytes: &[u8]) -> Option<&'static str> {
     None
 }
 
-#[derive(Deserialize)]
-pub struct RawUploadQuery {
-    pub folder: Option<String>,
-    pub is_private: Option<bool>,
-    pub file_name: Option<String>,
-    pub ext: Option<String>,
-}
-
 pub async fn upload_raw_binary(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -357,5 +343,232 @@ pub async fn upload_raw_binary(
         id: Some(asset_id),
         relative_path: Some(relative_path),
         message: None,
+    }))
+}
+
+pub async fn inspect_link(
+    State(state): State<AppState>,
+    Json(payload): Json<InspectLinkRequest>,
+) -> Result<Json<InspectResult>, AppError> {
+    let meta = media_downloader::extract_links(&payload.url)
+        .await
+        .map_err(|e| AppError::BadRequest(format!("Link inspection failed: {e}")))?;
+
+    let clean_caption: String = meta
+        .caption
+        .chars()
+        .take(30)
+        .map(|c| if c.is_alphanumeric() { c } else { '_' })
+        .collect::<String>()
+        .trim_matches('_')
+        .to_lowercase();
+
+    let prefix = if clean_caption.is_empty() { "post" } else { &clean_caption };
+    let total = meta.items.len();
+
+    let candidate_items: Vec<CandidateItem> = meta
+        .items
+        .into_iter()
+        .enumerate()
+        .map(|(idx, item)| {
+            let media_type_str = match item.media_type {
+                media_downloader::MediaType::Video => "video".to_string(),
+                media_downloader::MediaType::Image => "image".to_string(),
+            };
+
+            let ext = if media_type_str == "video" { "mp4" } else { "jpg" };
+            let suggested_filename = if total > 1 {
+                format!("{prefix}_{}.{ext}", idx + 1)
+            } else {
+                format!("{prefix}.{ext}")
+            };
+
+            CandidateItem {
+                id: format!("item_{idx}"),
+                media_type: media_type_str,
+                thumbnail_url: item.thumbnail_url,
+                high_res_url: item.high_res_url,
+                audio_url: item.audio_url,
+                suggested_filename,
+            }
+        })
+        .collect();
+
+    // Fast-path: single item skips frontend selection entirely
+    if total == 1 {
+        let commit_req = CommitLinkRequest {
+            platform: meta.platform.clone(),
+            folder: Some(format!("{}/{}", meta.platform, meta.author)),
+            is_private: true,
+            selected_items: candidate_items,
+        };
+
+        let Json(receipt) = commit_link_download(State(state), Json(commit_req)).await?;
+        return Ok(Json(InspectResult::Committed(receipt)));
+    }
+
+    // Multi-item path: return candidate thumbnails to the frontend
+    Ok(Json(InspectResult::Preview(InspectLinkResponse {
+        suggested_folder: format!("{}/{}", meta.platform, meta.author),
+        platform: meta.platform,
+        author: meta.author,
+        caption: meta.caption,
+        total_items: total,
+        items: candidate_items,
+    })))
+}
+
+/// Step 2: Directly fetches only the user-selected URLs from CDNs and runs the ingestion pipeline
+pub async fn commit_link_download(
+    State(state): State<AppState>,
+    Json(payload): Json<CommitLinkRequest>,
+) -> Result<Json<BatchUploadReceipt>, AppError> {
+    if payload.selected_items.is_empty() {
+        return Err(AppError::BadRequest("No items selected for download".to_string()));
+    }
+
+    // 1. Resolve folder path (custom override or fallback to "{platform}")
+    let raw_folder = payload.folder.unwrap_or(payload.platform);
+    let sanitized_folder = StorageService::sanitize_folder_path(&raw_folder);
+    let target_dir = StorageService::resolve_upload_dir(
+        &state.config.storage_root,
+        payload.is_private,
+        &sanitized_folder,
+    );
+
+    if let Err(e) = create_dir_all(&target_dir).await {
+        return Err(AppError::Internal(format!("Failed to create storage path: {e}")));
+    }
+
+    let mut results = Vec::new();
+
+    // 2. Download each chosen URL via unified downloader
+    for item in payload.selected_items {
+        let bytes = match media_downloader::download_asset(
+            &item.high_res_url,
+            item.audio_url.as_deref(),
+            &item.media_type,
+        )
+        .await
+        {
+            Ok(b) => b,
+            Err(e) => {
+                results.push(UploadItemResult {
+                    file_name: item.suggested_filename,
+                    status: "error".to_string(),
+                    id: None,
+                    relative_path: None,
+                    message: Some(format!("Asset download failed: {e}")),
+                });
+                continue;
+            }
+        };
+
+        let bytes_len = bytes.len() as i64;
+
+        // Duplicate check via SHA-256
+        let mut hasher = Sha256::new();
+        hasher.update(&bytes);
+        let sha256_hash = hex::encode(hasher.finalize());
+
+        match AssetRepo::find_id_by_sha256(&state.db, &sha256_hash).await {
+            Ok(Some(existing_id)) => {
+                warn!(file = %item.suggested_filename, id = %existing_id, "Skipping duplicate");
+                results.push(UploadItemResult {
+                    file_name: item.suggested_filename,
+                    status: "duplicate".to_string(),
+                    id: Some(existing_id),
+                    relative_path: None,
+                    message: Some("File with identical checksum already exists".to_string()),
+                });
+                continue;
+            }
+            Err(e) => {
+                results.push(UploadItemResult {
+                    file_name: item.suggested_filename,
+                    status: "error".to_string(),
+                    id: None,
+                    relative_path: None,
+                    message: Some(format!("Duplicate check error: {e}")),
+                });
+                continue;
+            }
+            Ok(None) => {}
+        }
+
+        // Commit file to disk
+        let asset_id = Uuid::new_v4().to_string();
+        let destination_path = target_dir.join(&item.suggested_filename);
+
+        let mut file = match File::create(&destination_path).await {
+            Ok(f) => f,
+            Err(e) => {
+                results.push(UploadItemResult {
+                    file_name: item.suggested_filename,
+                    status: "error".to_string(),
+                    id: None,
+                    relative_path: None,
+                    message: Some(format!("Disk write failure: {e}")),
+                });
+                continue;
+            }
+        };
+
+        if let Err(e) = file.write_all(&bytes).await {
+            results.push(UploadItemResult {
+                file_name: item.suggested_filename,
+                status: "error".to_string(),
+                id: None,
+                relative_path: None,
+                message: Some(format!("Buffer write failure: {e}")),
+            });
+            continue;
+        }
+
+        let relative_path = format!("{}/{}", sanitized_folder, item.suggested_filename);
+
+        // Queue for background ML processing
+        let enqueued = state
+            .job_sender
+            .send(ProcessJob {
+                asset_id: asset_id.clone(),
+                file_name: item.suggested_filename.clone(),
+                rel_path: relative_path.clone(),
+                folder_path: sanitized_folder.clone(),
+                disk_path: destination_path,
+                sha256: sha256_hash,
+                file_size_bytes: bytes_len,
+                is_private: payload.is_private,
+            })
+            .await;
+
+        if let Err(e) = enqueued {
+            results.push(UploadItemResult {
+                file_name: item.suggested_filename,
+                status: "error".to_string(),
+                id: None,
+                relative_path: None,
+                message: Some(format!("Background pipeline refused job: {e}")),
+            });
+            continue;
+        }
+
+        info!(id = %asset_id, file = %item.suggested_filename, "Media enqueued successfully");
+        results.push(UploadItemResult {
+            file_name: item.suggested_filename,
+            status: "queued".to_string(),
+            id: Some(asset_id),
+            relative_path: Some(relative_path),
+            message: None,
+        });
+    }
+
+    let success_count = results.iter().filter(|r| r.status == "queued").count();
+
+    Ok(Json(BatchUploadReceipt {
+        total_uploaded: success_count,
+        folder: sanitized_folder,
+        is_private: payload.is_private,
+        items: results,
     }))
 }

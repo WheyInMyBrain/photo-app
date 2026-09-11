@@ -23,6 +23,7 @@ frontend/src/app.d.ts.timestamp-*
 # ==========================================
 storage/originals/*
 storage/thumbs/*
+storage/db/**
 storage/db/*.db
 storage/db/*.db-wal
 storage/db/*.db-shm

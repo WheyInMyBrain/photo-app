@@ -1,4 +1,11 @@
-use serde::Serialize;
+use axum::body::Bytes;
+use serde::{Deserialize, Serialize};
+
+#[derive(Clone, Debug)]
+pub struct StagedFile {
+    pub file_name: String,
+    pub bytes: Bytes,
+}
 
 #[derive(Serialize, Clone, Debug)]
 pub struct UploadItemResult {
@@ -15,4 +22,57 @@ pub struct BatchUploadReceipt {
     pub folder: String,
     pub is_private: bool,
     pub items: Vec<UploadItemResult>,
+}
+
+#[derive(Deserialize)]
+pub struct RawUploadQuery {
+    pub folder: Option<String>,
+    pub is_private: Option<bool>,
+    pub file_name: Option<String>,
+    pub ext: Option<String>,
+}
+
+#[derive(Deserialize, Debug)]
+pub struct InspectLinkRequest {
+    pub url: String,
+}
+
+#[derive(Serialize, Debug)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum InspectResult {
+    Committed(BatchUploadReceipt),
+    Preview(InspectLinkResponse),
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct CandidateItem {
+    pub id: String,                    // Stable identifier (e.g. "item_0", "item_1")
+    pub media_type: String,            // "image" | "video"
+    pub thumbnail_url: String,         // Lightweight image for frontend UI
+    pub high_res_url: String,          // CDN master payload
+    pub audio_url: Option<String>,     // Present only for split DASH Reddit videos
+    pub suggested_filename: String,    // e.g. "caption_slug_1.jpg" or ".mp4"
+}
+
+#[derive(Serialize, Debug)]
+pub struct InspectLinkResponse {
+    pub platform: String,              // "instagram" | "reddit"
+    pub author: String,
+    pub caption: String,
+    pub suggested_folder: String,      // e.g. "instagram/riya.arora_official"
+    pub total_items: usize,
+    pub items: Vec<CandidateItem>,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+#[derive(Deserialize, Debug)]
+pub struct CommitLinkRequest {
+    pub platform: String,
+    pub folder: Option<String>,        // If omitted, defaults to "{platform}/{author}"
+    #[serde(default = "default_true")]
+    pub is_private: bool,
+    pub selected_items: Vec<CandidateItem>,
 }

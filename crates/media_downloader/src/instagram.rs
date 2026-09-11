@@ -1,71 +1,15 @@
 use anyhow::{bail, Context, Result};
-use bytes::Bytes;
 use reqwest::header::{HeaderMap, HeaderValue, COOKIE, USER_AGENT};
 use reqwest::Client;
 use serde_json::Value;
 
-use crate::models::{DownloadedAsset, DownloadedBatch, ExtractedMediaMetadata, MediaItem, MediaType};
+use crate::models::{ExtractedMediaMetadata, MediaItem, MediaType};
 
 const BROWSER_UA: &str = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:155.0) Gecko/20100101 Firefox/155.0";
 const APP_ID: &str = "936619743392459";
 
 // -----------------------------------------------------------------------------
-// Public Downloader Entrypoint
-// -----------------------------------------------------------------------------
-pub async fn download(input_url: &str) -> Result<DownloadedBatch> {
-    let meta = extract_links(input_url).await?;
-
-    let download_client = Client::builder()
-        .user_agent(BROWSER_UA)
-        .build()?;
-
-    let clean_caption = sanitize_caption_for_filename(&meta.caption);
-    let target_folder = format!("instagram/{}", meta.author);
-    let total_items = meta.items.len();
-
-    let mut assets = Vec::new();
-
-    for (idx, item) in meta.items.iter().enumerate() {
-        let resp = download_client
-            .get(&item.high_res_url)
-            .send()
-            .await
-            .context(format!("Failed to stream high-res media from {}", item.high_res_url))?;
-
-        if !resp.status().is_success() {
-            bail!("CDN rejected asset download with HTTP {}", resp.status());
-        }
-
-        let raw_bytes: Bytes = resp.bytes().await?;
-
-        let ext = match item.media_type {
-            MediaType::Video => "mp4",
-            MediaType::Image => "jpg",
-        };
-
-        let file_name = if total_items > 1 {
-            format!("{}_{}.{}", clean_caption, idx + 1, ext)
-        } else {
-            format!("{}.{}", clean_caption, ext)
-        };
-
-        assets.push(DownloadedAsset {
-            file_name,
-            bytes: raw_bytes,
-        });
-    }
-
-    Ok(DownloadedBatch {
-        platform: meta.platform,
-        author: meta.author,
-        caption: meta.caption,
-        target_folder,
-        assets,
-    })
-}
-
-// -----------------------------------------------------------------------------
-// Link Resolution
+// Link Resolution Entrypoint
 // -----------------------------------------------------------------------------
 pub async fn extract_links(input_url: &str) -> Result<ExtractedMediaMetadata> {
     let cookie = std::env::var("IG_COOKIE").context("Missing IG_COOKIE in .env")?;
@@ -80,6 +24,9 @@ pub async fn extract_links(input_url: &str) -> Result<ExtractedMediaMetadata> {
     }
 }
 
+// -----------------------------------------------------------------------------
+// Stories Link Extraction
+// -----------------------------------------------------------------------------
 async fn extract_story_links(input_url: &str, client: &Client) -> Result<ExtractedMediaMetadata> {
     let clean = input_url.split('?').next().unwrap_or(input_url).trim_matches('/');
     let segments: Vec<&str> = clean.split('/').collect();
@@ -131,14 +78,19 @@ async fn extract_story_links(input_url: &str, client: &Client) -> Result<Extract
         }
     }
 
+    let now = chrono::Local::now().format("%Y-%m-%d %H-%M-%S");
+
     Ok(ExtractedMediaMetadata {
         platform: "instagram".to_string(),
         author: username.to_string(),
-        caption: format!("Stories from @{username}"),
+        caption: format!("Stories from @{username} at {now}"),
         items,
     })
 }
 
+// -----------------------------------------------------------------------------
+// Feed & Reels Link Extraction
+// -----------------------------------------------------------------------------
 async fn extract_feed_links(input_url: &str, client: &Client) -> Result<ExtractedMediaMetadata> {
     let shortcode = extract_shortcode(input_url).context("Could not extract Instagram shortcode")?;
     let media_id = shortcode_to_id(shortcode)?;
@@ -190,6 +142,9 @@ async fn extract_feed_links(input_url: &str, client: &Client) -> Result<Extracte
     })
 }
 
+// -----------------------------------------------------------------------------
+// Direct Single Story Item Lookup
+// -----------------------------------------------------------------------------
 async fn extract_direct_pk_links(media_pk: &str, username: &str, client: &Client) -> Result<ExtractedMediaMetadata> {
     let info_url = format!("https://www.instagram.com/api/v1/media/{media_pk}/info/");
     let resp = client.get(&info_url).send().await?;
@@ -213,6 +168,9 @@ async fn extract_direct_pk_links(media_pk: &str, username: &str, client: &Client
     })
 }
 
+// -----------------------------------------------------------------------------
+// Parser
+// -----------------------------------------------------------------------------
 fn parse_media_item(item: &Value) -> Option<MediaItem> {
     let media_type = item.get("media_type").and_then(|t| t.as_i64()).unwrap_or(1);
 
@@ -240,7 +198,7 @@ fn parse_media_item(item: &Value) -> Option<MediaItem> {
         Some(MediaItem {
             media_type: MediaType::Video,
             high_res_url: clean_url(high_res),
-            audio_url: None,
+            audio_url: None, // Instagram embeds audio in the multiplexed video stream
             thumbnail_url,
         })
     } else {
@@ -255,6 +213,9 @@ fn parse_media_item(item: &Value) -> Option<MediaItem> {
     }
 }
 
+// -----------------------------------------------------------------------------
+// Numeric ID Resolver
+// -----------------------------------------------------------------------------
 async fn resolve_numeric_user_id(username: &str, client: &Client) -> Result<String> {
     // Strategy 1: TopSearch API
     let search_url = format!("https://www.instagram.com/api/v1/web/search/topsearch/?query={username}");
@@ -327,21 +288,6 @@ async fn resolve_numeric_user_id(username: &str, client: &Client) -> Result<Stri
 // -----------------------------------------------------------------------------
 // Utilities
 // -----------------------------------------------------------------------------
-fn sanitize_caption_for_filename(caption: &str) -> String {
-    let clean: String = caption
-        .chars()
-        .take(30)
-        .map(|c| if c.is_alphanumeric() { c } else { '_' })
-        .collect();
-
-    let trimmed = clean.trim_matches('_');
-    if trimmed.is_empty() {
-        "post".to_string()
-    } else {
-        trimmed.to_lowercase()
-    }
-}
-
 fn clean_url(raw: &str) -> String {
     raw.replace(r"\/", "/").replace(r"\u0026", "&")
 }

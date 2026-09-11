@@ -93,6 +93,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // Upload
         .route("/api/upload", post(routes::upload::upload_photo))
+        .route("/api/upload/inspect", post(routes::upload::inspect_link))
+        .route("/api/upload/commit", post(routes::upload::commit_link_download))
 
         // Folder Structure
         .route("/api/albums", get(routes::albums::get_album_contents))

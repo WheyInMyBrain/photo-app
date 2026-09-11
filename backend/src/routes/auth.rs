@@ -11,26 +11,11 @@ use argon2::{
     },
     Argon2,
 };
-use serde::{Deserialize, Serialize};
+
 use uuid::Uuid;
 
 use crate::{error::AppError, AppState};
-
-#[derive(Serialize)]
-pub struct VaultStatusResponse {
-    pub is_initialized: bool,
-    pub has_passkey: bool,
-}
-
-#[derive(Deserialize)]
-pub struct PasswordPayload {
-    pub password: String,
-}
-
-#[derive(Serialize)]
-pub struct UnlockResponse {
-    pub token: String,
-}
+use crate::domain::auth::{VaultStatusResponse, PasswordPayload, UnlockResponse, RegisterBiometricPayload};
 
 pub fn auth_routes() -> Router<AppState> {
     Router::new()
@@ -102,11 +87,6 @@ async fn unlock_password(
 
     let token = Uuid::new_v4().to_string();
     Ok(Json(UnlockResponse { token }))
-}
-
-#[derive(Deserialize)]
-pub struct RegisterBiometricPayload {
-    pub credential_id: String,
 }
 
 async fn register_biometric(

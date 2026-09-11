@@ -1,22 +1,17 @@
+pub mod downloader;
 pub mod instagram;
 pub mod models;
 pub mod reddit;
 
 use anyhow::{bail, Result};
-pub use models::{DownloadedAsset, DownloadedBatch, ExtractedMediaMetadata, MediaItem, MediaType};
+use bytes::Bytes;
 
-/// Downloads all high-resolution media from the URL directly into memory buffers
-pub async fn download_batch(url: &str) -> Result<DownloadedBatch> {
-    if url.contains("instagram.com") {
-        instagram::download(url).await
-    } else if url.contains("reddit.com") || url.contains("redd.it") {
-        reddit::download(url).await
-    } else {
-        bail!("Unsupported platform for URL: {url}");
-    }
-}
+// Re-export core models
+pub use models::{ExtractedMediaMetadata, MediaItem, MediaType};
 
-/// Resolves media links and preview thumbnails without downloading full media files
+/// ----------------------------------------------------------------------------
+/// 1. Unified Link Extractor (Instagram / Reddit)
+/// ----------------------------------------------------------------------------
 pub async fn extract_links(url: &str) -> Result<ExtractedMediaMetadata> {
     if url.contains("instagram.com") {
         instagram::extract_links(url).await
@@ -25,4 +20,15 @@ pub async fn extract_links(url: &str) -> Result<ExtractedMediaMetadata> {
     } else {
         bail!("Unsupported platform for URL: {url}");
     }
+}
+
+/// ----------------------------------------------------------------------------
+/// 2. Global Asset Downloader (Direct CDN fetch + FFmpeg remuxing)
+/// ----------------------------------------------------------------------------
+pub async fn download_asset(
+    high_res_url: &str,
+    audio_url: Option<&str>,
+    media_type: &str,
+) -> Result<Bytes> {
+    downloader::download_asset(high_res_url, audio_url, media_type).await
 }

@@ -30,3 +30,5 @@ tower-http = { version = "0.7.1", features = ["cors", "fs", "trace", "set-header
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 uuid = { version = "1.26.0", features = ["v4", "fast-rng"] }
+
+media_downloader = { path = "../crates/media_downloader" }
