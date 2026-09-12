@@ -157,49 +157,60 @@ impl AssetRepo {
     ) -> Result<DynamicFiltersResponse, sqlx::Error> {
         let privacy_level = if q.is_private.unwrap_or(false) { 1 } else { 0 };
         let show_trash = q.show_trash.unwrap_or(false);
-
-        let mut builder: QueryBuilder<Sqlite> = QueryBuilder::new(
-            "SELECT a.id FROM assets a "
-        );
-
         let fts_query = q.q.as_deref().and_then(Self::sanitize_query);
-        if fts_query.is_some() {
-            builder.push(" JOIN asset_search_index fts ON fts.asset_id = a.id ");
-        }
 
-        builder.push(" WHERE a.is_private = ");
-        builder.push_bind(privacy_level);
+        // Parse list params upfront so they can be reused across builder instantiations
+        let pids: Vec<&str> = q
+            .person_id
+            .as_deref()
+            .map(|s| s.split(',').map(|p| p.trim()).filter(|p| !p.is_empty()).collect())
+            .unwrap_or_default();
 
-        // --- TRASH SEPARATION ---
-        if show_trash {
-            builder.push(" AND a.deleted_at IS NOT NULL ");
-        } else {
-            builder.push(" AND a.deleted_at IS NULL ");
-        }
+        let tags: Vec<String> = q
+            .tag
+            .as_deref()
+            .map(|s| s.split(',').map(|t| t.trim().to_lowercase()).filter(|t| !t.is_empty()).collect())
+            .unwrap_or_default();
 
-        if let Some(ref expr) = fts_query {
-            builder.push(" AND fts.is_private = ");
-            builder.push_bind(privacy_level);
-            builder.push(" AND asset_search_index MATCH ");
-            builder.push_bind(expr);
-        }
+        // Helper to construct a fresh CTE builder since QueryBuilder cannot be cloned
+        let build_cte = || {
+            let mut builder: QueryBuilder<Sqlite> = QueryBuilder::new("WITH filtered AS (SELECT a.* FROM assets a ");
 
-        if let Some(ref m_type) = q.media_type {
-            match m_type.as_str() {
-                "photos" => { builder.push(" AND a.duration_seconds IS NULL "); }
-                "videos" => { builder.push(" AND a.duration_seconds IS NOT NULL "); }
-                _ => {}
+            if fts_query.is_some() {
+                builder.push(" JOIN asset_search_index fts ON fts.asset_id = a.id ");
             }
-        }
-        if let Some(fav) = q.is_favorite {
-            builder.push(" AND a.is_favorite = ");
-            builder.push_bind(if fav { 1 } else { 0 });
-        }
 
-        if let Some(ref pids_str) = q.person_id {
-            let pids: Vec<&str> = pids_str.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
-            let count = pids.len() as i64;
-            if count > 0 {
+            builder.push(" WHERE a.is_private = ");
+            builder.push_bind(privacy_level);
+
+            if show_trash {
+                builder.push(" AND a.deleted_at IS NOT NULL ");
+            } else {
+                builder.push(" AND a.deleted_at IS NULL ");
+            }
+
+            if let Some(ref expr) = fts_query {
+                builder.push(" AND fts.is_private = ");
+                builder.push_bind(privacy_level);
+                builder.push(" AND asset_search_index MATCH ");
+                builder.push_bind(expr);
+            }
+
+            if let Some(ref m_type) = q.media_type {
+                match m_type.as_str() {
+                    "photos" => { builder.push(" AND a.duration_seconds IS NULL "); }
+                    "videos" => { builder.push(" AND a.duration_seconds IS NOT NULL "); }
+                    _ => {}
+                }
+            }
+
+            if let Some(fav) = q.is_favorite {
+                builder.push(" AND a.is_favorite = ");
+                builder.push_bind(if fav { 1 } else { 0 });
+            }
+
+            if !pids.is_empty() {
+                let count = pids.len() as i64;
                 builder.push(" AND a.id IN (SELECT asset_id FROM asset_faces WHERE person_id IN (");
                 let mut sep = builder.separated(", ");
                 for pid in &pids { sep.push_bind(pid); }
@@ -207,12 +218,9 @@ impl AssetRepo {
                 builder.push_bind(count);
                 builder.push(") ");
             }
-        }
 
-        if let Some(ref tags_str) = q.tag {
-            let tags: Vec<String> = tags_str.split(',').map(|s| s.trim().to_lowercase()).filter(|s| !s.is_empty()).collect();
-            let count = tags.len() as i64;
-            if count > 0 {
+            if !tags.is_empty() {
+                let count = tags.len() as i64;
                 builder.push(" AND a.id IN (SELECT at.asset_id FROM asset_tags at JOIN tags t ON at.tag_id = t.id WHERE LOWER(t.name) IN (");
                 let mut sep = builder.separated(", ");
                 for t in &tags { sep.push_bind(t); }
@@ -220,59 +228,61 @@ impl AssetRepo {
                 builder.push_bind(count);
                 builder.push(") ");
             }
-        }
 
-        if let Some(ref folder) = q.folder_path {
-            builder.push(" AND a.folder_path = ");
-            builder.push_bind(folder);
-        }
-        if let Some(ref city) = q.city {
-            builder.push(" AND a.city = ");
-            builder.push_bind(city);
-        }
-        if let Some(ref model) = q.camera_model {
-            builder.push(" AND a.camera_model = ");
-            builder.push_bind(model);
-        }
-        if let Some(ref from_date) = q.from {
-            builder.push(" AND a.captured_at >= ");
-            builder.push_bind(from_date);
-        }
-        if let Some(ref to_date) = q.to {
-            builder.push(" AND a.captured_at <= ");
-            builder.push_bind(to_date);
-        }
+            if let Some(ref folder) = q.folder_path {
+                builder.push(" AND a.folder_path = ");
+                builder.push_bind(folder);
+            }
+            if let Some(ref city) = q.city {
+                builder.push(" AND a.city = ");
+                builder.push_bind(city);
+            }
+            if let Some(ref model) = q.camera_model {
+                builder.push(" AND a.camera_model = ");
+                builder.push_bind(model);
+            }
+            if let Some(ref from_date) = q.from {
+                builder.push(" AND a.captured_at >= ");
+                builder.push_bind(from_date);
+            }
+            if let Some(ref to_date) = q.to {
+                builder.push(" AND a.captured_at <= ");
+                builder.push_bind(to_date);
+            }
 
-        let matching_ids: Vec<String> = builder.build_query_scalar::<String>().fetch_all(pool).await?;
+            builder.push(") ");
+            builder
+        };
 
-        if matching_ids.is_empty() {
-            return Ok(DynamicFiltersResponse::default());
-        }
-
-        let total_media = matching_ids.len() as i64;
-
-        let mut stats_builder: QueryBuilder<Sqlite> = QueryBuilder::new(
+        // 1. Primary counts and date bounds
+        let mut stats_builder = build_cte();
+        stats_builder.push(
             r#"
             SELECT 
+                COUNT(*) as total_count,
                 COUNT(CASE WHEN duration_seconds IS NULL THEN 1 END) as p_count,
                 COUNT(CASE WHEN duration_seconds IS NOT NULL THEN 1 END) as v_count,
                 MIN(captured_at) as min_d, 
                 MAX(captured_at) as max_d 
-            FROM assets 
-            WHERE id IN (
+            FROM filtered
             "#
         );
-        let mut sep = stats_builder.separated(", ");
-        for id in &matching_ids { sep.push_bind(id); }
-        sep.push_unseparated(")");
 
         let stats_row = stats_builder.build().fetch_one(pool).await?;
+        let total_media: i64 = stats_row.try_get("total_count").unwrap_or(0);
+
+        if total_media == 0 {
+            return Ok(DynamicFiltersResponse::default());
+        }
+
         let photos_count: i64 = stats_row.try_get("p_count").unwrap_or(0);
         let videos_count: i64 = stats_row.try_get("v_count").unwrap_or(0);
         let min_date: Option<String> = stats_row.try_get("min_d").ok();
         let max_date: Option<String> = stats_row.try_get("max_d").ok();
 
-        let mut tod_builder: QueryBuilder<Sqlite> = QueryBuilder::new(
+        // 2. Times of day breakdown
+        let mut tod_builder = build_cte();
+        tod_builder.push(
             r#"
             SELECT 
                 CASE 
@@ -282,13 +292,12 @@ impl AssetRepo {
                     ELSE 'Night'
                 END as period,
                 COUNT(*) as count
-            FROM assets
-            WHERE hour IS NOT NULL AND id IN (
+            FROM filtered
+            WHERE hour IS NOT NULL 
+            GROUP BY period 
+            ORDER BY count DESC
             "#
         );
-        let mut sep = tod_builder.separated(", ");
-        for id in &matching_ids { sep.push_bind(id); }
-        sep.push_unseparated(") GROUP BY period ORDER BY count DESC");
 
         let times_of_day = tod_builder.build().fetch_all(pool).await?
             .into_iter()
@@ -299,17 +308,20 @@ impl AssetRepo {
             })
             .collect();
 
-        let mut people_builder: QueryBuilder<Sqlite> = QueryBuilder::new(
+        // 3. People breakdown
+        let mut people_builder = build_cte();
+        people_builder.push(
             r#"
             SELECT p.id, p.name, COUNT(DISTINCT af.asset_id) as count
             FROM asset_faces af
             JOIN persons p ON af.person_id = p.id
-            WHERE p.name IS NOT NULL AND af.asset_id IN (
+            JOIN filtered f ON af.asset_id = f.id
+            WHERE p.name IS NOT NULL
+            GROUP BY p.id 
+            ORDER BY count DESC 
+            LIMIT 30
             "#
         );
-        let mut sep = people_builder.separated(", ");
-        for id in &matching_ids { sep.push_bind(id); }
-        sep.push_unseparated(") GROUP BY p.id ORDER BY count DESC LIMIT 30");
 
         let people = people_builder.build().fetch_all(pool).await?
             .into_iter()
@@ -320,17 +332,19 @@ impl AssetRepo {
             })
             .collect();
 
-        let mut tags_builder: QueryBuilder<Sqlite> = QueryBuilder::new(
+        // 4. Tags breakdown
+        let mut tags_builder = build_cte();
+        tags_builder.push(
             r#"
             SELECT t.name, COUNT(DISTINCT at.asset_id) as count
             FROM asset_tags at
             JOIN tags t ON at.tag_id = t.id
-            WHERE at.asset_id IN (
+            JOIN filtered f ON at.asset_id = f.id
+            GROUP BY t.id 
+            ORDER BY count DESC 
+            LIMIT 40
             "#
         );
-        let mut sep = tags_builder.separated(", ");
-        for id in &matching_ids { sep.push_bind(id); }
-        sep.push_unseparated(") GROUP BY t.id ORDER BY count DESC LIMIT 40");
 
         let tags = tags_builder.build().fetch_all(pool).await?
             .into_iter()
@@ -341,12 +355,18 @@ impl AssetRepo {
             })
             .collect();
 
-        let mut loc_builder: QueryBuilder<Sqlite> = QueryBuilder::new(
-            "SELECT city, COUNT(*) as count FROM assets WHERE city IS NOT NULL AND id IN ("
+        // 5. Locations breakdown
+        let mut loc_builder = build_cte();
+        loc_builder.push(
+            r#"
+            SELECT city, COUNT(*) as count 
+            FROM filtered 
+            WHERE city IS NOT NULL 
+            GROUP BY city 
+            ORDER BY count DESC 
+            LIMIT 20
+            "#
         );
-        let mut sep = loc_builder.separated(", ");
-        for id in &matching_ids { sep.push_bind(id); }
-        sep.push_unseparated(") GROUP BY city ORDER BY count DESC LIMIT 20");
 
         let locations = loc_builder.build().fetch_all(pool).await?
             .into_iter()
@@ -357,12 +377,18 @@ impl AssetRepo {
             })
             .collect();
 
-        let mut cam_builder: QueryBuilder<Sqlite> = QueryBuilder::new(
-            "SELECT camera_model, COUNT(*) as count FROM assets WHERE camera_model IS NOT NULL AND id IN ("
+        // 6. Cameras breakdown
+        let mut cam_builder = build_cte();
+        cam_builder.push(
+            r#"
+            SELECT camera_model, COUNT(*) as count 
+            FROM filtered 
+            WHERE camera_model IS NOT NULL 
+            GROUP BY camera_model 
+            ORDER BY count DESC 
+            LIMIT 15
+            "#
         );
-        let mut sep = cam_builder.separated(", ");
-        for id in &matching_ids { sep.push_bind(id); }
-        sep.push_unseparated(") GROUP BY camera_model ORDER BY count DESC LIMIT 15");
 
         let cameras = cam_builder.build().fetch_all(pool).await?
             .into_iter()
@@ -373,12 +399,18 @@ impl AssetRepo {
             })
             .collect();
 
-        let mut album_builder: QueryBuilder<Sqlite> = QueryBuilder::new(
-            "SELECT folder_path, COUNT(*) as count FROM assets WHERE folder_path IS NOT NULL AND folder_path != 'root' AND id IN ("
+        // 7. Folders / Albums breakdown
+        let mut album_builder = build_cte();
+        album_builder.push(
+            r#"
+            SELECT folder_path, COUNT(*) as count 
+            FROM filtered 
+            WHERE folder_path IS NOT NULL AND folder_path != 'root' 
+            GROUP BY folder_path 
+            ORDER BY count DESC 
+            LIMIT 20
+            "#
         );
-        let mut sep = album_builder.separated(", ");
-        for id in &matching_ids { sep.push_bind(id); }
-        sep.push_unseparated(") GROUP BY folder_path ORDER BY count DESC LIMIT 20");
 
         let albums = album_builder.build().fetch_all(pool).await?
             .into_iter()

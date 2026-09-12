@@ -6,8 +6,9 @@ use axum::{
 };
 use sha2::{Digest, Sha256};
 use std::path::Path;
+use std::io::SeekFrom;
 use tokio::fs::{create_dir_all, File, OpenOptions};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tracing::{info, warn};
 use uuid::Uuid;
 
@@ -574,7 +575,7 @@ pub async fn commit_link_download(
 }
 
 /// POST /api/upload/chunk
-/// Accepts raw byte slices (e.g. 20MB) and appends them to a temporary file
+/// Writes a byte slice directly to its calculated byte offset in the staging file
 pub async fn upload_chunk(
     State(state): State<AppState>,
     Query(query): Query<ChunkUploadQuery>,
@@ -591,22 +592,30 @@ pub async fn upload_chunk(
 
     let part_path = temp_dir.join(format!("{}.part", query.upload_id));
 
+    // Open with write permissions (NOT append) so we can seek arbitrarily
     let mut file = OpenOptions::new()
         .create(true)
-        .append(true)
+        .write(true)
         .open(&part_path)
         .await
         .map_err(|e| AppError::Internal(format!("Failed to open chunk file: {}", e)))?;
 
+    // Determine target byte offset: chunk_index * standard_chunk_size
+    let offset = (query.chunk_index as u64) * query.chunk_size;
+    file.seek(SeekFrom::Start(offset))
+        .await
+        .map_err(|e| AppError::Internal(format!("Failed to seek to byte offset {}: {}", offset, e)))?;
+
     file.write_all(&body)
         .await
-        .map_err(|e| AppError::Internal(format!("Failed appending chunk bytes: {}", e)))?;
-    
+        .map_err(|e| AppError::Internal(format!("Failed writing chunk bytes at offset {}: {}", offset, e)))?;
+
     tracing::debug!(
         upload_id = %query.upload_id,
         part = query.chunk_index + 1,
         total = query.total_chunks,
-        "Received chunk"
+        offset = offset,
+        "Received and aligned chunk"
     );
 
     Ok(Json(ChunkUploadResponse {
@@ -618,6 +627,8 @@ pub async fn upload_chunk(
 
 /// POST /api/upload/chunk/finalize
 /// Stitches everything, runs checksum, checks duplicate, moves to vault, and enqueues worker
+/// POST /api/upload/chunk/finalize
+/// Streams file from disk in 64KB blocks to hash, checks duplicates, moves to vault, and enqueues worker
 pub async fn finalize_chunk(
     State(state): State<AppState>,
     Query(query): Query<FinalizeChunkQuery>,
@@ -629,18 +640,39 @@ pub async fn finalize_chunk(
         return Err(AppError::NotFound("Temporary chunk file not found".into()));
     }
 
-    // Read full stitched buffer
-    let file_bytes = tokio::fs::read(&part_path)
+    // 1. Open file and retrieve total size without loading it into RAM
+    let mut file_to_hash = File::open(&part_path)
         .await
-        .map_err(|e| AppError::Internal(format!("Failed to read assembled file: {}", e)))?;
+        .map_err(|e| AppError::Internal(format!("Failed opening part file: {}", e)))?;
 
-    let bytes_len = file_bytes.len() as i64;
+    let metadata = file_to_hash
+        .metadata()
+        .await
+        .map_err(|e| AppError::Internal(format!("Failed reading metadata: {}", e)))?;
+    let bytes_len = metadata.len() as i64;
 
-    // Checksum & Duplicate check
+    // 2. Stream-hash the file in fixed 64 KB chunks
     let mut hasher = Sha256::new();
-    hasher.update(&file_bytes);
+    let mut buffer = [0u8; 65536]; // 64 KB fixed buffer
+
+    loop {
+        let bytes_read = file_to_hash
+            .read(&mut buffer)
+            .await
+            .map_err(|e| AppError::Internal(format!("Failed streaming hash bytes: {}", e)))?;
+
+        if bytes_read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..bytes_read]);
+    }
+
+    // Explicitly drop file handle so Windows/Unix releases the open descriptor before renaming
+    drop(file_to_hash);
+
     let sha256_hash = hex::encode(hasher.finalize());
 
+    // 3. Duplicate check against existing vault database
     if let Ok(Some(existing_id)) = AssetRepo::find_id_by_sha256(&state.db, &sha256_hash).await {
         let _ = tokio::fs::remove_file(&part_path).await;
         return Ok(Json(UploadItemResult {
@@ -652,6 +684,7 @@ pub async fn finalize_chunk(
         }));
     }
 
+    // 4. Resolve destination directories
     let raw_folder = query.folder.unwrap_or_else(|| "root".to_string());
     let is_private = query.is_private.unwrap_or(false);
     let sanitized_folder = StorageService::sanitize_folder_path(&raw_folder);
@@ -668,13 +701,14 @@ pub async fn finalize_chunk(
     let asset_id = Uuid::new_v4().to_string();
     let destination_path = target_dir.join(&query.file_name);
 
-    // Atomically move from temporary chunk to final storage path
+    // 5. Atomically move from temporary chunk staging directly to vault storage
     tokio::fs::rename(&part_path, &destination_path)
         .await
         .map_err(|e| AppError::Internal(format!("Failed to move completed asset: {}", e)))?;
 
     let relative_path = format!("{}/{}", sanitized_folder, query.file_name);
 
+    // 6. Enqueue asset into background indexing pipeline
     state
         .job_sender
         .send(ProcessJob {

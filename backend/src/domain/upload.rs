@@ -81,6 +81,7 @@ pub struct CommitLinkRequest {
 pub struct ChunkUploadQuery {
     pub upload_id: String,
     pub chunk_index: u32,
+    pub chunk_size: u64,
     pub total_chunks: u32,
 }
 

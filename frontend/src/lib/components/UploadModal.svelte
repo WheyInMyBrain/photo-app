@@ -107,6 +107,7 @@
       const params = new URLSearchParams({
         upload_id: uploadId,
         chunk_index: chunkIdx.toString(),
+        chunk_size: CHUNK_SIZE_BYTES.toString(),
         total_chunks: totalChunks.toString(),
       });
 

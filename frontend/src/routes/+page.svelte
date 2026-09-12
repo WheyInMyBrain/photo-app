@@ -3,6 +3,7 @@
   import { onMount, onDestroy } from 'svelte';
   import { filterStore, filterQueryString } from '$lib/stores/filterStore';
   import PhotoModal from '$lib/components/PhotoModal.svelte';
+  import VirtualSection from '$lib/components/VirtualSection.svelte';
 
   interface SubAlbum {
     name: string;
@@ -34,7 +35,8 @@
 
   let albums: SubAlbum[] = [];
   let items: MediaItem[] = [];
-  
+  let itemIndexMap = new Map<string, number>();
+
   let groupedSections: [string, MediaItem[]][] = [];
   let groupIndexMap = new Map<string, number>();
 
@@ -49,7 +51,9 @@
   let selectedIds = new Set<string>();
   let isActionLoading = false;
 
-  $: folderSegments = $filterStore.folder_path ? $filterStore.folder_path.split('/').filter(Boolean) : [];
+  $: folderSegments = $filterStore.folder_path
+    ? $filterStore.folder_path.split('/').filter(Boolean)
+    : [];
 
   let selectedIndex: number | null = null;
   $: selectedAsset = selectedIndex !== null ? items[selectedIndex] : null;
@@ -57,7 +61,9 @@
   function getGroupHeader(dateStr: string | null): string {
     if (!dateStr) return 'Undated';
     const d = new Date(dateStr);
-    return isNaN(d.getTime()) ? 'Undated' : d.toLocaleDateString(undefined, { month: 'long', year: 'numeric' });
+    return isNaN(d.getTime())
+      ? 'Undated'
+      : d.toLocaleDateString(undefined, { month: 'long', year: 'numeric' });
   }
 
   function getDaysRemaining(deletedAt: string | null): number {
@@ -67,8 +73,12 @@
     return Math.max(0, 30 - daysPassed);
   }
 
-  function appendItemsToGroups(newItems: MediaItem[]) {
-    for (const item of newItems) {
+  function appendItemsToGroups(newItems: MediaItem[], startIndex: number) {
+    for (let i = 0; i < newItems.length; i++) {
+      const item = newItems[i];
+      const globalIdx = startIndex + i;
+      itemIndexMap.set(item.id, globalIdx);
+
       const key = getGroupHeader(item.captured_at);
       let gIdx = groupIndexMap.get(key);
 
@@ -89,6 +99,7 @@
 
     if (reset) {
       items = [];
+      itemIndexMap.clear();
       albums = [];
       groupedSections = [];
       groupIndexMap.clear();
@@ -112,15 +123,19 @@
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data: MediaPageResponse = await res.json();
 
-      albums = reset ? (data.albums ?? []) : albums;
-      
+      albums = reset ? data.albums ?? [] : albums;
+
       const newItems = data.items;
+      const startIndex = items.length;
       items = reset ? newItems : [...items, ...newItems];
-      appendItemsToGroups(newItems);
+
+      appendItemsToGroups(newItems, startIndex);
 
       nextCapturedAt = data.next_cursor_captured_at;
       nextId = data.next_cursor_id;
       hasMore = data.has_more;
+    } catch (err) {
+      console.error('Failed fetching media:', err);
     } finally {
       isLoading = false;
     }
@@ -145,7 +160,6 @@
     selectedIds = selectedIds;
   }
 
-  // Batch action: Soft delete / Restore selected items
   async function handleBatchToggleDelete() {
     if (selectedIds.size === 0 || isActionLoading) return;
     isActionLoading = true;
@@ -164,10 +178,11 @@
     }
   }
 
-  // Batch action: Permanently purge selected items from disk + DB
   async function handleBatchPurge() {
     if (selectedIds.size === 0 || isActionLoading) return;
-    const confirmed = confirm(`Are you sure you want to permanently delete ${selectedIds.size} item(s)? This cannot be undone.`);
+    const confirmed = confirm(
+      `Are you sure you want to permanently delete ${selectedIds.size} item(s)? This cannot be undone.`
+    );
     if (!confirmed) return;
 
     isActionLoading = true;
@@ -185,6 +200,13 @@
     }
   }
 
+  function openModalForAsset(id: string) {
+    const idx = itemIndexMap.get(id);
+    if (idx !== undefined) {
+      selectedIndex = idx;
+    }
+  }
+
   onMount(() => {
     fetchMedia(true);
     observer = new IntersectionObserver(
@@ -193,7 +215,7 @@
           fetchMedia();
         }
       },
-      { rootMargin: '400px' }
+      { rootMargin: '600px' }
     );
     if (scrollTrigger) observer.observe(scrollTrigger);
   });
@@ -233,7 +255,7 @@
     {/if}
   </div>
 
-  <!-- Sub-Albums Display (Hidden when in trash) -->
+  <!-- Folders -->
   {#if albums.length > 0 && !$filterStore.show_trash}
     <div>
       <h3 class="text-[11px] uppercase font-semibold text-neutral-500 tracking-wider mb-2">Folders</h3>
@@ -246,7 +268,11 @@
           >
             <div class="w-9 h-9 rounded-lg bg-neutral-800 flex items-center justify-center overflow-hidden flex-shrink-0">
               {#if album.cover_thumb}
-                <img src="/{album.cover_thumb}" alt={album.name} class="w-full h-full object-cover group-hover:scale-105 transition-transform" />
+                <img
+                  src="/{album.cover_thumb}"
+                  alt={album.name}
+                  class="w-full h-full object-cover group-hover:scale-105 transition-transform"
+                />
               {:else}
                 📁
               {/if}
@@ -261,7 +287,7 @@
     </div>
   {/if}
 
-  <!-- Media Grid -->
+  <!-- Media Grid with Section Windowing -->
   {#if items.length === 0 && albums.length === 0 && !isLoading}
     <div class="flex-1 flex flex-col items-center justify-center text-center py-16 text-neutral-500 text-xs">
       <div class="text-2xl mb-1">
@@ -278,36 +304,30 @@
   {:else}
     <div class="space-y-6">
       {#each groupedSections as [groupName, groupList] (groupName)}
-        <section class="section-contain">
+        <VirtualSection minHeight={240}>
           <h2 class="text-xs font-semibold text-neutral-400 uppercase tracking-wider mb-2 sticky top-0 bg-neutral-950/80 backdrop-blur-md py-1 z-10">
             {groupName}
           </h2>
           <div class="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 gap-2.5">
-            {#each groupList as asset, localIdx (asset.id)}
+            {#each groupList as asset (asset.id)}
               <div
                 role="button"
                 tabindex="0"
-                on:click={() => {
-                  const globalIdx = items.indexOf(asset);
-                  selectedIndex = globalIdx !== -1 ? globalIdx : 0;
-                }}
+                on:click={() => openModalForAsset(asset.id)}
                 on:keydown={(e) => {
-                  if (e.key === 'Enter') {
-                    const globalIdx = items.indexOf(asset);
-                    selectedIndex = globalIdx !== -1 ? globalIdx : 0;
-                  }
+                  if (e.key === 'Enter') openModalForAsset(asset.id);
                 }}
-                class="group relative aspect-square bg-neutral-900 rounded-lg overflow-hidden border transition-all cursor-pointer {selectedIds.has(asset.id) ? 'border-purple-500 ring-2 ring-purple-500/40' : 'border-neutral-800/80 hover:border-neutral-700'}"
+                class="group relative aspect-square bg-neutral-900 rounded-lg overflow-hidden border transition-all cursor-pointer will-change-transform {selectedIds.has(asset.id) ? 'border-purple-500 ring-2 ring-purple-500/40' : 'border-neutral-800/80 hover:border-neutral-700'}"
               >
                 <img
                   src="/{asset.thumb_path}"
                   alt={asset.file_name}
                   loading="lazy"
                   decoding="async"
-                  class="w-full h-full object-cover group-hover:scale-105 transition-transform duration-200"
+                  class="w-full h-full object-cover group-hover:scale-105 transition-transform duration-200 pointer-events-none"
                 />
 
-                <!-- Checkbox Multi-Select Dot (Top-Left) -->
+                <!-- Checkbox Multi-Select Dot -->
                 <button
                   type="button"
                   on:click={(e) => toggleSelect(asset.id, e)}
@@ -317,19 +337,19 @@
                   <span class="text-xs font-bold leading-none">✓</span>
                 </button>
 
-                <!-- Trash Badge with Days Remaining (In Trash View) -->
+                <!-- Trash Badge -->
                 {#if asset.deleted_at}
                   <div class="absolute bottom-1.5 left-1.5 bg-red-950/90 border border-red-800/80 px-1.5 py-0.5 rounded text-[9px] text-red-300 font-mono z-10 shadow">
                     🗑️ {getDaysRemaining(asset.deleted_at)}d left
                   </div>
                 {/if}
 
-                <!-- Favorite Badge (Top-Right) -->
+                <!-- Favorite Badge -->
                 {#if asset.is_favorite}
                   <div class="absolute top-1.5 right-1.5 bg-black/60 p-1 rounded-full text-amber-400 text-[10px] leading-none">★</div>
                 {/if}
 
-                <!-- Video Duration Badge (Bottom-Right) -->
+                <!-- Duration Badge -->
                 {#if asset.duration_seconds}
                   <div class="absolute bottom-1 right-1 bg-black/75 px-1 py-0.5 rounded text-[9px] text-white font-mono">
                     {Math.floor(asset.duration_seconds / 60)}:{Math.floor(asset.duration_seconds % 60).toString().padStart(2, '0')}
@@ -338,7 +358,7 @@
               </div>
             {/each}
           </div>
-        </section>
+        </VirtualSection>
       {/each}
     </div>
   {/if}
@@ -347,7 +367,7 @@
     {#if isLoading}Loading more...{/if}
   </div>
 
-  <!-- Floating Multi-Select Action Bar (Bottom Center) -->
+  <!-- Action Bar -->
   {#if selectedIds.size > 0}
     <div class="fixed bottom-6 left-1/2 -translate-x-1/2 z-40 bg-neutral-900/95 border border-neutral-800 shadow-2xl backdrop-blur-md px-4 py-2 rounded-2xl flex items-center gap-3">
       <span class="text-xs text-neutral-300 font-medium">
@@ -357,7 +377,6 @@
       <div class="h-4 w-px bg-neutral-800"></div>
 
       {#if $filterStore.show_trash}
-        <!-- Actions inside Trash View -->
         <button
           type="button"
           on:click={handleBatchToggleDelete}
@@ -376,7 +395,6 @@
           Delete Forever
         </button>
       {:else}
-        <!-- Action inside Normal Gallery -->
         <button
           type="button"
           on:click={handleBatchToggleDelete}
@@ -418,10 +436,3 @@
     />
   {/if}
 </div>
-
-<style>
-  .section-contain {
-    content-visibility: auto;
-    contain-intrinsic-size: 1px 300px;
-  }
-</style>
