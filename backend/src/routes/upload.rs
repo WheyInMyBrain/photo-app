@@ -6,13 +6,13 @@ use axum::{
 };
 use sha2::{Digest, Sha256};
 use std::path::Path;
-use tokio::fs::{create_dir_all, File};
+use tokio::fs::{create_dir_all, File, OpenOptions};
 use tokio::io::AsyncWriteExt;
 use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::db::AssetRepo;
-use crate::domain::upload::{StagedFile, BatchUploadReceipt, UploadItemResult, InspectLinkRequest, InspectResult, InspectLinkResponse, CandidateItem, CommitLinkRequest, RawUploadQuery}; 
+use crate::domain::upload::{StagedFile, BatchUploadReceipt, UploadItemResult, InspectLinkRequest, InspectResult, InspectLinkResponse, CandidateItem, CommitLinkRequest, RawUploadQuery, ChunkUploadQuery, ChunkUploadResponse, FinalizeChunkQuery}; 
 use crate::error::AppError;
 use crate::services::queue::ProcessJob;
 use crate::services::storage::StorageService;
@@ -570,5 +570,133 @@ pub async fn commit_link_download(
         folder: sanitized_folder,
         is_private: payload.is_private,
         items: results,
+    }))
+}
+
+/// POST /api/upload/chunk
+/// Accepts raw byte slices (e.g. 20MB) and appends them to a temporary file
+pub async fn upload_chunk(
+    State(state): State<AppState>,
+    Query(query): Query<ChunkUploadQuery>,
+    body: Bytes,
+) -> Result<Json<ChunkUploadResponse>, AppError> {
+    if body.is_empty() {
+        return Err(AppError::BadRequest("Chunk payload is empty".into()));
+    }
+
+    let temp_dir = state.config.storage_root.join("temp_chunks");
+    create_dir_all(&temp_dir)
+        .await
+        .map_err(|e| AppError::Internal(format!("Failed to create temp chunk dir: {}", e)))?;
+
+    let part_path = temp_dir.join(format!("{}.part", query.upload_id));
+
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&part_path)
+        .await
+        .map_err(|e| AppError::Internal(format!("Failed to open chunk file: {}", e)))?;
+
+    file.write_all(&body)
+        .await
+        .map_err(|e| AppError::Internal(format!("Failed appending chunk bytes: {}", e)))?;
+    
+    tracing::debug!(
+        upload_id = %query.upload_id,
+        part = query.chunk_index + 1,
+        total = query.total_chunks,
+        "Received chunk"
+    );
+
+    Ok(Json(ChunkUploadResponse {
+        upload_id: query.upload_id,
+        chunk_index: query.chunk_index,
+        received: true,
+    }))
+}
+
+/// POST /api/upload/chunk/finalize
+/// Stitches everything, runs checksum, checks duplicate, moves to vault, and enqueues worker
+pub async fn finalize_chunk(
+    State(state): State<AppState>,
+    Query(query): Query<FinalizeChunkQuery>,
+) -> Result<Json<UploadItemResult>, AppError> {
+    let temp_dir = state.config.storage_root.join("temp_chunks");
+    let part_path = temp_dir.join(format!("{}.part", query.upload_id));
+
+    if !part_path.exists() {
+        return Err(AppError::NotFound("Temporary chunk file not found".into()));
+    }
+
+    // Read full stitched buffer
+    let file_bytes = tokio::fs::read(&part_path)
+        .await
+        .map_err(|e| AppError::Internal(format!("Failed to read assembled file: {}", e)))?;
+
+    let bytes_len = file_bytes.len() as i64;
+
+    // Checksum & Duplicate check
+    let mut hasher = Sha256::new();
+    hasher.update(&file_bytes);
+    let sha256_hash = hex::encode(hasher.finalize());
+
+    if let Ok(Some(existing_id)) = AssetRepo::find_id_by_sha256(&state.db, &sha256_hash).await {
+        let _ = tokio::fs::remove_file(&part_path).await;
+        return Ok(Json(UploadItemResult {
+            file_name: query.file_name,
+            status: "duplicate".to_string(),
+            id: Some(existing_id),
+            relative_path: None,
+            message: Some("Duplicate file exists".to_string()),
+        }));
+    }
+
+    let raw_folder = query.folder.unwrap_or_else(|| "root".to_string());
+    let is_private = query.is_private.unwrap_or(false);
+    let sanitized_folder = StorageService::sanitize_folder_path(&raw_folder);
+    let target_dir = StorageService::resolve_upload_dir(
+        &state.config.storage_root,
+        is_private,
+        &sanitized_folder,
+    );
+
+    create_dir_all(&target_dir)
+        .await
+        .map_err(|e| AppError::Internal(format!("Failed to create folder: {}", e)))?;
+
+    let asset_id = Uuid::new_v4().to_string();
+    let destination_path = target_dir.join(&query.file_name);
+
+    // Atomically move from temporary chunk to final storage path
+    tokio::fs::rename(&part_path, &destination_path)
+        .await
+        .map_err(|e| AppError::Internal(format!("Failed to move completed asset: {}", e)))?;
+
+    let relative_path = format!("{}/{}", sanitized_folder, query.file_name);
+
+    state
+        .job_sender
+        .send(ProcessJob {
+            asset_id: asset_id.clone(),
+            file_name: query.file_name.clone(),
+            rel_path: relative_path.clone(),
+            folder_path: sanitized_folder.clone(),
+            disk_path: destination_path,
+            sha256: sha256_hash,
+            file_size_bytes: bytes_len,
+            is_private,
+        })
+        .await
+        .map_err(|e| AppError::Internal(format!("Background queue refused job: {}", e)))?;
+
+    info!(id = %asset_id, file = %query.file_name, "Chunked upload finalized and enqueued");
+
+    Ok(Json(UploadItemResult {
+        file_name: query.file_name,
+        status: "queued".to_string(),
+        id: Some(asset_id),
+        relative_path: Some(relative_path),
+        message: None,
     }))
 }

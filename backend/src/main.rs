@@ -2,9 +2,9 @@ mod config;
 mod db;
 mod domain;
 mod error;
+mod middleware;
 mod routes;
 mod services;
-mod middleware;
 
 use axum::{
     extract::DefaultBodyLimit,
@@ -27,7 +27,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use services::face_engine::FaceEngine;
 use services::queue::{ProcessJob, QueueService};
 use services::tag_engine::TagEngine;
-use services::trash_purger::TrashPurgerService; // <--- Import service
+use services::trash_purger::TrashPurgerService;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -38,13 +38,13 @@ pub struct AppState {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    dotenvy::dotenv().ok();
+    // Initialize config (which loads .env internally)
+    let config = Config::init();
+
     tracing_subscriber::registry()
         .with(tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
         .with(tracing_subscriber::fmt::layer())
         .init();
-
-    let config = Config::init();
 
     tokio::fs::create_dir_all(&config.storage_root.join("db")).await?;
     tokio::fs::create_dir_all(&config.storage_root.join("originals/public")).await?;
@@ -55,7 +55,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let pool = db::init_db_pool(&config.db_url).await?;
 
-    // Spawn trash purger here, after pool is successfully created
+    // Spawn trash purger with injected pool and storage path
     TrashPurgerService::start(pool.clone(), config.storage_root.clone());
 
     let models_dir = config.storage_root.join("models");
@@ -99,6 +99,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // Upload
         .route("/api/upload", post(routes::upload::upload_photo))
+        .route("/api/upload/chunk", post(routes::upload::upload_chunk))
+        .route("/api/upload/chunk/finalize", post(routes::upload::finalize_chunk))
         .route("/api/upload/inspect", post(routes::upload::inspect_link))
         .route("/api/upload/commit", post(routes::upload::commit_link_download))
 
@@ -116,7 +118,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // Tag Metadata
         .route("/api/assets/{id}/tags", get(routes::tags::get_asset_tags))
-
         .route("/api/persons/names", get(routes::people::get_names_directory))
 
         .nest("/thumbs", thumbs_router)
@@ -125,7 +126,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Router::new()
                 .route("/upload", post(routes::upload::upload_raw_binary))
                 .route("/albums", get(routes::albums::get_folder_suggestions))
-                .layer(axum::middleware::from_fn(
+                .layer(axum::middleware::from_fn_with_state(
+                    state.clone(),
                     crate::middleware::api_key::require_api_key,
                 )),
         )
@@ -133,7 +135,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .layer(TraceLayer::new_for_http())
         .with_state(state);
 
-    let addr = SocketAddr::from(([0, 0, 0, 0], config.server_port));
+    let addr: SocketAddr = format!("{}:{}", config.server_host, config.server_port)
+        .parse()
+        .expect("Invalid server address host/port configuration");
+
     info!("Application running on http://{}", addr);
 
     let listener = tokio::net::TcpListener::bind(addr).await?;

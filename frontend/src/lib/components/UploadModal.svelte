@@ -3,7 +3,7 @@
 
   export let isOpen = false;
   export let initialFiles: File[] = [];
-  export let isPrivate = false; // Synchronized initial value from +layout.svelte
+  export let isPrivate = false;
 
   const dispatch = createEventDispatcher<{
     close: void;
@@ -19,7 +19,10 @@
   let fileInputEl: HTMLInputElement;
   let existingFolders: string[] = [];
 
-  // Sync internal toggle whenever modal opens or parent changes
+  // Thresholds: files > 75 MB are sliced into 20 MB chunks to easily clear Cloudflare limits
+  const CHUNK_THRESHOLD_BYTES = 75 * 1024 * 1024;
+  const CHUNK_SIZE_BYTES = 20 * 1024 * 1024;
+
   $: if (isOpen) {
     uploadIsPrivate = isPrivate;
   }
@@ -71,40 +74,95 @@
     return `${parseFloat((bytes / Math.pow(k, i)).toFixed(1))} ${sizes[i]}`;
   }
 
+  // Upload small files using the default /api/upload
+  async function uploadDirect(file: File) {
+    const formData = new FormData();
+    formData.append('folder', folderPath.trim() || 'root');
+    formData.append('is_private', uploadIsPrivate ? 'true' : 'false');
+    formData.append('file', file);
+
+    const res = await fetch('/api/upload', {
+      method: 'POST',
+      body: formData,
+    });
+
+    if (!res.ok) {
+      const text = await res.text();
+      throw new Error(text || `HTTP ${res.status}`);
+    }
+  }
+
+  // Upload heavy files in sliced 20MB chunks
+  async function uploadChunked(file: File) {
+    const uploadId = crypto.randomUUID();
+    const totalChunks = Math.ceil(file.size / CHUNK_SIZE_BYTES);
+
+    for (let chunkIdx = 0; chunkIdx < totalChunks; chunkIdx++) {
+      const start = chunkIdx * CHUNK_SIZE_BYTES;
+      const end = Math.min(file.size, start + CHUNK_SIZE_BYTES);
+      const slice = file.slice(start, end);
+
+      statusMessage = `Uploading ${file.name} (Part ${chunkIdx + 1}/${totalChunks})...`;
+
+      const params = new URLSearchParams({
+        upload_id: uploadId,
+        chunk_index: chunkIdx.toString(),
+        total_chunks: totalChunks.toString(),
+      });
+
+      const res = await fetch(`/api/upload/chunk?${params.toString()}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/octet-stream' },
+        body: slice,
+      });
+
+      if (!res.ok) {
+        throw new Error(`Failed uploading chunk ${chunkIdx + 1}/${totalChunks}`);
+      }
+    }
+
+    // Finalize after all chunks are sent
+    statusMessage = `Processing ${file.name}...`;
+    const finalizeParams = new URLSearchParams({
+      upload_id: uploadId,
+      file_name: file.name,
+      folder: folderPath.trim() || 'root',
+      is_private: uploadIsPrivate ? 'true' : 'false',
+    });
+
+    const finalizeRes = await fetch(`/api/upload/chunk/finalize?${finalizeParams.toString()}`, {
+      method: 'POST',
+    });
+
+    if (!finalizeRes.ok) {
+      throw new Error(`Failed to finalize upload for ${file.name}`);
+    }
+  }
+
   async function uploadAll() {
     if (stagedFiles.length === 0 || isUploading) return;
 
     isUploading = true;
-    statusMessage = 'Uploading...';
-    uploadProgress = 15;
-
-    const formData = new FormData();
-    formData.append('folder', folderPath.trim() || 'root');
-    formData.append('is_private', uploadIsPrivate ? 'true' : 'false');
-
-    for (const file of stagedFiles) {
-      formData.append('file', file);
-    }
+    uploadProgress = 5;
+    const totalCount = stagedFiles.length;
 
     try {
-      uploadProgress = 65;
-      statusMessage = 'Saving to storage & indexing...';
+      for (let i = 0; i < stagedFiles.length; i++) {
+        const file = stagedFiles[i];
 
-      const res = await fetch('/api/upload', {
-        method: 'POST',
-        body: formData,
-      });
+        if (file.size > CHUNK_THRESHOLD_BYTES) {
+          statusMessage = `Chunking large file: ${file.name}...`;
+          await uploadChunked(file);
+        } else {
+          statusMessage = `Uploading ${file.name}...`;
+          await uploadDirect(file);
+        }
 
-      if (!res.ok) {
-        const text = await res.text();
-        throw new Error(text || `HTTP ${res.status}`);
+        uploadProgress = Math.round(((i + 1) / totalCount) * 100);
       }
 
-      uploadProgress = 100;
       statusMessage = 'Upload complete!';
-
-      const uploadedCount = stagedFiles.length;
-      dispatch('uploaded', { count: uploadedCount });
+      dispatch('uploaded', { count: totalCount });
       forceClose();
     } catch (e: any) {
       statusMessage = `Failed: ${e.message}`;
@@ -130,7 +188,6 @@
 
 <svelte:window on:keydown={handleKeydown} />
 
-<!-- Explicitly closed <option> tag prevents Vite compiler warning -->
 <datalist id="folder-suggestions">
   {#each existingFolders as folder}
     <option value={folder}>{folder}</option>
@@ -162,7 +219,7 @@
             {/if}
           </h2>
           <p class="text-[11px] text-neutral-400 mt-0.5">
-            Images and videos will be processed with background AI indexing.
+            Small files upload directly; large video files are sliced automatically.
           </p>
         </div>
         <button
@@ -262,8 +319,11 @@
                   class="flex items-center justify-between p-2 bg-neutral-950/80 border border-neutral-800/80 rounded-lg text-xs"
                 >
                   <div class="truncate mr-3">
-                    <div class="text-neutral-200 font-medium truncate max-w-[280px]">
-                      {file.name}
+                    <div class="text-neutral-200 font-medium truncate max-w-[280px] flex items-center gap-1.5">
+                      <span class="truncate">{file.name}</span>
+                      {#if file.size > CHUNK_THRESHOLD_BYTES}
+                        <span class="text-[9px] bg-blue-950/80 text-blue-300 border border-blue-800/50 px-1 rounded">CHUNKED</span>
+                      {/if}
                     </div>
                     <div class="text-[10px] text-neutral-500">
                       {formatBytes(file.size)} • {file.type || 'unknown'}
@@ -288,7 +348,7 @@
         {#if isUploading}
           <div class="space-y-1.5 pt-2">
             <div class="flex justify-between text-xs text-neutral-400">
-              <span>{statusMessage}</span>
+              <span class="truncate max-w-[260px]">{statusMessage}</span>
               <span>{uploadProgress}%</span>
             </div>
             <div class="w-full bg-neutral-800 rounded-full h-1.5 overflow-hidden">

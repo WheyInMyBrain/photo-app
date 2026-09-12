@@ -1,26 +1,28 @@
 use axum::{
     body::Body,
+    extract::State,
     http::{Request, StatusCode},
     middleware::Next,
     response::{IntoResponse, Response},
     Json,
 };
 use serde_json::json;
+use crate::AppState;
 
 pub async fn require_api_key(
+    State(state): State<AppState>,
     req: Request<Body>,
     next: Next,
 ) -> Response {
-    let expected_key = match std::env::var("VAULT_API_KEY") {
-        Ok(k) if !k.trim().is_empty() => k,
-        _ => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "error": "VAULT_API_KEY environment variable not configured" })),
-            )
-                .into_response();
-        }
-    };
+    let expected_key = &state.config.vault_api_key;
+
+    if expected_key.is_empty() {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "error": "VAULT_API_KEY is not configured on the server" })),
+        )
+            .into_response();
+    }
 
     let provided_key = req
         .headers()

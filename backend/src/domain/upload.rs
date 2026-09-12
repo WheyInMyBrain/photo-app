@@ -76,3 +76,25 @@ pub struct CommitLinkRequest {
     pub is_private: bool,
     pub selected_items: Vec<CandidateItem>,
 }
+
+#[derive(Deserialize)]
+pub struct ChunkUploadQuery {
+    pub upload_id: String,
+    pub chunk_index: u32,
+    pub total_chunks: u32,
+}
+
+#[derive(Serialize)]
+pub struct ChunkUploadResponse {
+    pub upload_id: String,
+    pub chunk_index: u32,
+    pub received: bool,
+}
+
+#[derive(Deserialize)]
+pub struct FinalizeChunkQuery {
+    pub upload_id: String,
+    pub file_name: String,
+    pub folder: Option<String>,
+    pub is_private: Option<bool>,
+}

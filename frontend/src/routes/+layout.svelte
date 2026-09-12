@@ -1,6 +1,7 @@
 <script lang="ts">
   import '../app.css';
   import { browser } from '$app/environment';
+  import { page } from '$app/stores';
   import { onDestroy } from 'svelte';
   import { filterStore, filterQueryString } from '$lib/stores/filterStore';
   import UploadModal from '$lib/components/UploadModal.svelte';
@@ -44,6 +45,9 @@
   let showAuthModal = false;
   let droppedFiles: File[] = [];
   let isDraggingOverWindow = false;
+
+  // Track whether we are on the people management route
+  $: isOnPeoplePage = $page.url.pathname.startsWith('/people');
 
   // --- Auto-Lock & Panic Protection Settings ---
   const IDLE_TIMEOUT_MS = 2 * 60 * 1000; // 2 minutes
@@ -117,8 +121,21 @@
     if (filterDebounce) clearTimeout(filterDebounce);
   });
 
+  // Only open fullscreen upload dropzone if real external OS files are being dragged
+  function handleDragOver(e: DragEvent) {
+    const types = e.dataTransfer?.types;
+    if (types && types.includes('Files') && !types.includes('text/plain') && !types.includes('application/x-face-id')) {
+      e.preventDefault();
+      isDraggingOverWindow = true;
+    }
+  }
+
   function handleDrop(e: DragEvent) {
-    if (!e.dataTransfer?.types?.includes('Files')) return;
+    const types = e.dataTransfer?.types;
+    if (!types || !types.includes('Files') || types.includes('text/plain') || types.includes('application/x-face-id')) {
+      isDraggingOverWindow = false;
+      return;
+    }
     e.preventDefault();
     isDraggingOverWindow = false;
     if (e.dataTransfer.files?.length) {
@@ -146,7 +163,7 @@
   on:pointerdown={recordUserActivity}
   on:wheel|passive={recordUserActivity}
   on:keydown={handleGlobalKeyDown}
-  on:dragover|preventDefault={() => (isDraggingOverWindow = true)}
+  on:dragover={handleDragOver}
   on:dragleave={(e) => { if (e.clientX === 0 || e.clientY === 0) isDraggingOverWindow = false; }}
   on:drop={handleDrop}
 />
@@ -158,19 +175,13 @@
       <!-- Title & Vault Indicator -->
       <div class="space-y-2">
         <div class="flex items-center justify-between px-1">
-          <span class="text-base font-bold tracking-tight text-white flex items-center gap-1.5">
+          <a href="/" class="text-base font-bold tracking-tight text-white flex items-center gap-1.5 hover:opacity-90 transition-opacity">
             Vault
             {#if $filterStore.is_private}
               <span class="text-[10px] bg-purple-950/80 text-purple-300 border border-purple-800/60 px-1.5 py-0.2 rounded font-mono font-medium">
                 PRIVATE
               </span>
             {/if}
-          </span>
-          <a 
-            href="/people?is_private={$filterStore.is_private}" 
-            class="text-[11px] text-neutral-400 hover:text-white transition-colors"
-          >
-            Manage People ⚙
           </a>
         </div>
       </div>
@@ -329,9 +340,23 @@
       {/if}
     </div>
 
-    <!-- Bottom Actions: Trash & Reset -->
+    <!-- Bottom Actions: People Management, Trash & Reset -->
     <div class="pt-3 border-t border-neutral-900 space-y-2">
-      <!-- Trash Filter Button (Placed at the very bottom) -->
+      <!-- Manage People Navigation Toggle (Above Trash) -->
+      <a
+        href={isOnPeoplePage ? '/' : `/people?is_private=${$filterStore.is_private}`}
+        class="w-full py-1.5 px-2.5 text-xs rounded-lg flex items-center justify-between border transition-all cursor-pointer {isOnPeoplePage ? 'bg-purple-950/60 border-purple-800 text-purple-200 font-medium' : 'bg-neutral-900/80 border-neutral-800 text-neutral-400 hover:text-white'}"
+      >
+        <span class="flex items-center gap-1.5">
+          <span>{isOnPeoplePage ? '←' : '👤'}</span>
+          <span>{isOnPeoplePage ? 'Exit Manage People' : 'Manage People'}</span>
+        </span>
+        {#if isOnPeoplePage}
+          <span class="text-[9px] bg-purple-900/80 text-purple-200 px-1 py-0.2 rounded font-mono">BACK</span>
+        {/if}
+      </a>
+
+      <!-- Trash Filter Button -->
       <button
         type="button"
         on:click={() => filterStore.toggleTrash()}
