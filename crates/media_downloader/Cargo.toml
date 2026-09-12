@@ -12,3 +12,4 @@ reqwest = { version = "0.13.5", default-features = false, features = ["json", "c
 tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread"] }
 uuid = { version = "1.26.0", features = ["v4"] }
 chrono = "0.4.45"
+base64 = "0.23.1"

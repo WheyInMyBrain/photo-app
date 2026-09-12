@@ -49,6 +49,7 @@ pub struct CandidateItem {
     pub id: String,                    // Stable identifier (e.g. "item_0", "item_1")
     pub media_type: String,            // "image" | "video"
     pub thumbnail_url: String,         // Lightweight image for frontend UI
+    pub thumbnail_base64: Option<String>, // Base64 data URI for instant client preview
     pub high_res_url: String,          // CDN master payload
     pub audio_url: Option<String>,     // Present only for split DASH Reddit videos
     pub suggested_filename: String,    // e.g. "caption_slug_1.jpg" or ".mp4"

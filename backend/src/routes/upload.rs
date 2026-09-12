@@ -239,6 +239,30 @@ async fn persist_and_enqueue_staged_file(
     })
 }
 
+pub fn verify_vault_api_key(headers: &HeaderMap, expected_key: &str) -> Result<(), AppError> {
+    // If no key is set in config, allow all requests (or enforce strict non-empty check)
+    if expected_key.is_empty() {
+        return Ok(());
+    }
+
+    let provided_key = headers
+        .get("X-Vault-API-Key")
+        .or_else(|| headers.get("X-Vault_API-Key")) // Tolerates underscore variation
+        .or_else(|| headers.get("X-API-Key"))
+        .and_then(|h| h.to_str().ok())
+        .or_else(|| {
+            headers
+                .get("Authorization")
+                .and_then(|h| h.to_str().ok())
+                .and_then(|val| val.strip_prefix("Bearer "))
+        });
+
+    match provided_key {
+        Some(key) if key == expected_key => Ok(()),
+        _ => Err(AppError::Unauthorized("Invalid or missing API key".into())),
+    }
+}
+
 // ==========================================
 // 1. FRONTEND HANDLER (Multipart Form-Data)
 // ==========================================
@@ -357,6 +381,8 @@ pub async fn upload_raw_binary(
     Query(query): Query<RawUploadQuery>,
     body: Bytes,
 ) -> Result<Json<UploadItemResult>, AppError> {
+    verify_vault_api_key(&headers, &state.config.vault_api_key)?;
+
     if body.is_empty() {
         return Err(AppError::BadRequest("Upload body cannot be empty".into()));
     }
@@ -402,8 +428,12 @@ pub async fn upload_raw_binary(
 
 pub async fn inspect_link(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(payload): Json<InspectLinkRequest>,
 ) -> Result<Json<InspectResult>, AppError> {
+    // Enforce API Key
+    verify_vault_api_key(&headers, &state.config.vault_api_key)?;
+
     let meta = media_downloader::extract_links(&payload.url)
         .await
         .map_err(|e| AppError::BadRequest(format!("Link inspection failed: {e}")))?;
@@ -441,6 +471,7 @@ pub async fn inspect_link(
                 id: format!("item_{idx}"),
                 media_type: media_type_str,
                 thumbnail_url: item.thumbnail_url,
+                thumbnail_base64: item.thumbnail_base64,
                 high_res_url: item.high_res_url,
                 audio_url: item.audio_url,
                 suggested_filename,
@@ -457,7 +488,8 @@ pub async fn inspect_link(
             selected_items: candidate_items,
         };
 
-        let Json(receipt) = commit_link_download(State(state), Json(commit_req)).await?;
+        // Notice we forward `headers` directly into commit_link_download
+        let Json(receipt) = commit_link_download(State(state), headers, Json(commit_req)).await?;
         return Ok(Json(InspectResult::Committed(receipt)));
     }
 
@@ -475,8 +507,12 @@ pub async fn inspect_link(
 /// Step 2: Directly fetches only the user-selected URLs from CDNs and runs the ingestion pipeline
 pub async fn commit_link_download(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(payload): Json<CommitLinkRequest>,
 ) -> Result<Json<BatchUploadReceipt>, AppError> {
+    // Enforce API Key
+    verify_vault_api_key(&headers, &state.config.vault_api_key)?;
+
     if payload.selected_items.is_empty() {
         return Err(AppError::BadRequest("No items selected for download".to_string()));
     }

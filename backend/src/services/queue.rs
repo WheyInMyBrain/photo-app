@@ -51,8 +51,6 @@ impl QueueService {
         tag_engine: Arc<TagEngine>,
         notify: Arc<Notify>,
     ) {
-        // Bound concurrent ONNX inferences: (cores / 2), clamped between 1 and 3.
-        // Prevents memory exhaustion and preserves CPU capacity for API responses.
         let cores = std::thread::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(4);
@@ -106,6 +104,9 @@ impl QueueService {
                             }
                         };
 
+                        let pool_ref = pool.clone();
+                        let j_id = job_id.clone();
+
                         let index_res = Self::index_and_dispatch(
                             pool.clone(),
                             thumbs_root.clone(),
@@ -119,17 +120,18 @@ impl QueueService {
 
                         match index_res {
                             Ok(_) => {
-                                let _ = JobRepo::mark_completed(&pool, &job_id).await;
+                                let _ = JobRepo::mark_completed(&pool_ref, &j_id).await;
                             }
                             Err(e) => {
-                                let _ = JobRepo::mark_failed(&pool, &job_id, &e).await;
+                                let _ = JobRepo::mark_failed(&pool_ref, &j_id, &e).await;
                             }
                         }
                     }
                     Ok(None) => {
+                        // Sleep until a new job is enqueued (instant) or check every 30s as a fallback
                         tokio::select! {
                             _ = notify.notified() => {},
-                            _ = tokio::time::sleep(Duration::from_secs(10)) => {},
+                            _ = tokio::time::sleep(Duration::from_secs(30)) => {},
                         }
                     }
                     Err(e) => {
@@ -267,16 +269,18 @@ impl QueueService {
         }
 
         if let Some(img_arc) = art.image_buffer {
+            // Acquire the permit before delegating to protect memory
+            let permit = ai_semaphore
+                .acquire_owned()
+                .await
+                .map_err(|e| e.to_string())?;
+
             let pool_clone = pool.clone();
             let a_id = asset_id.clone();
             let thumbs_clone = thumbs_root.clone();
 
             tokio::spawn(async move {
-                // Acquire permit: blocks if too many models are currently running
-                let _permit = match ai_semaphore.acquire().await {
-                    Ok(p) => p,
-                    Err(_) => return, // Semaphore closed on shutdown
-                };
+                let _guard = permit;
 
                 let f_engine = face_engine.clone();
                 let f_pool = pool_clone.clone();
@@ -309,7 +313,6 @@ impl QueueService {
                 } else {
                     info!(id = %a_id, "FTS5 search index refreshed with tags and faces");
                 }
-                // `_permit` drops here, unlocking the slot for the next image
             });
         }
 

@@ -195,21 +195,21 @@ fn parse_media_item(item: &Value) -> Option<MediaItem> {
             .get("url")?
             .as_str()?;
 
-        Some(MediaItem {
-            media_type: MediaType::Video,
-            high_res_url: clean_url(high_res),
-            audio_url: None, // Instagram embeds audio in the multiplexed video stream
+        Some(MediaItem::new(
+            MediaType::Video,
+            clean_url(high_res),
+            None, // Instagram embeds audio in the multiplexed video stream
             thumbnail_url,
-        })
+        ))
     } else {
         let high_res = candidates.first()?.get("url")?.as_str()?;
 
-        Some(MediaItem {
-            media_type: MediaType::Image,
-            high_res_url: clean_url(high_res),
-            audio_url: None,
+        Some(MediaItem::new(
+            MediaType::Image,
+            clean_url(high_res),
+            None,
             thumbnail_url,
-        })
+        ))
     }
 }
 

@@ -97,12 +97,12 @@ pub async fn extract_links(input_url: &str) -> Result<ExtractedMediaMetadata> {
 
             let thumbnail_url = extract_preview_thumbnail(post_data).unwrap_or_else(|| url.to_string());
 
-            items.push(MediaItem {
+            items.push(MediaItem::new(
                 media_type,
-                high_res_url: clean_url_str(url),
-                audio_url: None,
-                thumbnail_url: clean_url_str(&thumbnail_url),
-            });
+                clean_url_str(url),
+                None,
+                clean_url_str(&thumbnail_url),
+            ));
         }
     }
 
@@ -143,12 +143,12 @@ fn parse_reddit_video(vid: &Value, post_data: &Value) -> Option<MediaItem> {
 
     let thumbnail_url = extract_preview_thumbnail(post_data).unwrap_or_else(|| fallback_url.to_string());
 
-    Some(MediaItem {
-        media_type: MediaType::Video,
-        high_res_url: clean_url_str(fallback_url),
+    Some(MediaItem::new(
+        MediaType::Video,
+        clean_url_str(fallback_url),
         audio_url,
-        thumbnail_url: clean_url_str(&thumbnail_url),
-    })
+        clean_url_str(&thumbnail_url),
+    ))
 }
 
 fn parse_reddit_gallery_node(media_obj: &Value) -> Option<MediaItem> {
@@ -160,21 +160,21 @@ fn parse_reddit_gallery_node(media_obj: &Value) -> Option<MediaItem> {
         .and_then(|u| u.as_str());
 
     if let Some(mp4) = media_obj.get("s").and_then(|s| s.get("mp4")).and_then(|u| u.as_str()) {
-        return Some(MediaItem {
-            media_type: MediaType::Video,
-            high_res_url: clean_url_str(mp4),
-            audio_url: None,
-            thumbnail_url: clean_url_str(thumbnail_url.unwrap_or(mp4)),
-        });
+        return Some(MediaItem::new(
+            MediaType::Video,
+            clean_url_str(mp4),
+            None,
+            clean_url_str(thumbnail_url.unwrap_or(mp4)),
+        ));
     }
 
     if let Some(img) = media_obj.get("s").and_then(|s| s.get("u")).and_then(|u| u.as_str()) {
-        return Some(MediaItem {
-            media_type: MediaType::Image,
-            high_res_url: clean_url_str(img),
-            audio_url: None,
-            thumbnail_url: clean_url_str(thumbnail_url.unwrap_or(img)),
-        });
+        return Some(MediaItem::new(
+            MediaType::Image,
+            clean_url_str(img),
+            None,
+            clean_url_str(thumbnail_url.unwrap_or(img)),
+        ));
     }
 
     None

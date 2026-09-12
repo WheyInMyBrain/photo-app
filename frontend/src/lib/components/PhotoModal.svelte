@@ -56,7 +56,6 @@
   let editingName = '';
 
   let detailAbortCtrl: AbortController | null = null;
-  let videoEl: HTMLVideoElement | null = null;
 
   function focusInput(node: HTMLElement) {
     node.focus();
@@ -67,7 +66,7 @@
     return !item.mime_type.startsWith('video/');
   }
 
-  // Preload ONLY photos. Videos are strictly skipped.
+  // Preload neighboring images only
   $: if (nextAsset && isImage(nextAsset)) {
     const img = new Image();
     img.src = `/api/assets/${nextAsset.id}/stream`;
@@ -78,13 +77,7 @@
     img.src = `/api/assets/${prevAsset.id}/stream`;
   }
 
-  // Teardown active video hardware decoding pipelines before asset changes
   $: if (asset?.id) {
-    if (videoEl) {
-      videoEl.pause();
-      videoEl.removeAttribute('src');
-      videoEl.load();
-    }
     isFavorite = Boolean(asset.is_favorite);
     editingFaceId = null;
     loadDetails(asset.id);
@@ -94,7 +87,6 @@
     const originalOverflow = document.body.style.overflow;
     document.body.style.overflow = 'hidden';
 
-    // Fetch names directory
     fetch('/api/persons/names')
       .then((res) => (res.ok ? res.json() : []))
       .then((data) => {
@@ -104,11 +96,6 @@
 
     return () => {
       document.body.style.overflow = originalOverflow;
-      if (videoEl) {
-        videoEl.pause();
-        videoEl.removeAttribute('src');
-        videoEl.load();
-      }
     };
   });
 
@@ -249,43 +236,45 @@
       {/if}
 
       <div class="relative max-h-full max-w-full flex items-center justify-center">
-        {#if asset.mime_type.startsWith('video/')}
-          <video
-            bind:this={videoEl}
-            src="/api/assets/{asset.id}/stream"
-            controls
-            autoplay
-            class="max-h-[90vh] max-w-[75vw] rounded-lg shadow-2xl"
-          >
-            <track kind="captions" />
-          </video>
-        {:else}
-          <div class="relative inline-block">
-            <img
+        {#key asset.id}
+          {#if asset.mime_type.startsWith('video/')}
+            <video
               src="/api/assets/{asset.id}/stream"
-              alt={asset.file_name}
-              decoding="async"
-              class="max-h-[90vh] max-w-[75vw] object-contain rounded-lg shadow-2xl block select-none pointer-events-none"
-            />
+              controls
+              autoplay
+              playsinline
+              class="max-h-[90vh] max-w-[75vw] rounded-lg shadow-2xl"
+            >
+              <track kind="captions" />
+            </video>
+          {:else}
+            <div class="relative inline-block">
+              <img
+                src="/api/assets/{asset.id}/stream"
+                alt={asset.file_name}
+                decoding="async"
+                class="max-h-[90vh] max-w-[75vw] object-contain rounded-lg shadow-2xl block select-none pointer-events-none"
+              />
 
-            {#if showBoxes}
-              {#each faces as f (f.face_id)}
-                <div
-                  class="absolute border border-emerald-400/80 bg-emerald-400/10 rounded cursor-pointer group z-10 hover:border-emerald-300 hover:bg-emerald-400/20 transition-colors"
-                  style="left: {f.bbox_x * 100}%; top: {f.bbox_y * 100}%; width: {f.bbox_w * 100}%; height: {f.bbox_h * 100}%;"
-                  on:click={() => { editingFaceId = f.face_id; editingName = f.person_name ?? ''; }}
-                  role="button"
-                  tabindex="0"
-                  on:keydown={(e) => e.key === 'Enter' && (editingFaceId = f.face_id)}
-                >
-                  <span class="absolute -bottom-6 left-1/2 -translate-x-1/2 bg-neutral-900/90 text-[10px] text-emerald-300 px-1.5 py-0.5 rounded shadow whitespace-nowrap opacity-80 group-hover:opacity-100 border border-neutral-700 pointer-events-none">
-                    {f.person_name || 'Unnamed'}
-                  </span>
-                </div>
-              {/each}
-            {/if}
-          </div>
-        {/if}
+              {#if showBoxes}
+                {#each faces as f (f.face_id)}
+                  <div
+                    class="absolute border border-emerald-400/80 bg-emerald-400/10 rounded cursor-pointer group z-10 hover:border-emerald-300 hover:bg-emerald-400/20 transition-colors"
+                    style="left: {f.bbox_x * 100}%; top: {f.bbox_y * 100}%; width: {f.bbox_w * 100}%; height: {f.bbox_h * 100}%;"
+                    on:click={() => { editingFaceId = f.face_id; editingName = f.person_name ?? ''; }}
+                    role="button"
+                    tabindex="0"
+                    on:keydown={(e) => e.key === 'Enter' && (editingFaceId = f.face_id)}
+                  >
+                    <span class="absolute -bottom-6 left-1/2 -translate-x-1/2 bg-neutral-900/90 text-[10px] text-emerald-300 px-1.5 py-0.5 rounded shadow whitespace-nowrap opacity-80 group-hover:opacity-100 border border-neutral-700 pointer-events-none">
+                      {f.person_name || 'Unnamed'}
+                    </span>
+                  </div>
+                {/each}
+              {/if}
+            </div>
+          {/if}
+        {/key}
       </div>
     </div>
 

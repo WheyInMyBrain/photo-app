@@ -12,6 +12,25 @@ pub struct MediaItem {
     pub high_res_url: String,
     pub audio_url: Option<String>,
     pub thumbnail_url: String,
+    pub thumbnail_base64: Option<String>,
+}
+
+impl MediaItem {
+    /// Internal constructor for scrapers that do not know about base64
+    pub fn new(
+        media_type: MediaType,
+        high_res_url: String,
+        audio_url: Option<String>,
+        thumbnail_url: String,
+    ) -> Self {
+        Self {
+            media_type,
+            high_res_url,
+            audio_url,
+            thumbnail_url,
+            thumbnail_base64: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
