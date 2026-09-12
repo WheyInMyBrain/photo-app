@@ -3,26 +3,12 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse, Json},
 };
-use serde::Serialize;
 use tower_http::services::ServeFile;
 
 use crate::db::AssetRepo;
-use crate::domain::media::{DynamicFiltersResponse, MediaPageResponse, MediaQuery};
+use crate::domain::media::{DynamicFiltersResponse, MediaPageResponse, MediaQuery, SoftDeleteResponse, FavoriteToggleResponse};
 use crate::error::AppError;
 use crate::AppState;
-
-#[derive(Serialize)]
-pub struct FavoriteToggleResponse {
-    pub asset_id: String,
-    pub is_favorite: bool,
-}
-
-#[derive(Serialize)]
-pub struct SoftDeleteResponse {
-    pub id: String,
-    pub is_deleted: bool,
-    pub deleted_at: Option<String>,
-}
 
 /// GET /api/media
 pub async fn list_media(

@@ -130,3 +130,16 @@ pub struct DynamicFiltersResponse {
     pub cameras: Vec<FilterOption>,
     pub albums: Vec<FilterOption>,
 }
+
+#[derive(Serialize)]
+pub struct FavoriteToggleResponse {
+    pub asset_id: String,
+    pub is_favorite: bool,
+}
+
+#[derive(Serialize)]
+pub struct SoftDeleteResponse {
+    pub id: String,
+    pub is_deleted: bool,
+    pub deleted_at: Option<String>,
+}

@@ -31,4 +31,15 @@ impl StorageService {
             .join(access_tier)
             .join(folder_path)
     }
+
+    /// Generates a collision-proof disk filename using the asset UUID while keeping the extension
+    pub fn generate_disk_filename(asset_id: &str, original_filename: &str) -> String {
+        let extension = Path::new(original_filename)
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .unwrap_or("raw")
+            .to_lowercase();
+
+        format!("{}.{}", asset_id, extension)
+    }
 }

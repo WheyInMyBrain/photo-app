@@ -2,10 +2,12 @@ use image::DynamicImage;
 use sqlx::SqlitePool;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tokio::sync::mpsc;
+use std::time::Duration;
+use tokio::sync::Notify;
 use tracing::{error, info};
 
-use crate::db::AssetRepo;
+use crate::db::{AssetRepo, JobRepo};
+use crate::domain::job_repo::DbJob;
 use crate::domain::media::NewAssetRecord;
 use crate::services::face_engine::FaceEngine;
 use crate::services::face_pipeline::FacePipeline;
@@ -15,17 +17,7 @@ use crate::services::tag_engine::TagEngine;
 use crate::services::tag_pipeline::TagPipeline;
 use crate::services::video_processor::VideoProcessor;
 
-#[derive(Debug)]
-pub struct ProcessJob {
-    pub asset_id: String,
-    pub file_name: String,
-    pub rel_path: String,
-    pub folder_path: String,
-    pub disk_path: PathBuf,
-    pub sha256: String,
-    pub file_size_bytes: i64,
-    pub is_private: bool,
-}
+pub type ProcessJob = DbJob;
 
 struct MediaArtifacts {
     meta: ExtractedMetadata,
@@ -42,60 +34,99 @@ struct MediaArtifacts {
 pub struct QueueService;
 
 impl QueueService {
+    pub async fn enqueue(
+        pool: &SqlitePool,
+        notify: &Arc<Notify>,
+        job: ProcessJob,
+    ) -> Result<(), sqlx::Error> {
+        JobRepo::enqueue(pool, &job).await?;
+        notify.notify_one();
+        Ok(())
+    }
+
     pub fn start_worker(
-        mut receiver: mpsc::Receiver<ProcessJob>,
         pool: SqlitePool,
         thumbs_root: PathBuf,
         face_engine: Arc<FaceEngine>,
         tag_engine: Arc<TagEngine>,
+        notify: Arc<Notify>,
     ) {
         tokio::spawn(async move {
-            info!("Background media worker running (FaceEngine + TagEngine)");
+            info!("Persistent background media worker running (FaceEngine + TagEngine)");
 
-            while let Some(job) = receiver.recv().await {
-                let pool = pool.clone();
-                let thumbs_root = thumbs_root.clone();
-                let face_engine = face_engine.clone();
-                let tag_engine = tag_engine.clone();
-
-                let shard = if job.asset_id.len() >= 2 { &job.asset_id[0..2] } else { "misc" };
-                let shard_dir = thumbs_root.join(shard);
-
-                if let Err(e) = std::fs::create_dir_all(&shard_dir) {
-                    error!("Failed to create shard directory {:?}: {}", shard_dir, e);
-                    continue;
+            if let Ok(count) = JobRepo::reset_interrupted(&pool).await {
+                if count > 0 {
+                    info!(count = count, "Rescheduled interrupted jobs from previous run");
                 }
+            }
 
-                let disk_path = job.disk_path.clone();
-                let asset_id = job.asset_id.clone();
+            loop {
+                match JobRepo::fetch_next_job(&pool).await {
+                    Ok(Some(job)) => {
+                        let job_id = job.id.clone();
+                        let shard = if job.asset_id.len() >= 2 { &job.asset_id[0..2] } else { "misc" };
+                        let shard_dir = thumbs_root.join(shard);
 
-                // 1. Media decoding and thumbnail generation in blocking thread
-                let process_res = tokio::task::spawn_blocking(move || {
-                    Self::process_file_sync(&disk_path, &asset_id, &shard_dir)
-                })
-                .await;
+                        if let Err(e) = std::fs::create_dir_all(&shard_dir) {
+                            error!("Failed to create shard directory {:?}: {}", shard_dir, e);
+                            let _ = JobRepo::mark_failed(&pool, &job_id, &e.to_string()).await;
+                            continue;
+                        }
 
-                let artifacts = match process_res {
-                    Ok(Ok(data)) => data,
-                    Ok(Err(e)) => {
-                        error!("Processing error on {}: {}", job.asset_id, e);
-                        continue;
+                        let disk_path = job.disk_path.clone();
+                        let asset_id = job.asset_id.clone();
+
+                        let process_res = tokio::task::spawn_blocking(move || {
+                            Self::process_file_sync(&disk_path, &asset_id, &shard_dir)
+                        })
+                        .await;
+
+                        let artifacts = match process_res {
+                            Ok(Ok(data)) => data,
+                            Ok(Err(e)) => {
+                                let err_msg = e.to_string();
+                                error!("Processing error on {}: {}", job.asset_id, err_msg);
+                                let _ = JobRepo::mark_failed(&pool, &job_id, &err_msg).await;
+                                continue;
+                            }
+                            Err(join_err) => {
+                                let err_msg = join_err.to_string();
+                                error!("Worker task panic on {}: {}", job.asset_id, err_msg);
+                                let _ = JobRepo::mark_failed(&pool, &job_id, &err_msg).await;
+                                continue;
+                            }
+                        };
+
+                        let index_res = Self::index_and_dispatch(
+                            pool.clone(),
+                            thumbs_root.clone(),
+                            face_engine.clone(),
+                            tag_engine.clone(),
+                            job,
+                            artifacts,
+                        )
+                        .await;
+
+                        match index_res {
+                            Ok(_) => {
+                                let _ = JobRepo::mark_completed(&pool, &job_id).await;
+                            }
+                            Err(e) => {
+                                let _ = JobRepo::mark_failed(&pool, &job_id, &e).await;
+                            }
+                        }
                     }
-                    Err(join_err) => {
-                        error!("Worker task panic on {}: {}", job.asset_id, join_err);
-                        continue;
+                    Ok(None) => {
+                        tokio::select! {
+                            _ = notify.notified() => {},
+                            _ = tokio::time::sleep(Duration::from_secs(10)) => {},
+                        }
                     }
-                };
-
-                // 2. Persist to DB and dispatch AI pipelines
-                Self::index_and_dispatch(
-                    pool,
-                    thumbs_root,
-                    face_engine,
-                    tag_engine,
-                    job,
-                    artifacts,
-                ).await;
+                    Err(e) => {
+                        error!(error = %e, "Failed to poll processing_jobs");
+                        tokio::time::sleep(Duration::from_secs(5)).await;
+                    }
+                }
             }
         });
     }
@@ -180,7 +211,7 @@ impl QueueService {
         tag_engine: Arc<TagEngine>,
         job: ProcessJob,
         art: MediaArtifacts,
-    ) {
+    ) -> Result<(), String> {
         let asset_id = job.asset_id.clone();
 
         let record = NewAssetRecord {
@@ -214,27 +245,25 @@ impl QueueService {
             camera_model: art.meta.camera_model,
         };
 
-        if let Err(e) = AssetRepo::insert_asset(&pool, &record).await {
-            error!("Database write failure for {}: {}", asset_id, e);
-            return;
-        }
+        AssetRepo::insert_asset(&pool, &record)
+            .await
+            .map_err(|e| format!("Database write failure for {}: {}", asset_id, e))?;
 
         info!(id = %asset_id, mime = %art.mime_type, "Indexed asset successfully");
 
-        // 2. Initial instant search sync using unified AssetRepo
         if let Err(e) = AssetRepo::sync_search_index(&pool, &asset_id).await {
             error!("Initial search sync failed for {}: {}", asset_id, e);
         }
 
-        // 3. Asynchronous AI enrichment for images
         if let Some(img_arc) = art.image_buffer {
             let pool_clone = pool.clone();
             let a_id = asset_id.clone();
+            let thumbs_clone = thumbs_root.clone();
 
             tokio::spawn(async move {
                 let f_engine = face_engine.clone();
                 let f_pool = pool_clone.clone();
-                let f_thumbs = thumbs_root.clone();
+                let f_thumbs = thumbs_clone.clone();
                 let f_id = a_id.clone();
                 let f_img = img_arc.clone();
 
@@ -243,28 +272,22 @@ impl QueueService {
                 let t_id = a_id.clone();
                 let t_img = img_arc.clone();
 
+                // Run both Face and Tag pipelines concurrently; both isolate ONNX on blocking threads
                 let (face_res, tag_res) = tokio::join!(
-                    tokio::spawn(async move {
-                        FacePipeline::process_asset_faces(&f_engine, &f_pool, &f_thumbs, &f_id, &f_img).await
-                    }),
-                    tokio::spawn(async move {
-                        TagPipeline::process_asset_tags(&t_engine, &t_pool, &t_id, &t_img).await
-                    })
+                    FacePipeline::process_asset_faces(f_engine, &f_pool, &f_thumbs, &f_id, f_img),
+                    TagPipeline::process_asset_tags(t_engine, &t_pool, &t_id, t_img)
                 );
 
                 match face_res {
-                    Ok(Ok(cnt)) => info!(id = %a_id, faces = cnt, "Faces clustered"),
-                    Ok(Err(e)) => error!("Face pipeline failure on {}: {}", a_id, e),
-                    Err(join_err) => error!("Face task panicked on {}: {}", a_id, join_err),
+                    Ok(cnt) => info!(id = %a_id, faces = cnt, "Faces clustered"),
+                    Err(e) => error!("Face pipeline failure on {}: {}", a_id, e),
                 }
 
                 match tag_res {
-                    Ok(Ok(cnt)) => info!(id = %a_id, tags = cnt, "WD Tags stored"),
-                    Ok(Err(e)) => error!("Tag pipeline failure on {}: {}", a_id, e),
-                    Err(join_err) => error!("Tag task panicked on {}: {}", a_id, join_err),
+                    Ok(cnt) => info!(id = %a_id, tags = cnt, "WD Tags stored"),
+                    Err(e) => error!("Tag pipeline failure on {}: {}", a_id, e),
                 }
 
-                // 4. Final FTS5 refresh using unified AssetRepo
                 if let Err(e) = AssetRepo::sync_search_index(&pool_clone, &a_id).await {
                     error!("Final FTS5 search sync failed for {}: {}", a_id, e);
                 } else {
@@ -272,5 +295,7 @@ impl QueueService {
                 }
             });
         }
+
+        Ok(())
     }
 }

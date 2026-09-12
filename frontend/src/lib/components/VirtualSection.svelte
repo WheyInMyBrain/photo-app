@@ -20,17 +20,20 @@
         }
       },
       {
-        // 1000px margin pre-renders before the user even reaches the section
         rootMargin: '1000px 0px 1000px 0px',
         threshold: 0
       }
     );
 
-    if (containerEl) observer.observe(containerEl);
+    if (containerEl) {
+      observer.observe(containerEl);
+    }
   });
 
   onDestroy(() => {
-    if (observer) observer.disconnect();
+    if (observer) {
+      observer.disconnect();
+    }
   });
 </script>
 
@@ -40,9 +43,8 @@
   class="relative"
 >
   {#if isVisible}
-    <slot />
+    <slot></slot>
   {:else}
-    <!-- Empty DOM stub: keeps scroll position intact while freeing RAM -->
-    <div style="height: {recordedHeight}px;" class="w-full pointer-events-none" />
+    <div style="height: {recordedHeight}px;" class="w-full pointer-events-none"></div>
   {/if}
 </section>

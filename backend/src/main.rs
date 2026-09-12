@@ -15,7 +15,7 @@ use axum::{
 use config::Config;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::sync::mpsc;
+use tokio::sync::Notify;
 use tower_http::{
     services::ServeDir,
     set_header::SetResponseHeaderLayer,
@@ -25,7 +25,7 @@ use tracing::info;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 use services::face_engine::FaceEngine;
-use services::queue::{ProcessJob, QueueService};
+use services::queue::QueueService;
 use services::tag_engine::TagEngine;
 use services::trash_purger::TrashPurgerService;
 
@@ -33,12 +33,11 @@ use services::trash_purger::TrashPurgerService;
 pub struct AppState {
     pub db: sqlx::SqlitePool,
     pub config: Config,
-    pub job_sender: mpsc::Sender<ProcessJob>,
+    pub queue_notify: Arc<Notify>,
 }
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // Initialize config (which loads .env internally)
     let config = Config::init();
 
     tracing_subscriber::registry()
@@ -49,33 +48,59 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tokio::fs::create_dir_all(&config.storage_root.join("db")).await?;
     tokio::fs::create_dir_all(&config.storage_root.join("originals/public")).await?;
     tokio::fs::create_dir_all(&config.storage_root.join("originals/private")).await?;
+    tokio::fs::create_dir_all(&config.storage_root.join("temp_chunks")).await?;
     tokio::fs::create_dir_all(&config.storage_root.join("thumbs")).await?;
     tokio::fs::create_dir_all(&config.storage_root.join("thumbs/faces")).await?;
     tokio::fs::create_dir_all(&config.storage_root.join("models")).await?;
 
     let pool = db::init_db_pool(&config.db_url).await?;
 
-    // Spawn trash purger with injected pool and storage path
+    // Create persistent job queue table
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS processing_jobs (
+            id TEXT PRIMARY KEY,
+            asset_id TEXT NOT NULL,
+            file_name TEXT NOT NULL,
+            rel_path TEXT NOT NULL,
+            folder_path TEXT NOT NULL,
+            disk_path TEXT NOT NULL,
+            sha256 TEXT NOT NULL,
+            file_size_bytes INTEGER NOT NULL,
+            is_private INTEGER NOT NULL DEFAULT 0,
+            status TEXT NOT NULL DEFAULT 'pending',
+            attempts INTEGER NOT NULL DEFAULT 0,
+            last_error TEXT,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE INDEX IF NOT EXISTS idx_jobs_status_created ON processing_jobs(status, created_at);
+        "#
+    )
+    .execute(&pool)
+    .await?;
+
     TrashPurgerService::start(pool.clone(), config.storage_root.clone());
 
     let models_dir = config.storage_root.join("models");
     let face_engine = Arc::new(FaceEngine::init(&models_dir).map_err(|e| e.to_string())?);
     let tag_engine = Arc::new(TagEngine::init(&models_dir).map_err(|e| e.to_string())?);
 
-    let (tx, rx) = mpsc::channel::<ProcessJob>(100);
+    // Initialize wakeup notification primitive for the worker
+    let queue_notify = Arc::new(Notify::new());
 
     QueueService::start_worker(
-        rx,
         pool.clone(),
         config.storage_root.join("thumbs"),
         face_engine,
         tag_engine,
+        queue_notify.clone(),
     );
 
     let state = AppState {
         db: pool,
         config: config.clone(),
-        job_sender: tx,
+        queue_notify,
     };
 
     let thumbs_router = Router::new()

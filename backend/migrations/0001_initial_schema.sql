@@ -244,3 +244,26 @@ CREATE TABLE IF NOT EXISTS passkey_credentials (
     sign_count INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
+
+
+-- ============================================================================
+-- 6. Atomic DB-Backed Job Queue
+-- ============================================================================
+CREATE TABLE IF NOT EXISTS processing_jobs (
+    id TEXT PRIMARY KEY,
+    asset_id TEXT NOT NULL,
+    file_name TEXT NOT NULL,
+    rel_path TEXT NOT NULL,
+    folder_path TEXT NOT NULL,
+    disk_path TEXT NOT NULL,
+    sha256 TEXT NOT NULL,
+    file_size_bytes INTEGER NOT NULL,
+    is_private INTEGER NOT NULL DEFAULT 0,
+    status TEXT NOT NULL DEFAULT 'pending', -- 'pending', 'processing', 'completed', 'failed'
+    attempts INTEGER NOT NULL DEFAULT 0,
+    last_error TEXT,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_jobs_status_created ON processing_jobs(status, created_at);

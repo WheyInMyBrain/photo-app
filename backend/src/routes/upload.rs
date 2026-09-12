@@ -7,17 +7,237 @@ use axum::{
 use sha2::{Digest, Sha256};
 use std::path::Path;
 use std::io::SeekFrom;
-use tokio::fs::{create_dir_all, File, OpenOptions};
+use tokio::fs::{self, create_dir_all, File, OpenOptions};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
-use tracing::{info, warn};
 use uuid::Uuid;
 
 use crate::db::AssetRepo;
 use crate::domain::upload::{StagedFile, BatchUploadReceipt, UploadItemResult, InspectLinkRequest, InspectResult, InspectLinkResponse, CandidateItem, CommitLinkRequest, RawUploadQuery, ChunkUploadQuery, ChunkUploadResponse, FinalizeChunkQuery}; 
 use crate::error::AppError;
-use crate::services::queue::ProcessJob;
+use crate::services::queue::{ProcessJob, QueueService};
 use crate::services::storage::StorageService;
 use crate::AppState;
+
+async fn persist_and_enqueue_bytes(
+    state: &AppState,
+    file_name: &str,
+    bytes: &[u8],
+    folder: &str,
+    is_private: bool,
+) -> UploadItemResult {
+    let bytes_len = bytes.len() as i64;
+
+    // 1. Checksum & Deduplication
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    let sha256_hash = hex::encode(hasher.finalize());
+
+    match AssetRepo::find_id_by_sha256(&state.db, &sha256_hash).await {
+        Ok(Some(existing_id)) => {
+            return UploadItemResult {
+                file_name: file_name.to_string(),
+                status: "duplicate".to_string(),
+                id: Some(existing_id),
+                relative_path: None,
+                message: Some("File with identical checksum already exists".to_string()),
+            };
+        }
+        Err(e) => {
+            return UploadItemResult {
+                file_name: file_name.to_string(),
+                status: "error".to_string(),
+                id: None,
+                relative_path: None,
+                message: Some(format!("Duplicate check failure: {e}")),
+            };
+        }
+        Ok(None) => {}
+    }
+
+    // 2. Directory & Path Resolution
+    let sanitized_folder = StorageService::sanitize_folder_path(folder);
+    let target_dir = StorageService::resolve_upload_dir(
+        &state.config.storage_root,
+        is_private,
+        &sanitized_folder,
+    );
+
+    if let Err(e) = fs::create_dir_all(&target_dir).await {
+        return UploadItemResult {
+            file_name: file_name.to_string(),
+            status: "error".to_string(),
+            id: None,
+            relative_path: None,
+            message: Some(format!("Failed to create directory: {e}")),
+        };
+    }
+
+    let asset_id = Uuid::new_v4().to_string();
+    let disk_file_name = StorageService::generate_disk_filename(&asset_id, file_name);
+    let destination_path = target_dir.join(&disk_file_name);
+
+    // 3. Write & Sync to SSD
+    let mut file = match File::create(&destination_path).await {
+        Ok(f) => f,
+        Err(e) => {
+            return UploadItemResult {
+                file_name: file_name.to_string(),
+                status: "error".to_string(),
+                id: None,
+                relative_path: None,
+                message: Some(format!("Disk write failure: {e}")),
+            };
+        }
+    };
+
+    if let Err(e) = file.write_all(bytes).await {
+        return UploadItemResult {
+            file_name: file_name.to_string(),
+            status: "error".to_string(),
+            id: None,
+            relative_path: None,
+            message: Some(format!("Failed writing buffer: {e}")),
+        };
+    }
+
+    file.sync_all().await.ok();
+    drop(file);
+
+    let relative_path = format!("{}/{}", sanitized_folder, disk_file_name);
+
+    // 4. Enqueue into DB
+    let job = ProcessJob {
+        id: Uuid::new_v4().to_string(),
+        asset_id: asset_id.clone(),
+        file_name: file_name.to_string(),
+        rel_path: relative_path.clone(),
+        folder_path: sanitized_folder,
+        disk_path: destination_path,
+        sha256: sha256_hash,
+        file_size_bytes: bytes_len,
+        is_private,
+    };
+
+    if let Err(e) = QueueService::enqueue(&state.db, &state.queue_notify, job).await {
+        return UploadItemResult {
+            file_name: file_name.to_string(),
+            status: "error".to_string(),
+            id: None,
+            relative_path: None,
+            message: Some(format!("Database queue rejected job: {e}")),
+        };
+    }
+
+    UploadItemResult {
+        file_name: file_name.to_string(),
+        status: "queued".to_string(),
+        id: Some(asset_id),
+        relative_path: Some(relative_path),
+        message: None,
+    }
+}
+
+/// Core pipeline for stitched chunk files already present on disk
+async fn persist_and_enqueue_staged_file(
+    state: &AppState,
+    part_path: &Path,
+    file_name: &str,
+    folder: &str,
+    is_private: bool,
+) -> Result<UploadItemResult, AppError> {
+    if !part_path.exists() {
+        return Err(AppError::NotFound("Temporary chunk file not found".into()));
+    }
+
+    // 1. Flush & Stream-hash using 64KB buffers
+    let mut file_to_hash = File::open(part_path)
+        .await
+        .map_err(|e| AppError::Internal(format!("Failed opening part file: {e}")))?;
+
+    file_to_hash.sync_all().await.ok();
+
+    let metadata = file_to_hash
+        .metadata()
+        .await
+        .map_err(|e| AppError::Internal(format!("Failed reading metadata: {e}")))?;
+    let bytes_len = metadata.len() as i64;
+
+    let mut hasher = Sha256::new();
+    let mut buffer = [0u8; 65536];
+
+    loop {
+        let bytes_read = file_to_hash
+            .read(&mut buffer)
+            .await
+            .map_err(|e| AppError::Internal(format!("Failed reading bytes: {e}")))?;
+        if bytes_read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..bytes_read]);
+    }
+    drop(file_to_hash);
+
+    let sha256_hash = hex::encode(hasher.finalize());
+
+    // 2. Duplicate Check
+    if let Ok(Some(existing_id)) = AssetRepo::find_id_by_sha256(&state.db, &sha256_hash).await {
+        let _ = fs::remove_file(part_path).await;
+        return Ok(UploadItemResult {
+            file_name: file_name.to_string(),
+            status: "duplicate".to_string(),
+            id: Some(existing_id),
+            relative_path: None,
+            message: Some("Duplicate file exists".to_string()),
+        });
+    }
+
+    // 3. Resolve destination & move
+    let sanitized_folder = StorageService::sanitize_folder_path(folder);
+    let target_dir = StorageService::resolve_upload_dir(
+        &state.config.storage_root,
+        is_private,
+        &sanitized_folder,
+    );
+
+    fs::create_dir_all(&target_dir)
+        .await
+        .map_err(|e| AppError::Internal(format!("Failed to create folder: {e}")))?;
+
+    let asset_id = Uuid::new_v4().to_string();
+    let disk_file_name = StorageService::generate_disk_filename(&asset_id, file_name);
+    let destination_path = target_dir.join(&disk_file_name);
+
+    fs::rename(part_path, &destination_path)
+        .await
+        .map_err(|e| AppError::Internal(format!("Failed to move asset to storage: {e}")))?;
+
+    let relative_path = format!("{}/{}", sanitized_folder, disk_file_name);
+
+    // 4. Enqueue into DB
+    let job = ProcessJob {
+        id: Uuid::new_v4().to_string(),
+        asset_id: asset_id.clone(),
+        file_name: file_name.to_string(),
+        rel_path: relative_path.clone(),
+        folder_path: sanitized_folder,
+        disk_path: destination_path,
+        sha256: sha256_hash,
+        file_size_bytes: bytes_len,
+        is_private,
+    };
+
+    QueueService::enqueue(&state.db, &state.queue_notify, job)
+        .await
+        .map_err(|e| AppError::Internal(format!("Failed enqueuing job into database: {e}")))?;
+
+    Ok(UploadItemResult {
+        file_name: file_name.to_string(),
+        status: "queued".to_string(),
+        id: Some(asset_id),
+        relative_path: Some(relative_path),
+        message: None,
+    })
+}
 
 // ==========================================
 // 1. FRONTEND HANDLER (Multipart Form-Data)
@@ -47,10 +267,7 @@ pub async fn upload_photo(
                 is_private = val.eq_ignore_ascii_case("true") || val == "1";
             }
             "file" | "files" => {
-                let file_name = field
-                    .file_name()
-                    .unwrap_or("media.raw")
-                    .to_string();
+                let file_name = field.file_name().unwrap_or("media.raw").to_string();
 
                 match field.bytes().await {
                     Ok(b) => staged_files.push(StagedFile { file_name, bytes: b }),
@@ -60,7 +277,7 @@ pub async fn upload_photo(
                             status: "error".to_string(),
                             id: None,
                             relative_path: None,
-                            message: Some(format!("Failed reading bytes: {}", err)),
+                            message: Some(format!("Failed reading bytes: {err}")),
                         });
                     }
                 }
@@ -69,119 +286,23 @@ pub async fn upload_photo(
         }
     }
 
-    let sanitized_folder = StorageService::sanitize_folder_path(&raw_folder);
-    let target_dir = StorageService::resolve_upload_dir(
-        &state.config.storage_root,
-        is_private,
-        &sanitized_folder,
-    );
-
-    if let Err(e) = create_dir_all(&target_dir).await {
-        return Err(AppError::Internal(format!("Failed to create destination path: {}", e)));
-    }
-
     for staged in staged_files {
-        let bytes_len = staged.bytes.len() as i64;
-
-        let mut hasher = Sha256::new();
-        hasher.update(&staged.bytes);
-        let sha256_hash = hex::encode(hasher.finalize());
-
-        match AssetRepo::find_id_by_sha256(&state.db, &sha256_hash).await {
-            Ok(Some(existing_id)) => {
-                warn!(file = %staged.file_name, id = %existing_id, "Skipping duplicate");
-                results.push(UploadItemResult {
-                    file_name: staged.file_name,
-                    status: "duplicate".to_string(),
-                    id: Some(existing_id),
-                    relative_path: None,
-                    message: Some("File with identical checksum already exists".to_string()),
-                });
-                continue;
-            }
-            Err(e) => {
-                results.push(UploadItemResult {
-                    file_name: staged.file_name,
-                    status: "error".to_string(),
-                    id: None,
-                    relative_path: None,
-                    message: Some(format!("Duplicate check failure: {}", e)),
-                });
-                continue;
-            }
-            Ok(None) => {}
-        }
-
-        let asset_id = Uuid::new_v4().to_string();
-        let destination_path = target_dir.join(&staged.file_name);
-
-        let mut file = match File::create(&destination_path).await {
-            Ok(f) => f,
-            Err(e) => {
-                results.push(UploadItemResult {
-                    file_name: staged.file_name,
-                    status: "error".to_string(),
-                    id: None,
-                    relative_path: None,
-                    message: Some(format!("Disk write failure: {}", e)),
-                });
-                continue;
-            }
-        };
-
-        if let Err(e) = file.write_all(&staged.bytes).await {
-            results.push(UploadItemResult {
-                file_name: staged.file_name,
-                status: "error".to_string(),
-                id: None,
-                relative_path: None,
-                message: Some(format!("Failed writing buffer: {}", e)),
-            });
-            continue;
-        }
-
-        let relative_path = format!("{}/{}", sanitized_folder, staged.file_name);
-
-        let job_enqueued = state
-            .job_sender
-            .send(ProcessJob {
-                asset_id: asset_id.clone(),
-                file_name: staged.file_name.clone(),
-                rel_path: relative_path.clone(),
-                folder_path: sanitized_folder.clone(),
-                disk_path: destination_path,
-                sha256: sha256_hash,
-                file_size_bytes: bytes_len,
-                is_private,
-            })
-            .await;
-
-        if let Err(e) = job_enqueued {
-            results.push(UploadItemResult {
-                file_name: staged.file_name,
-                status: "error".to_string(),
-                id: None,
-                relative_path: None,
-                message: Some(format!("Background pipeline refused job: {}", e)),
-            });
-            continue;
-        }
-
-        info!(id = %asset_id, file = %staged.file_name, "Media enqueued successfully");
-        results.push(UploadItemResult {
-            file_name: staged.file_name,
-            status: "queued".to_string(),
-            id: Some(asset_id),
-            relative_path: Some(relative_path),
-            message: None,
-        });
+        let res = persist_and_enqueue_bytes(
+            &state,
+            &staged.file_name,
+            &staged.bytes,
+            &raw_folder,
+            is_private,
+        )
+        .await;
+        results.push(res);
     }
 
     let success_count = results.iter().filter(|r| r.status == "queued").count();
 
     Ok(Json(BatchUploadReceipt {
         total_uploaded: success_count,
-        folder: sanitized_folder,
+        folder: StorageService::sanitize_folder_path(&raw_folder),
         is_private,
         items: results,
     }))
@@ -240,7 +361,6 @@ pub async fn upload_raw_binary(
         return Err(AppError::BadRequest("Upload body cannot be empty".into()));
     }
 
-    // 1. Resolve raw base filename
     let mut file_name = query
         .file_name
         .or_else(|| {
@@ -251,7 +371,6 @@ pub async fn upload_raw_binary(
         })
         .unwrap_or_else(|| Uuid::new_v4().to_string());
 
-    // 2. Check if file name already contains an extension
     let has_extension = Path::new(&file_name)
         .extension()
         .and_then(|e| e.to_str())
@@ -259,7 +378,6 @@ pub async fn upload_raw_binary(
         .unwrap_or(false);
 
     if !has_extension {
-        // Fallbacks: Query ?ext= -> Header X-File-Ext -> Magic Bytes -> Default to "jpg"
         let ext = query
             .ext
             .or_else(|| {
@@ -276,75 +394,10 @@ pub async fn upload_raw_binary(
 
     let raw_folder = query.folder.unwrap_or_else(|| "root".to_string());
     let is_private = query.is_private.unwrap_or(false);
-    let bytes_len = body.len() as i64;
 
-    // 3. SHA-256 Checksum
-    let mut hasher = Sha256::new();
-    hasher.update(&body);
-    let sha256_hash = hex::encode(hasher.finalize());
+    let result = persist_and_enqueue_bytes(&state, &file_name, &body, &raw_folder, is_private).await;
 
-    // 4. Duplicate Check
-    if let Ok(Some(existing_id)) = AssetRepo::find_id_by_sha256(&state.db, &sha256_hash).await {
-        warn!(file = %file_name, id = %existing_id, "Skipping duplicate");
-        return Ok(Json(UploadItemResult {
-            file_name,
-            status: "duplicate".to_string(),
-            id: Some(existing_id),
-            relative_path: None,
-            message: Some("Identical file already exists".to_string()),
-        }));
-    }
-
-    // 5. Target Directory & Write File
-    let sanitized_folder = StorageService::sanitize_folder_path(&raw_folder);
-    let target_dir = StorageService::resolve_upload_dir(
-        &state.config.storage_root,
-        is_private,
-        &sanitized_folder,
-    );
-
-    create_dir_all(&target_dir)
-        .await
-        .map_err(|e| AppError::Internal(format!("Failed to create directory: {}", e)))?;
-
-    let asset_id = Uuid::new_v4().to_string();
-    let destination_path = target_dir.join(&file_name);
-
-    let mut file = File::create(&destination_path)
-        .await
-        .map_err(|e| AppError::Internal(format!("Failed to create file: {}", e)))?;
-
-    file.write_all(&body)
-        .await
-        .map_err(|e| AppError::Internal(format!("Failed writing buffer: {}", e)))?;
-
-    let relative_path = format!("{}/{}", sanitized_folder, file_name);
-
-    // 6. Enqueue ProcessJob with extension-bearing name and path
-    state
-        .job_sender
-        .send(ProcessJob {
-            asset_id: asset_id.clone(),
-            file_name: file_name.clone(),
-            rel_path: relative_path.clone(),
-            folder_path: sanitized_folder.clone(),
-            disk_path: destination_path,
-            sha256: sha256_hash,
-            file_size_bytes: bytes_len,
-            is_private,
-        })
-        .await
-        .map_err(|e| AppError::Internal(format!("Queue error: {}", e)))?;
-
-    info!(id = %asset_id, file = %file_name, "Raw stream uploaded & enqueued");
-
-    Ok(Json(UploadItemResult {
-        file_name,
-        status: "queued".to_string(),
-        id: Some(asset_id),
-        relative_path: Some(relative_path),
-        message: None,
-    }))
+    Ok(Json(result))
 }
 
 pub async fn inspect_link(
@@ -428,22 +481,9 @@ pub async fn commit_link_download(
         return Err(AppError::BadRequest("No items selected for download".to_string()));
     }
 
-    // 1. Resolve folder path (custom override or fallback to "{platform}")
     let raw_folder = payload.folder.unwrap_or(payload.platform);
-    let sanitized_folder = StorageService::sanitize_folder_path(&raw_folder);
-    let target_dir = StorageService::resolve_upload_dir(
-        &state.config.storage_root,
-        payload.is_private,
-        &sanitized_folder,
-    );
-
-    if let Err(e) = create_dir_all(&target_dir).await {
-        return Err(AppError::Internal(format!("Failed to create storage path: {e}")));
-    }
-
     let mut results = Vec::new();
 
-    // 2. Download each chosen URL via unified downloader
     for item in payload.selected_items {
         let bytes = match media_downloader::download_asset(
             &item.high_res_url,
@@ -465,110 +505,23 @@ pub async fn commit_link_download(
             }
         };
 
-        let bytes_len = bytes.len() as i64;
+        let res = persist_and_enqueue_bytes(
+            &state,
+            &item.suggested_filename,
+            &bytes,
+            &raw_folder,
+            payload.is_private,
+        )
+        .await;
 
-        // Duplicate check via SHA-256
-        let mut hasher = Sha256::new();
-        hasher.update(&bytes);
-        let sha256_hash = hex::encode(hasher.finalize());
-
-        match AssetRepo::find_id_by_sha256(&state.db, &sha256_hash).await {
-            Ok(Some(existing_id)) => {
-                warn!(file = %item.suggested_filename, id = %existing_id, "Skipping duplicate");
-                results.push(UploadItemResult {
-                    file_name: item.suggested_filename,
-                    status: "duplicate".to_string(),
-                    id: Some(existing_id),
-                    relative_path: None,
-                    message: Some("File with identical checksum already exists".to_string()),
-                });
-                continue;
-            }
-            Err(e) => {
-                results.push(UploadItemResult {
-                    file_name: item.suggested_filename,
-                    status: "error".to_string(),
-                    id: None,
-                    relative_path: None,
-                    message: Some(format!("Duplicate check error: {e}")),
-                });
-                continue;
-            }
-            Ok(None) => {}
-        }
-
-        // Commit file to disk
-        let asset_id = Uuid::new_v4().to_string();
-        let destination_path = target_dir.join(&item.suggested_filename);
-
-        let mut file = match File::create(&destination_path).await {
-            Ok(f) => f,
-            Err(e) => {
-                results.push(UploadItemResult {
-                    file_name: item.suggested_filename,
-                    status: "error".to_string(),
-                    id: None,
-                    relative_path: None,
-                    message: Some(format!("Disk write failure: {e}")),
-                });
-                continue;
-            }
-        };
-
-        if let Err(e) = file.write_all(&bytes).await {
-            results.push(UploadItemResult {
-                file_name: item.suggested_filename,
-                status: "error".to_string(),
-                id: None,
-                relative_path: None,
-                message: Some(format!("Buffer write failure: {e}")),
-            });
-            continue;
-        }
-
-        let relative_path = format!("{}/{}", sanitized_folder, item.suggested_filename);
-
-        // Queue for background ML processing
-        let enqueued = state
-            .job_sender
-            .send(ProcessJob {
-                asset_id: asset_id.clone(),
-                file_name: item.suggested_filename.clone(),
-                rel_path: relative_path.clone(),
-                folder_path: sanitized_folder.clone(),
-                disk_path: destination_path,
-                sha256: sha256_hash,
-                file_size_bytes: bytes_len,
-                is_private: payload.is_private,
-            })
-            .await;
-
-        if let Err(e) = enqueued {
-            results.push(UploadItemResult {
-                file_name: item.suggested_filename,
-                status: "error".to_string(),
-                id: None,
-                relative_path: None,
-                message: Some(format!("Background pipeline refused job: {e}")),
-            });
-            continue;
-        }
-
-        info!(id = %asset_id, file = %item.suggested_filename, "Media enqueued successfully");
-        results.push(UploadItemResult {
-            file_name: item.suggested_filename,
-            status: "queued".to_string(),
-            id: Some(asset_id),
-            relative_path: Some(relative_path),
-            message: None,
-        });
+        results.push(res);
     }
 
     let success_count = results.iter().filter(|r| r.status == "queued").count();
 
     Ok(Json(BatchUploadReceipt {
         total_uploaded: success_count,
-        folder: sanitized_folder,
+        folder: StorageService::sanitize_folder_path(&raw_folder),
         is_private: payload.is_private,
         items: results,
     }))
@@ -626,8 +579,6 @@ pub async fn upload_chunk(
 }
 
 /// POST /api/upload/chunk/finalize
-/// Stitches everything, runs checksum, checks duplicate, moves to vault, and enqueues worker
-/// POST /api/upload/chunk/finalize
 /// Streams file from disk in 64KB blocks to hash, checks duplicates, moves to vault, and enqueues worker
 pub async fn finalize_chunk(
     State(state): State<AppState>,
@@ -635,102 +586,17 @@ pub async fn finalize_chunk(
 ) -> Result<Json<UploadItemResult>, AppError> {
     let temp_dir = state.config.storage_root.join("temp_chunks");
     let part_path = temp_dir.join(format!("{}.part", query.upload_id));
-
-    if !part_path.exists() {
-        return Err(AppError::NotFound("Temporary chunk file not found".into()));
-    }
-
-    // 1. Open file and retrieve total size without loading it into RAM
-    let mut file_to_hash = File::open(&part_path)
-        .await
-        .map_err(|e| AppError::Internal(format!("Failed opening part file: {}", e)))?;
-
-    let metadata = file_to_hash
-        .metadata()
-        .await
-        .map_err(|e| AppError::Internal(format!("Failed reading metadata: {}", e)))?;
-    let bytes_len = metadata.len() as i64;
-
-    // 2. Stream-hash the file in fixed 64 KB chunks
-    let mut hasher = Sha256::new();
-    let mut buffer = [0u8; 65536]; // 64 KB fixed buffer
-
-    loop {
-        let bytes_read = file_to_hash
-            .read(&mut buffer)
-            .await
-            .map_err(|e| AppError::Internal(format!("Failed streaming hash bytes: {}", e)))?;
-
-        if bytes_read == 0 {
-            break;
-        }
-        hasher.update(&buffer[..bytes_read]);
-    }
-
-    // Explicitly drop file handle so Windows/Unix releases the open descriptor before renaming
-    drop(file_to_hash);
-
-    let sha256_hash = hex::encode(hasher.finalize());
-
-    // 3. Duplicate check against existing vault database
-    if let Ok(Some(existing_id)) = AssetRepo::find_id_by_sha256(&state.db, &sha256_hash).await {
-        let _ = tokio::fs::remove_file(&part_path).await;
-        return Ok(Json(UploadItemResult {
-            file_name: query.file_name,
-            status: "duplicate".to_string(),
-            id: Some(existing_id),
-            relative_path: None,
-            message: Some("Duplicate file exists".to_string()),
-        }));
-    }
-
-    // 4. Resolve destination directories
     let raw_folder = query.folder.unwrap_or_else(|| "root".to_string());
     let is_private = query.is_private.unwrap_or(false);
-    let sanitized_folder = StorageService::sanitize_folder_path(&raw_folder);
-    let target_dir = StorageService::resolve_upload_dir(
-        &state.config.storage_root,
+
+    let result = persist_and_enqueue_staged_file(
+        &state,
+        &part_path,
+        &query.file_name,
+        &raw_folder,
         is_private,
-        &sanitized_folder,
-    );
+    )
+    .await?;
 
-    create_dir_all(&target_dir)
-        .await
-        .map_err(|e| AppError::Internal(format!("Failed to create folder: {}", e)))?;
-
-    let asset_id = Uuid::new_v4().to_string();
-    let destination_path = target_dir.join(&query.file_name);
-
-    // 5. Atomically move from temporary chunk staging directly to vault storage
-    tokio::fs::rename(&part_path, &destination_path)
-        .await
-        .map_err(|e| AppError::Internal(format!("Failed to move completed asset: {}", e)))?;
-
-    let relative_path = format!("{}/{}", sanitized_folder, query.file_name);
-
-    // 6. Enqueue asset into background indexing pipeline
-    state
-        .job_sender
-        .send(ProcessJob {
-            asset_id: asset_id.clone(),
-            file_name: query.file_name.clone(),
-            rel_path: relative_path.clone(),
-            folder_path: sanitized_folder.clone(),
-            disk_path: destination_path,
-            sha256: sha256_hash,
-            file_size_bytes: bytes_len,
-            is_private,
-        })
-        .await
-        .map_err(|e| AppError::Internal(format!("Background queue refused job: {}", e)))?;
-
-    info!(id = %asset_id, file = %query.file_name, "Chunked upload finalized and enqueued");
-
-    Ok(Json(UploadItemResult {
-        file_name: query.file_name,
-        status: "queued".to_string(),
-        id: Some(asset_id),
-        relative_path: Some(relative_path),
-        message: None,
-    }))
+    Ok(Json(result))
 }
