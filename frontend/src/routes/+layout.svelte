@@ -45,8 +45,12 @@
   let showAuthModal = false;
   let droppedFiles: File[] = [];
   let isDraggingOverWindow = false;
+  let dragCounter = 0; // Fixes drag flicker bug across nested DOM elements
 
-  // Track whether we are on the people management route
+  // AbortController to prevent race conditions from out-of-order responses
+  let filterAbortCtrl: AbortController | null = null;
+  let filterDebounce: ReturnType<typeof setTimeout> | null = null;
+
   $: isOnPeoplePage = $page.url.pathname.startsWith('/people');
 
   // --- Auto-Lock & Panic Protection Settings ---
@@ -55,7 +59,6 @@
   let lastActivity = Date.now();
   let idleInterval: ReturnType<typeof setInterval> | null = null;
   let lastEscPress = 0;
-  let filterDebounce: ReturnType<typeof setTimeout> | null = null;
 
   function recordUserActivity() {
     const now = Date.now();
@@ -91,7 +94,7 @@
           if ($filterStore.is_private && Date.now() - lastActivity > IDLE_TIMEOUT_MS) {
             filterStore.lockVault();
           }
-        }, 30 * 1000);
+        }, 15 * 1000);
       }
     } else if (idleInterval) {
       clearInterval(idleInterval);
@@ -101,11 +104,24 @@
 
   async function refreshFilters(qs: string) {
     if (!browser) return;
+
+    // Cancel any pending request so stale parameters never overwrite new ones
+    if (filterAbortCtrl) {
+      filterAbortCtrl.abort();
+    }
+    filterAbortCtrl = new AbortController();
+
     try {
-      const res = await fetch(`/api/media/filters${qs}`);
-      if (res.ok) filters = await res.json();
-    } catch (e) {
-      console.error('Failed to load dynamic filters', e);
+      const res = await fetch(`/api/media/filters${qs}`, {
+        signal: filterAbortCtrl.signal
+      });
+      if (res.ok) {
+        filters = await res.json();
+      }
+    } catch (e: any) {
+      if (e?.name !== 'AbortError') {
+        console.error('Failed to load dynamic filters', e);
+      }
     }
   }
 
@@ -119,26 +135,44 @@
   onDestroy(() => {
     if (idleInterval) clearInterval(idleInterval);
     if (filterDebounce) clearTimeout(filterDebounce);
+    if (filterAbortCtrl) filterAbortCtrl.abort();
   });
 
-  // Only open fullscreen upload dropzone if real external OS files are being dragged
-  function handleDragOver(e: DragEvent) {
+  // --- Robust Drag & Drop Handling (Zero Flicker) ---
+  function isValidFileDrag(e: DragEvent): boolean {
     const types = e.dataTransfer?.types;
-    if (types && types.includes('Files') && !types.includes('text/plain') && !types.includes('application/x-face-id')) {
-      e.preventDefault();
-      isDraggingOverWindow = true;
+    return !!(types && types.includes('Files') && !types.includes('text/plain') && !types.includes('application/x-face-id'));
+  }
+
+  function handleDragEnter(e: DragEvent) {
+    if (!isValidFileDrag(e)) return;
+    e.preventDefault();
+    dragCounter++;
+    isDraggingOverWindow = true;
+  }
+
+  function handleDragOver(e: DragEvent) {
+    if (!isValidFileDrag(e)) return;
+    e.preventDefault();
+  }
+
+  function handleDragLeave(e: DragEvent) {
+    if (!isValidFileDrag(e)) return;
+    e.preventDefault();
+    dragCounter--;
+    if (dragCounter <= 0) {
+      dragCounter = 0;
+      isDraggingOverWindow = false;
     }
   }
 
   function handleDrop(e: DragEvent) {
-    const types = e.dataTransfer?.types;
-    if (!types || !types.includes('Files') || types.includes('text/plain') || types.includes('application/x-face-id')) {
-      isDraggingOverWindow = false;
-      return;
-    }
-    e.preventDefault();
+    dragCounter = 0;
     isDraggingOverWindow = false;
-    if (e.dataTransfer.files?.length) {
+    if (!isValidFileDrag(e)) return;
+
+    e.preventDefault();
+    if (e.dataTransfer?.files?.length) {
       droppedFiles = Array.from(e.dataTransfer.files);
       showUploadModal = true;
     }
@@ -160,11 +194,12 @@
 
 <svelte:window
   on:visibilitychange={handleVisibilityChange}
-  on:pointerdown={recordUserActivity}
+  on:pointerdown|passive={recordUserActivity}
   on:wheel|passive={recordUserActivity}
   on:keydown={handleGlobalKeyDown}
+  on:dragenter={handleDragEnter}
   on:dragover={handleDragOver}
-  on:dragleave={(e) => { if (e.clientX === 0 || e.clientY === 0) isDraggingOverWindow = false; }}
+  on:dragleave={handleDragLeave}
   on:drop={handleDrop}
 />
 
@@ -178,7 +213,7 @@
           <a href="/" class="text-base font-bold tracking-tight text-white flex items-center gap-1.5 hover:opacity-90 transition-opacity">
             Vault
             {#if $filterStore.is_private}
-              <span class="text-[10px] bg-purple-950/80 text-purple-300 border border-purple-800/60 px-1.5 py-0.2 rounded font-mono font-medium">
+              <span class="text-[10px] bg-purple-950/80 text-purple-300 border border-purple-800/60 px-1.5 py-0.5 rounded font-mono font-medium">
                 PRIVATE
               </span>
             {/if}
@@ -239,7 +274,7 @@
             class="w-full bg-neutral-900 border border-neutral-800 text-xs text-neutral-300 rounded p-1.5 outline-none cursor-pointer"
           >
             <option value="">All Folders</option>
-            {#each filters.albums as alb}
+            {#each filters.albums as alb (alb.value)}
               <option value={alb.value}>{alb.label} ({alb.count})</option>
             {/each}
           </select>
@@ -274,7 +309,7 @@
         <div class="space-y-1.5 pt-1 border-t border-neutral-900">
           <span class="text-[10px] uppercase font-semibold text-neutral-500 tracking-wider">People</span>
           <div class="flex flex-wrap gap-1 max-h-24 overflow-y-auto">
-            {#each filters.people as p}
+            {#each filters.people as p (p.value)}
               <button
                 type="button"
                 on:click={() => filterStore.togglePerson(p.value)}
@@ -292,7 +327,7 @@
         <div class="space-y-1.5 pt-1 border-t border-neutral-900">
           <span class="text-[10px] uppercase font-semibold text-neutral-500 tracking-wider">Tags</span>
           <div class="flex flex-wrap gap-1 max-h-28 overflow-y-auto">
-            {#each filters.tags as t}
+            {#each filters.tags as t (t.value)}
               <button
                 type="button"
                 on:click={() => filterStore.toggleTag(t.value)}
@@ -315,7 +350,7 @@
             class="w-full bg-neutral-900 border border-neutral-800 text-xs text-neutral-300 rounded p-1.5 outline-none cursor-pointer"
           >
             <option value="">All Places</option>
-            {#each filters.locations as loc}
+            {#each filters.locations as loc (loc.value)}
               <option value={loc.value}>{loc.label} ({loc.count})</option>
             {/each}
           </select>
@@ -332,7 +367,7 @@
             class="w-full bg-neutral-900 border border-neutral-800 text-xs text-neutral-300 rounded p-1.5 outline-none cursor-pointer"
           >
             <option value="">All Cameras</option>
-            {#each filters.cameras as cam}
+            {#each filters.cameras as cam (cam.value)}
               <option value={cam.value}>{cam.label} ({cam.count})</option>
             {/each}
           </select>
@@ -340,9 +375,8 @@
       {/if}
     </div>
 
-    <!-- Bottom Actions: People Management, Trash & Reset -->
+    <!-- Bottom Actions -->
     <div class="pt-3 border-t border-neutral-900 space-y-2">
-      <!-- Manage People Navigation Toggle (Above Trash) -->
       <a
         href={isOnPeoplePage ? '/' : `/people?is_private=${$filterStore.is_private}`}
         class="w-full py-1.5 px-2.5 text-xs rounded-lg flex items-center justify-between border transition-all cursor-pointer {isOnPeoplePage ? 'bg-purple-950/60 border-purple-800 text-purple-200 font-medium' : 'bg-neutral-900/80 border-neutral-800 text-neutral-400 hover:text-white'}"
@@ -352,11 +386,10 @@
           <span>{isOnPeoplePage ? 'Exit Manage People' : 'Manage People'}</span>
         </span>
         {#if isOnPeoplePage}
-          <span class="text-[9px] bg-purple-900/80 text-purple-200 px-1 py-0.2 rounded font-mono">BACK</span>
+          <span class="text-[9px] bg-purple-900/80 text-purple-200 px-1 py-0.5 rounded font-mono">BACK</span>
         {/if}
       </a>
 
-      <!-- Trash Filter Button -->
       <button
         type="button"
         on:click={() => filterStore.toggleTrash()}
@@ -366,11 +399,10 @@
           🗑️ <span>{$filterStore.show_trash ? 'Viewing Trash' : 'Trash (30d Auto-Purge)'}</span>
         </span>
         {#if $filterStore.show_trash}
-          <span class="text-[9px] bg-red-900/80 text-red-200 px-1 py-0.2 rounded font-mono">ACTIVE</span>
+          <span class="text-[9px] bg-red-900/80 text-red-200 px-1 py-0.5 rounded font-mono">ACTIVE</span>
         {/if}
       </button>
 
-      <!-- Reset -->
       <button
         type="button"
         on:click={() => filterStore.reset()}
@@ -383,7 +415,6 @@
 
   <!-- Main View Area -->
   <main class="flex-1 h-full overflow-y-auto bg-neutral-950 relative">
-    <!-- Top-Right Purple Vault Button with Guard -->
     <div class="fixed top-4 right-6 z-40">
       <button
         type="button"
@@ -419,7 +450,7 @@
     </button>
   </main>
 
-  <!-- Fullscreen Drag Overlay -->
+  <!-- Fullscreen Drag Overlay (Guaranteed Zero Flicker) -->
   {#if isDraggingOverWindow}
     <div class="fixed inset-0 z-50 bg-black/70 border-2 border-dashed border-neutral-400 flex items-center justify-center pointer-events-none backdrop-blur-xs">
       <div class="bg-neutral-900 px-6 py-3 rounded-xl border border-neutral-800 text-sm font-medium text-white shadow-2xl">
@@ -428,7 +459,6 @@
     </div>
   {/if}
 
-  <!-- Upload Modal -->
   <UploadModal
     isOpen={showUploadModal}
     initialFiles={droppedFiles}
@@ -441,7 +471,6 @@
     }}
   />
 
-  <!-- Biometric & Master Password Authentication Gate -->
   <VaultAuthModal
     isOpen={showAuthModal}
     on:success={handleAuthSuccess}

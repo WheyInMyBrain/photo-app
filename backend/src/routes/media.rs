@@ -1,6 +1,6 @@
 use axum::{
     extract::{Path as AxumPath, Query, Request, State},
-    http::{header, HeaderValue, StatusCode},
+    http::{header, HeaderName, HeaderValue, StatusCode},
     response::{IntoResponse, Json, Response},
 };
 use tower_http::services::ServeFile;
@@ -8,7 +8,7 @@ use tower_http::services::ServeFile;
 use crate::db::AssetRepo;
 use crate::domain::media::{
     DynamicFiltersResponse, FavoriteToggleResponse, MediaPageResponse, MediaQuery,
-    SoftDeleteResponse,
+    SoftDeleteResponse, BatchActionRequest, BatchActionResponse
 };
 use crate::error::AppError;
 use crate::AppState;
@@ -50,7 +50,6 @@ pub async fn toggle_favorite(
 }
 
 /// GET /api/assets/:id/stream
-///
 /// Serves photos strictly from lightweight preview paths.
 /// Serves videos from originals with full zero-copy byte-range (HTTP 206) scrubbing via ServeFile.
 pub async fn stream_asset(
@@ -96,6 +95,12 @@ pub async fn stream_asset(
     response.headers_mut().insert(
         header::CACHE_CONTROL,
         HeaderValue::from_static("public, max-age=2592000, immutable"),
+    );
+
+    // Disable proxy buffering for instant byte-range scrubbing
+    response.headers_mut().insert(
+        HeaderName::from_static("x-accel-buffering"),
+        HeaderValue::from_static("no"),
     );
 
     Ok(response)
@@ -145,4 +150,36 @@ pub async fn hard_delete_asset(
     }
 
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// POST /api/assets/batch/delete
+pub async fn batch_toggle_soft_delete(
+    State(state): State<AppState>,
+    Json(payload): Json<BatchActionRequest>,
+) -> Result<Json<BatchActionResponse>, AppError> {
+    if payload.ids.is_empty() {
+        return Ok(Json(BatchActionResponse { affected_count: 0 }));
+    }
+
+    let affected_count = AssetRepo::batch_toggle_soft_delete(&state.db, &payload.ids)
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+
+    Ok(Json(BatchActionResponse { affected_count }))
+}
+
+/// POST /api/assets/batch/purge
+pub async fn batch_purge_assets(
+    State(state): State<AppState>,
+    Json(payload): Json<BatchActionRequest>,
+) -> Result<Json<BatchActionResponse>, AppError> {
+    if payload.ids.is_empty() {
+        return Ok(Json(BatchActionResponse { affected_count: 0 }));
+    }
+
+    let affected_count = AssetRepo::batch_purge(&state.db, &payload.ids, &state.config.storage_root)
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+
+    Ok(Json(BatchActionResponse { affected_count }))
 }

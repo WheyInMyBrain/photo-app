@@ -801,4 +801,59 @@ impl AssetRepo {
 
         Ok(true)
     }
+
+    pub async fn batch_toggle_soft_delete(
+        pool: &SqlitePool,
+        ids: &[String],
+    ) -> Result<usize, sqlx::Error> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
+
+        let mut tx = pool.begin().await?;
+        let mut count = 0;
+
+        for id in ids {
+            // Toggles deleted_at: if NULL -> set to CURRENT_TIMESTAMP, if set -> restore to NULL
+            let res = sqlx::query(
+                r#"
+                UPDATE assets
+                SET deleted_at = CASE 
+                    WHEN deleted_at IS NULL THEN CURRENT_TIMESTAMP 
+                    ELSE NULL 
+                END
+                WHERE id = ?1
+                "#
+            )
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+
+            count += res.rows_affected() as usize;
+        }
+
+        tx.commit().await?;
+        Ok(count)
+    }
+
+    pub async fn batch_purge(
+        pool: &SqlitePool,
+        ids: &[String],
+        storage_root: &std::path::Path,
+    ) -> Result<usize, sqlx::Error> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
+
+        let mut purged_count = 0;
+
+        // Perform file unlinks and DB removals
+        for id in ids {
+            if let Ok(true) = Self::purge_asset(pool, id, storage_root).await {
+                purged_count += 1;
+            }
+        }
+
+        Ok(purged_count)
+    }
 }

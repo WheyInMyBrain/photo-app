@@ -46,6 +46,15 @@
     }
   });
 
+  onMount(() => {
+    const originalOverflow = document.body.style.overflow;
+    document.body.style.overflow = 'hidden';
+
+    return () => {
+      document.body.style.overflow = originalOverflow;
+    };
+  });
+
   function addFiles(files: FileList | File[]) {
     const valid = Array.from(files).filter(
       (f) => f.type.startsWith('image/') || f.type.startsWith('video/')

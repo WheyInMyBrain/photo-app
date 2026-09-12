@@ -1,46 +1,58 @@
 <script lang="ts">
   import { onMount, onDestroy } from 'svelte';
 
-  export let minHeight = 320;
+  export let itemCount: number = 0;
+  export let minHeight: number = 240;
 
   let containerEl: HTMLElement;
   let isVisible = false;
-  let recordedHeight = minHeight;
+  let recordedHeight: number = minHeight;
   let observer: IntersectionObserver | null = null;
+  let resizeObserver: ResizeObserver | null = null;
+
+  // Pre-calculate estimated height to eliminate initial scroll jumping
+  $: if (recordedHeight === minHeight && itemCount > 0) {
+    const estimatedRows = Math.ceil(itemCount / 4);
+    recordedHeight = Math.max(minHeight, estimatedRows * 220 + 40);
+  }
 
   onMount(() => {
+    // Scoped resolution to the actual scroll ancestor
+    const scrollContainer = containerEl ? containerEl.closest('main') : null;
+
     observer = new IntersectionObserver(
       ([entry]) => {
         isVisible = entry.isIntersecting;
-        if (entry.isIntersecting && containerEl) {
-          const rect = containerEl.getBoundingClientRect();
-          if (rect.height > 0) {
-            recordedHeight = Math.round(rect.height);
-          }
-        }
       },
       {
-        rootMargin: '1000px 0px 1000px 0px',
+        root: scrollContainer,
+        rootMargin: '800px 0px 800px 0px',
         threshold: 0
       }
     );
 
+    resizeObserver = new ResizeObserver(([entry]) => {
+      if (entry && entry.contentRect.height > 0) {
+        recordedHeight = Math.round(entry.contentRect.height);
+      }
+    });
+
     if (containerEl) {
       observer.observe(containerEl);
+      resizeObserver.observe(containerEl);
     }
   });
 
   onDestroy(() => {
-    if (observer) {
-      observer.disconnect();
-    }
+    if (observer) observer.disconnect();
+    if (resizeObserver) resizeObserver.disconnect();
   });
 </script>
 
 <section
   bind:this={containerEl}
   style="min-height: {isVisible ? 'auto' : `${recordedHeight}px`};"
-  class="relative"
+  class="relative will-change-transform"
 >
   {#if isVisible}
     <slot></slot>

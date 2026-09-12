@@ -2,36 +2,13 @@
   import { browser } from '$app/environment';
   import { onMount, onDestroy } from 'svelte';
   import { filterStore, filterQueryString } from '$lib/stores/filterStore';
-  import PhotoModal from '$lib/components/PhotoModal.svelte';
+  import type { SubAlbum, MediaItem, MediaPageResponse } from '$lib/types/media';
+
   import VirtualSection from '$lib/components/VirtualSection.svelte';
-
-  interface SubAlbum {
-    name: string;
-    path: string;
-    count: number;
-    cover_thumb: string | null;
-  }
-
-  interface MediaItem {
-    id: string;
-    file_name: string;
-    thumb_path: string;
-    preview_path: string;
-    aspect_ratio: number | null;
-    duration_seconds: number | null;
-    mime_type: string;
-    captured_at: string | null;
-    is_favorite: number;
-    deleted_at: string | null;
-  }
-
-  interface MediaPageResponse {
-    albums: SubAlbum[];
-    items: MediaItem[];
-    next_cursor_captured_at: string | null;
-    next_cursor_id: string | null;
-    has_more: boolean;
-  }
+  import FolderGrid from '$lib/components/FolderGrid.svelte';
+  import MediaCard from '$lib/components/MediaCard.svelte';
+  import BatchActionBar from '$lib/components/BatchActionBar.svelte';
+  import PhotoModal from '$lib/components/PhotoModal.svelte';
 
   let albums: SubAlbum[] = [];
   let items: MediaItem[] = [];
@@ -46,17 +23,23 @@
   let isLoading = false;
   let scrollTrigger: HTMLDivElement;
   let observer: IntersectionObserver | null = null;
+  let filterDebounceTimer: ReturnType<typeof setTimeout> | null = null;
 
-  // Multi-select state
-  let selectedIds = new Set<string>();
+  let pageAbortCtrl: AbortController | null = null;
+  let lastFetchErrorTime = 0;
+  const RETRY_BACKOFF_MS = 3000;
+
+  let selectedMap: Record<string, boolean> = {};
+  let selectedCount = 0;
+  let lastSelectedId: string | null = null;
   let isActionLoading = false;
+
+  let selectedIndex: number | null = null;
+  $: selectedAsset = selectedIndex !== null ? items[selectedIndex] : null;
 
   $: folderSegments = $filterStore.folder_path
     ? $filterStore.folder_path.split('/').filter(Boolean)
     : [];
-
-  let selectedIndex: number | null = null;
-  $: selectedAsset = selectedIndex !== null ? items[selectedIndex] : null;
 
   function getGroupHeader(dateStr: string | null): string {
     if (!dateStr) return 'Undated';
@@ -66,25 +49,16 @@
       : d.toLocaleDateString(undefined, { month: 'long', year: 'numeric' });
   }
 
-  function getDaysRemaining(deletedAt: string | null): number {
-    if (!deletedAt) return 30;
-    const diffMs = Date.now() - new Date(deletedAt).getTime();
-    const daysPassed = Math.floor(diffMs / (1000 * 60 * 60 * 24));
-    return Math.max(0, 30 - daysPassed);
-  }
-
   function appendItemsToGroups(newItems: MediaItem[], startIndex: number) {
     for (let i = 0; i < newItems.length; i++) {
       const item = newItems[i];
-      const globalIdx = startIndex + i;
-      itemIndexMap.set(item.id, globalIdx);
+      itemIndexMap.set(item.id, startIndex + i);
 
       const key = getGroupHeader(item.captured_at);
-      let gIdx = groupIndexMap.get(key);
+      const gIdx = groupIndexMap.get(key);
 
       if (gIdx === undefined) {
-        gIdx = groupedSections.length;
-        groupIndexMap.set(key, gIdx);
+        groupIndexMap.set(key, groupedSections.length);
         groupedSections.push([key, [item]]);
       } else {
         groupedSections[gIdx][1].push(item);
@@ -94,21 +68,28 @@
   }
 
   async function fetchMedia(reset = false) {
-    if (!browser || isLoading || (!hasMore && !reset)) return;
-    isLoading = true;
+    if (!browser || (!hasMore && !reset)) return;
 
     if (reset) {
+      if (pageAbortCtrl) pageAbortCtrl.abort();
       items = [];
       itemIndexMap.clear();
       albums = [];
       groupedSections = [];
       groupIndexMap.clear();
-      selectedIds.clear();
-      selectedIds = selectedIds;
+      selectedMap = {};
+      selectedCount = 0;
+      lastSelectedId = null;
       nextCapturedAt = null;
       nextId = null;
       hasMore = true;
+      lastFetchErrorTime = 0;
+    } else {
+      if (isLoading || Date.now() - lastFetchErrorTime < RETRY_BACKOFF_MS) return;
     }
+
+    pageAbortCtrl = new AbortController();
+    isLoading = true;
 
     try {
       const baseParams = new URLSearchParams($filterQueryString.replace(/^\?/, ''));
@@ -119,7 +100,9 @@
         baseParams.set('cursor_id', nextId);
       }
 
-      const res = await fetch(`/api/media?${baseParams.toString()}`);
+      const res = await fetch(`/api/media?${baseParams.toString()}`, {
+        signal: pageAbortCtrl.signal
+      });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data: MediaPageResponse = await res.json();
 
@@ -134,7 +117,10 @@
       nextCapturedAt = data.next_cursor_captured_at;
       nextId = data.next_cursor_id;
       hasMore = data.has_more;
-    } catch (err) {
+      lastFetchErrorTime = 0;
+    } catch (err: any) {
+      if (err?.name === 'AbortError') return;
+      lastFetchErrorTime = Date.now();
       console.error('Failed fetching media:', err);
     } finally {
       isLoading = false;
@@ -142,33 +128,66 @@
   }
 
   $: if (browser && $filterQueryString !== undefined) {
-    fetchMedia(true);
+    if (filterDebounceTimer) clearTimeout(filterDebounceTimer);
+    filterDebounceTimer = setTimeout(() => {
+      fetchMedia(true);
+    }, 200);
   }
 
   function toggleSelect(id: string, e: MouseEvent) {
     e.stopPropagation();
-    if (selectedIds.has(id)) {
-      selectedIds.delete(id);
-    } else {
-      selectedIds.add(id);
+
+    if (e.shiftKey && lastSelectedId && lastSelectedId !== id) {
+      const startIdx = itemIndexMap.get(lastSelectedId);
+      const endIdx = itemIndexMap.get(id);
+
+      if (startIdx !== undefined && endIdx !== undefined) {
+        const [low, high] = [Math.min(startIdx, endIdx), Math.max(startIdx, endIdx)];
+        for (let i = low; i <= high; i++) {
+          const target = items[i];
+          if (target && !selectedMap[target.id]) {
+            selectedMap[target.id] = true;
+            selectedCount += 1;
+          }
+        }
+        lastSelectedId = id;
+        selectedMap = selectedMap;
+        return;
+      }
     }
-    selectedIds = selectedIds;
+
+    if (selectedMap[id]) {
+      delete selectedMap[id];
+      selectedCount -= 1;
+      lastSelectedId = null;
+    } else {
+      selectedMap[id] = true;
+      selectedCount += 1;
+      lastSelectedId = id;
+    }
+    selectedMap = selectedMap;
   }
 
   function clearSelection() {
-    selectedIds.clear();
-    selectedIds = selectedIds;
+    selectedMap = {};
+    selectedCount = 0;
+    lastSelectedId = null;
   }
 
   async function handleBatchToggleDelete() {
-    if (selectedIds.size === 0 || isActionLoading) return;
+    const ids = Object.keys(selectedMap);
+    if (ids.length === 0 || isActionLoading) return;
     isActionLoading = true;
 
     try {
-      const promises = Array.from(selectedIds).map((id) =>
-        fetch(`/api/assets/${id}/delete`, { method: 'POST' })
-      );
-      await Promise.all(promises);
+      const res = await fetch('/api/assets/batch/delete', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ids })
+      });
+
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+
       clearSelection();
       fetchMedia(true);
     } catch (e) {
@@ -179,18 +198,20 @@
   }
 
   async function handleBatchPurge() {
-    if (selectedIds.size === 0 || isActionLoading) return;
-    const confirmed = confirm(
-      `Are you sure you want to permanently delete ${selectedIds.size} item(s)? This cannot be undone.`
-    );
-    if (!confirmed) return;
+    const ids = Object.keys(selectedMap);
+    if (ids.length === 0 || isActionLoading) return;
+    if (!confirm(`Permanently delete ${ids.length} item(s)? This cannot be undone.`)) return;
 
     isActionLoading = true;
     try {
-      const promises = Array.from(selectedIds).map((id) =>
-        fetch(`/api/assets/${id}/purge`, { method: 'POST' })
-      );
-      await Promise.all(promises);
+      const res = await fetch('/api/assets/batch/purge', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ids })
+      });
+
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+
       clearSelection();
       fetchMedia(true);
     } catch (e) {
@@ -202,25 +223,35 @@
 
   function openModalForAsset(id: string) {
     const idx = itemIndexMap.get(id);
-    if (idx !== undefined) {
-      selectedIndex = idx;
-    }
+    if (idx !== undefined) selectedIndex = idx;
   }
 
   onMount(() => {
-    fetchMedia(true);
+    const handleRefresh = () => fetchMedia(true);
+    window.addEventListener('vault:refresh-timeline', handleRefresh);
+
+    const scrollContainer = document.querySelector('main');
     observer = new IntersectionObserver(
       (entries) => {
         if (entries[0].isIntersecting && hasMore && !isLoading) {
           fetchMedia();
         }
       },
-      { rootMargin: '600px' }
+      {
+        root: scrollContainer ?? null,
+        rootMargin: '600px'
+      }
     );
     if (scrollTrigger) observer.observe(scrollTrigger);
+
+    return () => {
+      window.removeEventListener('vault:refresh-timeline', handleRefresh);
+    };
   });
 
   onDestroy(() => {
+    if (pageAbortCtrl) pageAbortCtrl.abort();
+    if (filterDebounceTimer) clearTimeout(filterDebounceTimer);
     if (observer) observer.disconnect();
   });
 </script>
@@ -255,37 +286,8 @@
     {/if}
   </div>
 
-  <!-- Folders -->
-  {#if albums.length > 0 && !$filterStore.show_trash}
-    <div>
-      <h3 class="text-[11px] uppercase font-semibold text-neutral-500 tracking-wider mb-2">Folders</h3>
-      <div class="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-6 gap-2.5">
-        {#each albums as album (album.path)}
-          <button
-            type="button"
-            on:click={() => filterStore.setFolderPath(album.path)}
-            class="group bg-neutral-900 border border-neutral-800 hover:border-neutral-700 p-2.5 rounded-xl flex items-center gap-2.5 text-left transition-all cursor-pointer"
-          >
-            <div class="w-9 h-9 rounded-lg bg-neutral-800 flex items-center justify-center overflow-hidden flex-shrink-0">
-              {#if album.cover_thumb}
-                <img
-                  src="/{album.cover_thumb}"
-                  alt={album.name}
-                  class="w-full h-full object-cover group-hover:scale-105 transition-transform"
-                />
-              {:else}
-                📁
-              {/if}
-            </div>
-            <div class="truncate">
-              <div class="text-xs font-medium text-neutral-200 group-hover:text-white truncate">{album.name}</div>
-              <div class="text-[10px] text-neutral-500">{album.count} items</div>
-            </div>
-          </button>
-        {/each}
-      </div>
-    </div>
-  {/if}
+  <!-- Folder Grid Component -->
+  <FolderGrid {albums} />
 
   <!-- Media Grid with Section Windowing -->
   {#if items.length === 0 && albums.length === 0 && !isLoading}
@@ -304,58 +306,18 @@
   {:else}
     <div class="space-y-6">
       {#each groupedSections as [groupName, groupList] (groupName)}
-        <VirtualSection minHeight={240}>
+        <VirtualSection itemCount={groupList.length} minHeight={240}>
           <h2 class="text-xs font-semibold text-neutral-400 uppercase tracking-wider mb-2 sticky top-0 bg-neutral-950/80 backdrop-blur-md py-1 z-10">
             {groupName}
           </h2>
           <div class="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 gap-2.5">
             {#each groupList as asset (asset.id)}
-              <div
-                role="button"
-                tabindex="0"
-                on:click={() => openModalForAsset(asset.id)}
-                on:keydown={(e) => {
-                  if (e.key === 'Enter') openModalForAsset(asset.id);
-                }}
-                class="group relative aspect-square bg-neutral-900 rounded-lg overflow-hidden border transition-all cursor-pointer will-change-transform {selectedIds.has(asset.id) ? 'border-purple-500 ring-2 ring-purple-500/40' : 'border-neutral-800/80 hover:border-neutral-700'}"
-              >
-                <img
-                  src="/{asset.thumb_path}"
-                  alt={asset.file_name}
-                  loading="lazy"
-                  decoding="async"
-                  class="w-full h-full object-cover group-hover:scale-105 transition-transform duration-200 pointer-events-none"
-                />
-
-                <!-- Checkbox Multi-Select Dot -->
-                <button
-                  type="button"
-                  on:click={(e) => toggleSelect(asset.id, e)}
-                  class="absolute top-1.5 left-1.5 w-5 h-5 rounded-md flex items-center justify-center transition-all z-20 cursor-pointer {selectedIds.has(asset.id) ? 'bg-purple-600 text-white' : 'bg-black/40 text-transparent hover:bg-black/70 hover:text-neutral-400 border border-neutral-700/60'}"
-                  title="Select photo"
-                >
-                  <span class="text-xs font-bold leading-none">✓</span>
-                </button>
-
-                <!-- Trash Badge -->
-                {#if asset.deleted_at}
-                  <div class="absolute bottom-1.5 left-1.5 bg-red-950/90 border border-red-800/80 px-1.5 py-0.5 rounded text-[9px] text-red-300 font-mono z-10 shadow">
-                    🗑️ {getDaysRemaining(asset.deleted_at)}d left
-                  </div>
-                {/if}
-
-                <!-- Favorite Badge -->
-                {#if asset.is_favorite}
-                  <div class="absolute top-1.5 right-1.5 bg-black/60 p-1 rounded-full text-amber-400 text-[10px] leading-none">★</div>
-                {/if}
-
-                <!-- Duration Badge -->
-                {#if asset.duration_seconds}
-                  <div class="absolute bottom-1 right-1 bg-black/75 px-1 py-0.5 rounded text-[9px] text-white font-mono">
-                    {Math.floor(asset.duration_seconds / 60)}:{Math.floor(asset.duration_seconds % 60).toString().padStart(2, '0')}
-                  </div>
-                {/if}
-              </div>
+              <MediaCard
+                {asset}
+                isSelected={Boolean(selectedMap[asset.id])}
+                on:open={() => openModalForAsset(asset.id)}
+                on:select={(e) => toggleSelect(asset.id, e.detail)}
+              />
             {/each}
           </div>
         </VirtualSection>
@@ -363,64 +325,26 @@
     </div>
   {/if}
 
+  <!-- Infinite Scroll Intersection Target -->
   <div bind:this={scrollTrigger} class="py-6 text-center text-xs text-neutral-600">
     {#if isLoading}Loading more...{/if}
   </div>
 
-  <!-- Action Bar -->
-  {#if selectedIds.size > 0}
-    <div class="fixed bottom-6 left-1/2 -translate-x-1/2 z-40 bg-neutral-900/95 border border-neutral-800 shadow-2xl backdrop-blur-md px-4 py-2 rounded-2xl flex items-center gap-3">
-      <span class="text-xs text-neutral-300 font-medium">
-        {selectedIds.size} selected
-      </span>
-
-      <div class="h-4 w-px bg-neutral-800"></div>
-
-      {#if $filterStore.show_trash}
-        <button
-          type="button"
-          on:click={handleBatchToggleDelete}
-          disabled={isActionLoading}
-          class="text-xs px-2.5 py-1 bg-neutral-800 hover:bg-neutral-700 text-neutral-200 rounded-lg transition-colors cursor-pointer font-medium"
-        >
-          ↺ Restore
-        </button>
-
-        <button
-          type="button"
-          on:click={handleBatchPurge}
-          disabled={isActionLoading}
-          class="text-xs px-2.5 py-1 bg-red-900/70 hover:bg-red-800 text-red-200 rounded-lg transition-colors cursor-pointer font-medium"
-        >
-          Delete Forever
-        </button>
-      {:else}
-        <button
-          type="button"
-          on:click={handleBatchToggleDelete}
-          disabled={isActionLoading}
-          class="text-xs px-3 py-1 bg-red-950/80 hover:bg-red-900 text-red-300 border border-red-900/60 rounded-lg transition-colors cursor-pointer font-medium flex items-center gap-1.5"
-        >
-          <span>🗑️</span>
-          <span>Move to Trash</span>
-        </button>
-      {/if}
-
-      <button
-        type="button"
-        on:click={clearSelection}
-        class="text-xs text-neutral-500 hover:text-white px-1.5 py-1 cursor-pointer"
-        title="Deselect All"
-      >
-        ✕
-      </button>
-    </div>
-  {/if}
+  <!-- Floating Multi-Select Action Bar Component -->
+  <BatchActionBar
+    count={selectedCount}
+    {isActionLoading}
+    on:toggleDelete={handleBatchToggleDelete}
+    on:purge={handleBatchPurge}
+    on:clear={clearSelection}
+  />
 
   <!-- Single Photo Modal View -->
   {#if selectedAsset && selectedIndex !== null}
     <PhotoModal
       asset={selectedAsset}
+      prevAsset={selectedIndex > 0 ? items[selectedIndex - 1] : null}
+      nextAsset={selectedIndex < items.length - 1 ? items[selectedIndex + 1] : null}
       hasPrev={selectedIndex > 0}
       hasNext={selectedIndex < items.length - 1}
       on:close={() => (selectedIndex = null)}

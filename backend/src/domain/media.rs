@@ -131,6 +131,16 @@ pub struct DynamicFiltersResponse {
     pub albums: Vec<FilterOption>,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct BatchActionRequest {
+    pub ids: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct BatchActionResponse {
+    pub affected_count: usize,
+}
+
 #[derive(Serialize)]
 pub struct FavoriteToggleResponse {
     pub asset_id: String,

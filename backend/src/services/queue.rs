@@ -3,7 +3,7 @@ use sqlx::SqlitePool;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::Notify;
+use tokio::sync::{Notify, Semaphore};
 use tracing::{error, info};
 
 use crate::db::{AssetRepo, JobRepo};
@@ -51,6 +51,15 @@ impl QueueService {
         tag_engine: Arc<TagEngine>,
         notify: Arc<Notify>,
     ) {
+        // Bound concurrent ONNX inferences: (cores / 2), clamped between 1 and 3.
+        // Prevents memory exhaustion and preserves CPU capacity for API responses.
+        let cores = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4);
+        let ai_slots = (cores / 2).clamp(1, 3);
+        let ai_semaphore = Arc::new(Semaphore::new(ai_slots));
+        info!(ai_worker_concurrency = ai_slots, "AI inference throttling active");
+
         tokio::spawn(async move {
             info!("Persistent background media worker running (FaceEngine + TagEngine)");
 
@@ -102,6 +111,7 @@ impl QueueService {
                             thumbs_root.clone(),
                             face_engine.clone(),
                             tag_engine.clone(),
+                            ai_semaphore.clone(),
                             job,
                             artifacts,
                         )
@@ -209,6 +219,7 @@ impl QueueService {
         thumbs_root: PathBuf,
         face_engine: Arc<FaceEngine>,
         tag_engine: Arc<TagEngine>,
+        ai_semaphore: Arc<Semaphore>,
         job: ProcessJob,
         art: MediaArtifacts,
     ) -> Result<(), String> {
@@ -261,6 +272,12 @@ impl QueueService {
             let thumbs_clone = thumbs_root.clone();
 
             tokio::spawn(async move {
+                // Acquire permit: blocks if too many models are currently running
+                let _permit = match ai_semaphore.acquire().await {
+                    Ok(p) => p,
+                    Err(_) => return, // Semaphore closed on shutdown
+                };
+
                 let f_engine = face_engine.clone();
                 let f_pool = pool_clone.clone();
                 let f_thumbs = thumbs_clone.clone();
@@ -272,7 +289,6 @@ impl QueueService {
                 let t_id = a_id.clone();
                 let t_img = img_arc.clone();
 
-                // Run both Face and Tag pipelines concurrently; both isolate ONNX on blocking threads
                 let (face_res, tag_res) = tokio::join!(
                     FacePipeline::process_asset_faces(f_engine, &f_pool, &f_thumbs, &f_id, f_img),
                     TagPipeline::process_asset_tags(t_engine, &t_pool, &t_id, t_img)
@@ -293,6 +309,7 @@ impl QueueService {
                 } else {
                     info!(id = %a_id, "FTS5 search index refreshed with tags and faces");
                 }
+                // `_permit` drops here, unlocking the slot for the next image
             });
         }
 

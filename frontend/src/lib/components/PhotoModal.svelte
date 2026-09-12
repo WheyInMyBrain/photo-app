@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount, createEventDispatcher } from 'svelte';
+  import { onMount, onDestroy, createEventDispatcher } from 'svelte';
 
   export let asset: {
     id: string;
@@ -11,6 +11,8 @@
     is_favorite?: number;
   } | null = null;
 
+  export let prevAsset: { id: string; mime_type: string } | null = null;
+  export let nextAsset: { id: string; mime_type: string } | null = null;
   export let hasPrev = false;
   export let hasNext = false;
 
@@ -53,9 +55,21 @@
   let editingFaceId: string | null = null;
   let editingName = '';
 
-  // Svelte action to replace HTML autofocus and eliminate a11y warnings
+  let detailAbortCtrl: AbortController | null = null;
+
   function focusInput(node: HTMLElement) {
     node.focus();
+  }
+
+  // Preload neighboring media into memory for zero-latency transitions
+  $: if (nextAsset && !nextAsset.mime_type.startsWith('video/')) {
+    const img = new Image();
+    img.src = `/api/assets/${nextAsset.id}/stream`;
+  }
+
+  $: if (prevAsset && !prevAsset.mime_type.startsWith('video/')) {
+    const img = new Image();
+    img.src = `/api/assets/${prevAsset.id}/stream`;
   }
 
   $: if (asset?.id) {
@@ -73,15 +87,38 @@
     }
   });
 
+  onMount(() => {
+    const originalOverflow = document.body.style.overflow;
+    document.body.style.overflow = 'hidden';
+
+    return () => {
+      document.body.style.overflow = originalOverflow;
+    };
+  });
+
+  onDestroy(() => {
+    if (detailAbortCtrl) detailAbortCtrl.abort();
+  });
+
   async function loadDetails(id: string) {
+    if (detailAbortCtrl) {
+      detailAbortCtrl.abort();
+    }
+    detailAbortCtrl = new AbortController();
     loadingDetails = true;
+
     try {
       const [fRes, tRes] = await Promise.all([
-        fetch(`/api/assets/${id}/faces`),
-        fetch(`/api/assets/${id}/tags`)
+        fetch(`/api/assets/${id}/faces`, { signal: detailAbortCtrl.signal }),
+        fetch(`/api/assets/${id}/tags`, { signal: detailAbortCtrl.signal })
       ]);
       faces = fRes.ok ? await fRes.json() : [];
       tags = tRes.ok ? await tRes.json() : [];
+    } catch (e: any) {
+      if (e?.name !== 'AbortError') {
+        faces = [];
+        tags = [];
+      }
     } finally {
       loadingDetails = false;
     }
@@ -107,13 +144,11 @@
     editingFaceId = null;
     if (!clean || clean === face.person_name) return;
 
-    // Check if entered name already belongs to an existing person cluster
     const matched = knownPeople.find(
       (p) => p.name?.toLowerCase() === clean.toLowerCase()
     );
 
     if (matched && matched.id !== face.person_id) {
-      // 1. Move face to existing person cluster
       const res = await fetch(`/api/faces/${face.face_id}/reassign`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -125,7 +160,6 @@
         faces = [...faces];
       }
     } else if (face.person_id) {
-      // 2. Assign brand new name to this cluster
       const res = await fetch(`/api/persons/${face.person_id}/name`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -152,9 +186,8 @@
 
 <svelte:window on:keydown={handleKeydown} />
 
-<!-- Explicitly closed <option> tag prevents Vite compiler warning -->
 <datalist id="known-people-list">
-  {#each knownPeople as person}
+  {#each knownPeople as person (person.id)}
     {#if person.name}
       <option value={person.name}>{person.name}</option>
     {/if}
@@ -162,25 +195,50 @@
 </datalist>
 
 {#if asset}
-  <div class="fixed inset-0 z-50 flex bg-black/90 backdrop-blur-md select-none">
+  <div class="fixed inset-0 z-50 flex bg-black/95 backdrop-blur-md select-none">
+    <!-- Top-Left Close Button -->
     <button
       type="button"
       on:click={() => dispatch('close')}
-      class="absolute top-4 left-4 z-20 text-neutral-400 hover:text-white bg-neutral-900/80 p-2 rounded-full cursor-pointer"
+      class="absolute top-4 left-4 z-30 text-neutral-400 hover:text-white bg-neutral-900/80 hover:bg-neutral-800 p-2.5 rounded-full transition-colors cursor-pointer"
       title="Close (Esc)"
     >
       ✕
     </button>
 
-    <!-- Main Canvas -->
-    <div class="flex-1 relative flex items-center justify-center p-4">
+    <!-- Main Canvas Viewport -->
+    <div class="flex-1 relative flex items-center justify-center p-4 overflow-hidden">
+      <!-- Previous Navigation Arrow -->
+      {#if hasPrev}
+        <button
+          type="button"
+          on:click={() => dispatch('prev')}
+          class="absolute left-6 z-20 text-white/70 hover:text-white bg-black/40 hover:bg-black/80 border border-neutral-800/80 p-3 rounded-full transition-all cursor-pointer backdrop-blur-xs"
+          title="Previous (←)"
+        >
+          ‹
+        </button>
+      {/if}
+
+      <!-- Next Navigation Arrow -->
+      {#if hasNext}
+        <button
+          type="button"
+          on:click={() => dispatch('next')}
+          class="absolute right-6 z-20 text-white/70 hover:text-white bg-black/40 hover:bg-black/80 border border-neutral-800/80 p-3 rounded-full transition-all cursor-pointer backdrop-blur-xs"
+          title="Next (→)"
+        >
+          ›
+        </button>
+      {/if}
+
       <div class="relative max-h-full max-w-full flex items-center justify-center">
         {#if asset.mime_type.startsWith('video/')}
           <video
             src="/api/assets/{asset.id}/stream"
             controls
             autoplay
-            class="max-h-[90vh] max-w-[75vw] rounded shadow-2xl"
+            class="max-h-[90vh] max-w-[75vw] rounded-lg shadow-2xl"
           >
             <track kind="captions" />
           </video>
@@ -189,20 +247,21 @@
             <img
               src="/api/assets/{asset.id}/stream"
               alt={asset.file_name}
-              class="max-h-[90vh] max-w-[75vw] object-contain rounded shadow-2xl block"
+              decoding="async"
+              class="max-h-[90vh] max-w-[75vw] object-contain rounded-lg shadow-2xl block select-none pointer-events-none"
             />
 
             {#if showBoxes}
-              {#each faces as f}
+              {#each faces as f (f.face_id)}
                 <div
-                  class="absolute border border-emerald-400/80 bg-emerald-400/10 rounded cursor-pointer group z-10"
+                  class="absolute border border-emerald-400/80 bg-emerald-400/10 rounded cursor-pointer group z-10 hover:border-emerald-300 hover:bg-emerald-400/20 transition-colors"
                   style="left: {f.bbox_x * 100}%; top: {f.bbox_y * 100}%; width: {f.bbox_w * 100}%; height: {f.bbox_h * 100}%;"
                   on:click={() => { editingFaceId = f.face_id; editingName = f.person_name ?? ''; }}
                   role="button"
                   tabindex="0"
                   on:keydown={(e) => e.key === 'Enter' && (editingFaceId = f.face_id)}
                 >
-                  <span class="absolute -bottom-6 left-1/2 -translate-x-1/2 bg-neutral-900/90 text-[10px] text-emerald-300 px-1.5 py-0.5 rounded shadow whitespace-nowrap opacity-80 group-hover:opacity-100 border border-neutral-700">
+                  <span class="absolute -bottom-6 left-1/2 -translate-x-1/2 bg-neutral-900/90 text-[10px] text-emerald-300 px-1.5 py-0.5 rounded shadow whitespace-nowrap opacity-80 group-hover:opacity-100 border border-neutral-700 pointer-events-none">
                     {f.person_name || 'Unnamed'}
                   </span>
                 </div>
@@ -214,12 +273,12 @@
     </div>
 
     <!-- Metadata Drawer -->
-    <aside class="w-80 border-l border-neutral-800 bg-neutral-950 p-5 flex flex-col justify-between overflow-y-auto space-y-6">
+    <aside class="w-80 border-l border-neutral-800 bg-neutral-950 p-5 flex flex-col justify-between overflow-y-auto space-y-6 flex-shrink-0">
       <div class="space-y-5">
         <div class="flex items-center justify-between border-b border-neutral-900 pb-3">
           <div class="truncate mr-2">
             <h3 class="font-medium text-xs text-white truncate" title={asset.file_name}>{asset.file_name}</h3>
-            <p class="text-[10px] text-neutral-500 mt-0.5">
+            <p class="text-[10px] text-neutral-500 mt-0.5 font-mono">
               {asset.captured_at ? new Date(asset.captured_at).toLocaleDateString() : 'Undated'}
             </p>
           </div>
@@ -233,7 +292,7 @@
           </button>
         </div>
 
-        <!-- People Section with Datalist Input -->
+        <!-- People Section -->
         <div>
           <div class="flex items-center justify-between mb-2">
             <span class="text-[10px] uppercase font-semibold text-neutral-500 tracking-wider">People</span>
@@ -254,7 +313,7 @@
             <div class="text-xs text-neutral-600 italic">No faces detected</div>
           {:else}
             <div class="space-y-2">
-              {#each faces as f}
+              {#each faces as f (f.face_id)}
                 <div class="flex items-center gap-2.5 bg-neutral-900/60 border border-neutral-800/60 p-2 rounded-lg">
                   <img src="/{f.face_thumb_path}" alt="" class="w-8 h-8 rounded-full object-cover border border-neutral-700" />
                   <div class="flex-1 min-w-0">
@@ -300,7 +359,7 @@
             <div class="text-xs text-neutral-600 italic">No tags</div>
           {:else}
             <div class="flex flex-wrap gap-1">
-              {#each tags as t}
+              {#each tags as t (t.name)}
                 <span class="px-2 py-0.5 rounded text-[10px] bg-neutral-900 border border-neutral-800 text-neutral-300">
                   #{t.name}
                 </span>
