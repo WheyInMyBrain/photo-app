@@ -24,6 +24,9 @@ CREATE TABLE IF NOT EXISTS assets (
     face_processed INTEGER NOT NULL DEFAULT 0 CHECK (face_processed IN (0, 1)),
     tags_processed INTEGER NOT NULL DEFAULT 0 CHECK (tags_processed IN (0, 1)),
 
+    -- Soft delete tracking (ISO 8601 UTC timestamp, NULL = active)
+    deleted_at TEXT DEFAULT NULL,
+
     -- Temporal indexing
     captured_at TEXT,
     captured_at_local TEXT,
@@ -64,27 +67,49 @@ CREATE TABLE IF NOT EXISTS assets (
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
--- Core Feed & Pagination Indexes
+-- 1. Main Feed & Pagination (Partial Index: excludes trash completely)
+--    Keeps the main index compact and fast since deleted assets are skipped.
 CREATE INDEX IF NOT EXISTS idx_assets_cursor_pagination 
-    ON assets(is_private, captured_at DESC, id DESC);
+    ON assets(is_private, captured_at DESC, id DESC)
+    WHERE deleted_at IS NULL;
 
+-- 2. Trash View Index
+--    Powers the trash view and the daily background 30-day auto-purge worker.
+CREATE INDEX IF NOT EXISTS idx_assets_trash
+    ON assets(is_private, deleted_at DESC, id DESC)
+    WHERE deleted_at IS NOT NULL;
+
+-- 3. Geo Coordinate Bounding Box Index
+--    Composite index on lat/long for map viewport lookups & spatial radius queries.
+CREATE INDEX IF NOT EXISTS idx_assets_lat_long
+    ON assets(latitude, longitude)
+    WHERE latitude IS NOT NULL AND longitude IS NOT NULL AND deleted_at IS NULL;
+
+-- 4. Pipeline Queue Indexes (Active assets only)
 CREATE INDEX IF NOT EXISTS idx_assets_unprocessed_faces 
-    ON assets(id) WHERE face_processed = 0;
+    ON assets(id) 
+    WHERE face_processed = 0 AND deleted_at IS NULL;
 
 CREATE INDEX IF NOT EXISTS idx_assets_unprocessed_tags 
-    ON assets(id) WHERE tags_processed = 0;
+    ON assets(id) 
+    WHERE tags_processed = 0 AND deleted_at IS NULL;
 
+-- 5. Filtering & Aggregation Indexes (Active assets only)
 CREATE INDEX IF NOT EXISTS idx_assets_folder_seek 
-    ON assets(is_private, folder_path);
+    ON assets(is_private, folder_path)
+    WHERE deleted_at IS NULL;
 
 CREATE INDEX IF NOT EXISTS idx_assets_geo 
-    ON assets(is_private, city, country_code);
+    ON assets(is_private, city, country_code)
+    WHERE deleted_at IS NULL;
 
 CREATE INDEX IF NOT EXISTS idx_assets_timeline 
-    ON assets(is_private, year DESC, month DESC);
+    ON assets(is_private, year DESC, month DESC)
+    WHERE deleted_at IS NULL;
 
 CREATE INDEX IF NOT EXISTS idx_assets_camera 
-    ON assets(is_private, camera_model);
+    ON assets(is_private, camera_model)
+    WHERE deleted_at IS NULL;
 
 
 -- ============================================================================

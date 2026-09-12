@@ -27,6 +27,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use services::face_engine::FaceEngine;
 use services::queue::{ProcessJob, QueueService};
 use services::tag_engine::TagEngine;
+use services::trash_purger::TrashPurgerService; // <--- Import service
 
 #[derive(Clone)]
 pub struct AppState {
@@ -53,6 +54,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tokio::fs::create_dir_all(&config.storage_root.join("models")).await?;
 
     let pool = db::init_db_pool(&config.db_url).await?;
+
+    // Spawn trash purger here, after pool is successfully created
+    TrashPurgerService::start(pool.clone(), config.storage_root.clone());
 
     let models_dir = config.storage_root.join("models");
     let face_engine = Arc::new(FaceEngine::init(&models_dir).map_err(|e| e.to_string())?);
@@ -90,6 +94,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/media/filters", get(routes::media::get_available_filters))
         .route("/api/assets/{id}/stream", get(routes::media::stream_asset))
         .route("/api/assets/{id}/favorite", post(routes::media::toggle_favorite))
+        .route("/api/assets/{id}/delete", post(routes::media::toggle_soft_delete))
+        .route("/api/assets/{id}/purge", post(routes::media::hard_delete_asset))
 
         // Upload
         .route("/api/upload", post(routes::upload::upload_photo))

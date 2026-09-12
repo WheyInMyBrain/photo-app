@@ -21,6 +21,7 @@
     mime_type: string;
     captured_at: string | null;
     is_favorite: number;
+    deleted_at: string | null;
   }
 
   interface MediaPageResponse {
@@ -34,7 +35,6 @@
   let albums: SubAlbum[] = [];
   let items: MediaItem[] = [];
   
-  // High-efficiency grouped storage: ordered list of [groupKey, itemsInGroup]
   let groupedSections: [string, MediaItem[]][] = [];
   let groupIndexMap = new Map<string, number>();
 
@@ -44,6 +44,10 @@
   let isLoading = false;
   let scrollTrigger: HTMLDivElement;
   let observer: IntersectionObserver | null = null;
+
+  // Multi-select state
+  let selectedIds = new Set<string>();
+  let isActionLoading = false;
 
   $: folderSegments = $filterStore.folder_path ? $filterStore.folder_path.split('/').filter(Boolean) : [];
 
@@ -56,7 +60,13 @@
     return isNaN(d.getTime()) ? 'Undated' : d.toLocaleDateString(undefined, { month: 'long', year: 'numeric' });
   }
 
-  // Incremental append: O(batch_size) instead of O(total_media)
+  function getDaysRemaining(deletedAt: string | null): number {
+    if (!deletedAt) return 30;
+    const diffMs = Date.now() - new Date(deletedAt).getTime();
+    const daysPassed = Math.floor(diffMs / (1000 * 60 * 60 * 24));
+    return Math.max(0, 30 - daysPassed);
+  }
+
   function appendItemsToGroups(newItems: MediaItem[]) {
     for (const item of newItems) {
       const key = getGroupHeader(item.captured_at);
@@ -70,7 +80,7 @@
         groupedSections[gIdx][1].push(item);
       }
     }
-    groupedSections = groupedSections; // Single tick trigger
+    groupedSections = groupedSections;
   }
 
   async function fetchMedia(reset = false) {
@@ -82,6 +92,8 @@
       albums = [];
       groupedSections = [];
       groupIndexMap.clear();
+      selectedIds.clear();
+      selectedIds = selectedIds;
       nextCapturedAt = null;
       nextId = null;
       hasMore = true;
@@ -118,8 +130,59 @@
     fetchMedia(true);
   }
 
-  function openModal(globalIdx: number) {
-    selectedIndex = globalIdx;
+  function toggleSelect(id: string, e: MouseEvent) {
+    e.stopPropagation();
+    if (selectedIds.has(id)) {
+      selectedIds.delete(id);
+    } else {
+      selectedIds.add(id);
+    }
+    selectedIds = selectedIds;
+  }
+
+  function clearSelection() {
+    selectedIds.clear();
+    selectedIds = selectedIds;
+  }
+
+  // Batch action: Soft delete / Restore selected items
+  async function handleBatchToggleDelete() {
+    if (selectedIds.size === 0 || isActionLoading) return;
+    isActionLoading = true;
+
+    try {
+      const promises = Array.from(selectedIds).map((id) =>
+        fetch(`/api/assets/${id}/delete`, { method: 'POST' })
+      );
+      await Promise.all(promises);
+      clearSelection();
+      fetchMedia(true);
+    } catch (e) {
+      console.error('Batch delete error', e);
+    } finally {
+      isActionLoading = false;
+    }
+  }
+
+  // Batch action: Permanently purge selected items from disk + DB
+  async function handleBatchPurge() {
+    if (selectedIds.size === 0 || isActionLoading) return;
+    const confirmed = confirm(`Are you sure you want to permanently delete ${selectedIds.size} item(s)? This cannot be undone.`);
+    if (!confirmed) return;
+
+    isActionLoading = true;
+    try {
+      const promises = Array.from(selectedIds).map((id) =>
+        fetch(`/api/assets/${id}/purge`, { method: 'POST' })
+      );
+      await Promise.all(promises);
+      clearSelection();
+      fetchMedia(true);
+    } catch (e) {
+      console.error('Batch purge error', e);
+    } finally {
+      isActionLoading = false;
+    }
   }
 
   onMount(() => {
@@ -140,30 +203,38 @@
   });
 </script>
 
-<div class="p-6 max-w-7xl mx-auto space-y-6 min-h-full flex flex-col select-none">
-  <!-- Breadcrumbs -->
-  <div class="flex items-center gap-1.5 text-xs text-neutral-400">
-    <button
-      type="button"
-      on:click={() => filterStore.setFolderPath('')}
-      class="hover:text-white transition-colors cursor-pointer font-medium"
-    >
-      Root
-    </button>
-    {#each folderSegments as seg, i}
-      <span class="text-neutral-600">/</span>
+<div class="p-6 max-w-7xl mx-auto space-y-6 min-h-full flex flex-col select-none pb-24">
+  <!-- Breadcrumbs & Status -->
+  <div class="flex items-center justify-between">
+    <div class="flex items-center gap-1.5 text-xs text-neutral-400">
       <button
         type="button"
-        on:click={() => filterStore.setFolderPath(folderSegments.slice(0, i + 1).join('/'))}
-        class="hover:text-white transition-colors cursor-pointer {i === folderSegments.length - 1 ? 'text-white font-semibold' : ''}"
+        on:click={() => filterStore.setFolderPath('')}
+        class="hover:text-white transition-colors cursor-pointer font-medium"
       >
-        {seg}
+        Root
       </button>
-    {/each}
+      {#each folderSegments as seg, i}
+        <span class="text-neutral-600">/</span>
+        <button
+          type="button"
+          on:click={() => filterStore.setFolderPath(folderSegments.slice(0, i + 1).join('/'))}
+          class="hover:text-white transition-colors cursor-pointer {i === folderSegments.length - 1 ? 'text-white font-semibold' : ''}"
+        >
+          {seg}
+        </button>
+      {/each}
+    </div>
+
+    {#if $filterStore.show_trash}
+      <span class="text-xs bg-red-950/80 border border-red-800/80 text-red-300 px-2 py-0.5 rounded-full font-medium">
+        Trash: Items auto-delete after 30 days
+      </span>
+    {/if}
   </div>
 
-  <!-- Sub-Albums Display -->
-  {#if albums.length > 0}
+  <!-- Sub-Albums Display (Hidden when in trash) -->
+  {#if albums.length > 0 && !$filterStore.show_trash}
     <div>
       <h3 class="text-[11px] uppercase font-semibold text-neutral-500 tracking-wider mb-2">Folders</h3>
       <div class="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-6 gap-2.5">
@@ -194,27 +265,39 @@
   {#if items.length === 0 && albums.length === 0 && !isLoading}
     <div class="flex-1 flex flex-col items-center justify-center text-center py-16 text-neutral-500 text-xs">
       <div class="text-2xl mb-1">
-        {$filterStore.is_private ? '🔒' : '📷'}
+        {$filterStore.show_trash ? '🗑️' : $filterStore.is_private ? '🔒' : '📷'}
       </div>
-      {$filterStore.is_private ? 'No private media in this location.' : 'No media in this location.'}
+      {#if $filterStore.show_trash}
+        Trash is empty.
+      {:else if $filterStore.is_private}
+        No private media in this location.
+      {:else}
+        No media in this location.
+      {/if}
     </div>
   {:else}
     <div class="space-y-6">
       {#each groupedSections as [groupName, groupList] (groupName)}
-        <!-- content-visibility skips rendering computations for off-screen months -->
         <section class="section-contain">
           <h2 class="text-xs font-semibold text-neutral-400 uppercase tracking-wider mb-2 sticky top-0 bg-neutral-950/80 backdrop-blur-md py-1 z-10">
             {groupName}
           </h2>
           <div class="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 gap-2.5">
             {#each groupList as asset, localIdx (asset.id)}
-              <button
-                type="button"
+              <div
+                role="button"
+                tabindex="0"
                 on:click={() => {
                   const globalIdx = items.indexOf(asset);
-                  openModal(globalIdx !== -1 ? globalIdx : 0);
+                  selectedIndex = globalIdx !== -1 ? globalIdx : 0;
                 }}
-                class="group relative aspect-square bg-neutral-900 rounded-lg overflow-hidden border border-neutral-800/80 hover:border-neutral-700 transition-all cursor-pointer"
+                on:keydown={(e) => {
+                  if (e.key === 'Enter') {
+                    const globalIdx = items.indexOf(asset);
+                    selectedIndex = globalIdx !== -1 ? globalIdx : 0;
+                  }
+                }}
+                class="group relative aspect-square bg-neutral-900 rounded-lg overflow-hidden border transition-all cursor-pointer {selectedIds.has(asset.id) ? 'border-purple-500 ring-2 ring-purple-500/40' : 'border-neutral-800/80 hover:border-neutral-700'}"
               >
                 <img
                   src="/{asset.thumb_path}"
@@ -223,15 +306,36 @@
                   decoding="async"
                   class="w-full h-full object-cover group-hover:scale-105 transition-transform duration-200"
                 />
-                {#if asset.is_favorite}
-                  <div class="absolute top-1.5 right-1.5 bg-black/60 p-1 rounded-full text-amber-400 text-[10px]">★</div>
+
+                <!-- Checkbox Multi-Select Dot (Top-Left) -->
+                <button
+                  type="button"
+                  on:click={(e) => toggleSelect(asset.id, e)}
+                  class="absolute top-1.5 left-1.5 w-5 h-5 rounded-md flex items-center justify-center transition-all z-20 cursor-pointer {selectedIds.has(asset.id) ? 'bg-purple-600 text-white' : 'bg-black/40 text-transparent hover:bg-black/70 hover:text-neutral-400 border border-neutral-700/60'}"
+                  title="Select photo"
+                >
+                  <span class="text-xs font-bold leading-none">✓</span>
+                </button>
+
+                <!-- Trash Badge with Days Remaining (In Trash View) -->
+                {#if asset.deleted_at}
+                  <div class="absolute bottom-1.5 left-1.5 bg-red-950/90 border border-red-800/80 px-1.5 py-0.5 rounded text-[9px] text-red-300 font-mono z-10 shadow">
+                    🗑️ {getDaysRemaining(asset.deleted_at)}d left
+                  </div>
                 {/if}
+
+                <!-- Favorite Badge (Top-Right) -->
+                {#if asset.is_favorite}
+                  <div class="absolute top-1.5 right-1.5 bg-black/60 p-1 rounded-full text-amber-400 text-[10px] leading-none">★</div>
+                {/if}
+
+                <!-- Video Duration Badge (Bottom-Right) -->
                 {#if asset.duration_seconds}
                   <div class="absolute bottom-1 right-1 bg-black/75 px-1 py-0.5 rounded text-[9px] text-white font-mono">
                     {Math.floor(asset.duration_seconds / 60)}:{Math.floor(asset.duration_seconds % 60).toString().padStart(2, '0')}
                   </div>
                 {/if}
-              </button>
+              </div>
             {/each}
           </div>
         </section>
@@ -243,6 +347,59 @@
     {#if isLoading}Loading more...{/if}
   </div>
 
+  <!-- Floating Multi-Select Action Bar (Bottom Center) -->
+  {#if selectedIds.size > 0}
+    <div class="fixed bottom-6 left-1/2 -translate-x-1/2 z-40 bg-neutral-900/95 border border-neutral-800 shadow-2xl backdrop-blur-md px-4 py-2 rounded-2xl flex items-center gap-3">
+      <span class="text-xs text-neutral-300 font-medium">
+        {selectedIds.size} selected
+      </span>
+
+      <div class="h-4 w-px bg-neutral-800"></div>
+
+      {#if $filterStore.show_trash}
+        <!-- Actions inside Trash View -->
+        <button
+          type="button"
+          on:click={handleBatchToggleDelete}
+          disabled={isActionLoading}
+          class="text-xs px-2.5 py-1 bg-neutral-800 hover:bg-neutral-700 text-neutral-200 rounded-lg transition-colors cursor-pointer font-medium"
+        >
+          ↺ Restore
+        </button>
+
+        <button
+          type="button"
+          on:click={handleBatchPurge}
+          disabled={isActionLoading}
+          class="text-xs px-2.5 py-1 bg-red-900/70 hover:bg-red-800 text-red-200 rounded-lg transition-colors cursor-pointer font-medium"
+        >
+          Delete Forever
+        </button>
+      {:else}
+        <!-- Action inside Normal Gallery -->
+        <button
+          type="button"
+          on:click={handleBatchToggleDelete}
+          disabled={isActionLoading}
+          class="text-xs px-3 py-1 bg-red-950/80 hover:bg-red-900 text-red-300 border border-red-900/60 rounded-lg transition-colors cursor-pointer font-medium flex items-center gap-1.5"
+        >
+          <span>🗑️</span>
+          <span>Move to Trash</span>
+        </button>
+      {/if}
+
+      <button
+        type="button"
+        on:click={clearSelection}
+        class="text-xs text-neutral-500 hover:text-white px-1.5 py-1 cursor-pointer"
+        title="Deselect All"
+      >
+        ✕
+      </button>
+    </div>
+  {/if}
+
+  <!-- Single Photo Modal View -->
   {#if selectedAsset && selectedIndex !== null}
     <PhotoModal
       asset={selectedAsset}
@@ -263,7 +420,6 @@
 </div>
 
 <style>
-  /* Instructs Chromium & WebKit to skip layout and painting for off-screen month groups */
   .section-contain {
     content-visibility: auto;
     contain-intrinsic-size: 1px 300px;

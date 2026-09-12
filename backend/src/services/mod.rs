@@ -8,3 +8,4 @@ pub mod face_detector;
 pub mod face_pipeline;
 pub mod tag_pipeline;
 pub mod tag_engine;
+pub mod trash_purger;

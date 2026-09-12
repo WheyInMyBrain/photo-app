@@ -2,6 +2,7 @@ import { writable, derived } from 'svelte/store';
 
 export interface FilterState {
   is_private: boolean;
+  show_trash: boolean; // <--- Trash Toggle
   q: string;
   media_type: 'all' | 'photos' | 'videos';
   is_favorite: boolean;
@@ -16,6 +17,7 @@ export interface FilterState {
 
 const initial: FilterState = {
   is_private: false,
+  show_trash: false,
   q: '',
   media_type: 'all',
   is_favorite: false,
@@ -36,14 +38,20 @@ function createFilterStore() {
     toggleVaultMode: () => update(s => ({
       ...initial,
       is_private: !s.is_private,
+      show_trash: false,
       person_ids: new Set(),
       tags: new Set()
     })),
     lockVault: () => update(() => ({
       ...initial,
       is_private: false,
+      show_trash: false,
       person_ids: new Set(),
       tags: new Set()
+    })),
+    toggleTrash: () => update(s => ({
+      ...s,
+      show_trash: !s.show_trash
     })),
     setQ: (q: string) => update(s => ({ ...s, q })),
     setMediaType: (media_type: 'all' | 'photos' | 'videos') => update(s => ({ ...s, media_type })),
@@ -66,6 +74,7 @@ function createFilterStore() {
     reset: () => update(s => ({
       ...initial,
       is_private: s.is_private,
+      show_trash: false,
       person_ids: new Set(),
       tags: new Set()
     }))
@@ -77,6 +86,7 @@ export const filterStore = createFilterStore();
 export const filterQueryString = derived(filterStore, ($s) => {
   const params = new URLSearchParams();
   params.set('is_private', $s.is_private ? 'true' : 'false');
+  if ($s.show_trash) params.set('show_trash', 'true');
 
   if ($s.q) params.set('q', $s.q);
   if ($s.media_type !== 'all') params.set('media_type', $s.media_type);

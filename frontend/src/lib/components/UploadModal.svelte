@@ -3,7 +3,7 @@
 
   export let isOpen = false;
   export let initialFiles: File[] = [];
-  export let isPrivate = false; // Synchronized from +layout.svelte
+  export let isPrivate = false; // Synchronized initial value from +layout.svelte
 
   const dispatch = createEventDispatcher<{
     close: void;
@@ -12,11 +12,17 @@
 
   let stagedFiles: File[] = [];
   let folderPath = '';
+  let uploadIsPrivate = false;
   let isUploading = false;
   let uploadProgress = 0;
   let statusMessage = '';
   let fileInputEl: HTMLInputElement;
   let existingFolders: string[] = [];
+
+  // Sync internal toggle whenever modal opens or parent changes
+  $: if (isOpen) {
+    uploadIsPrivate = isPrivate;
+  }
 
   $: if (initialFiles && initialFiles.length > 0) {
     addFiles(initialFiles);
@@ -74,7 +80,7 @@
 
     const formData = new FormData();
     formData.append('folder', folderPath.trim() || 'root');
-    formData.append('is_private', isPrivate ? 'true' : 'false');
+    formData.append('is_private', uploadIsPrivate ? 'true' : 'false');
 
     for (const file of stagedFiles) {
       formData.append('file', file);
@@ -145,9 +151,13 @@
         <div>
           <h2 class="text-sm font-bold text-white flex items-center gap-2">
             Upload Media
-            {#if isPrivate}
+            {#if uploadIsPrivate}
               <span class="text-[10px] bg-purple-950/80 text-purple-300 border border-purple-800/60 px-1.5 py-0.2 rounded font-mono font-medium">
                 TO PRIVATE VAULT
+              </span>
+            {:else}
+              <span class="text-[10px] bg-neutral-800 text-neutral-400 border border-neutral-700/60 px-1.5 py-0.2 rounded font-mono font-medium">
+                TO PUBLIC
               </span>
             {/if}
           </h2>
@@ -167,6 +177,33 @@
 
       <!-- Body / Form -->
       <div class="p-5 space-y-4 overflow-y-auto flex-1">
+        <!-- Privacy Destination Toggle -->
+        <div class="space-y-1.5">
+          <span class="text-[11px] uppercase font-semibold text-neutral-400 tracking-wider">
+            Privacy Realm
+          </span>
+          <div class="grid grid-cols-2 bg-neutral-950 p-1 rounded-lg border border-neutral-800 gap-1 text-xs">
+            <button
+              type="button"
+              disabled={isUploading}
+              on:click={() => (uploadIsPrivate = false)}
+              class="py-1.5 rounded-md text-center cursor-pointer transition-all flex items-center justify-center gap-1.5 {!uploadIsPrivate ? 'bg-neutral-800 text-white font-medium shadow-xs' : 'text-neutral-500 hover:text-neutral-300'}"
+            >
+              <span>📷</span>
+              <span>Public Gallery</span>
+            </button>
+            <button
+              type="button"
+              disabled={isUploading}
+              on:click={() => (uploadIsPrivate = true)}
+              class="py-1.5 rounded-md text-center cursor-pointer transition-all flex items-center justify-center gap-1.5 {uploadIsPrivate ? 'bg-purple-600 text-white font-medium shadow-xs' : 'text-neutral-500 hover:text-purple-400'}"
+            >
+              <span>🔒</span>
+              <span>Private Vault</span>
+            </button>
+          </div>
+        </div>
+
         <!-- Target Album/Folder Input -->
         <div class="space-y-1.5">
           <label for="upload-folder-input" class="text-[11px] uppercase font-semibold text-neutral-400 tracking-wider">

@@ -19,6 +19,7 @@ pub struct MediaSummary {
     pub mime_type: String,
     pub captured_at: Option<String>,
     pub is_favorite: i64,
+    pub deleted_at: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -87,6 +88,7 @@ pub struct MediaQuery {
     pub cursor_id: Option<String>,
     pub limit: Option<i64>,
     pub is_private: Option<bool>,
+    pub show_trash: Option<bool>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]

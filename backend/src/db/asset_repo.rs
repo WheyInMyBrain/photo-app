@@ -14,12 +14,13 @@ impl AssetRepo {
         let limit = q.limit.unwrap_or(50).clamp(1, 200);
         let fetch_limit = limit + 1;
         let privacy_level = if q.is_private.unwrap_or(false) { 1 } else { 0 };
+        let show_trash = q.show_trash.unwrap_or(false);
 
         let mut builder: QueryBuilder<Sqlite> = QueryBuilder::new(
             "SELECT \
                 a.id, a.file_name, a.thumb_path, a.preview_path, \
                 a.aspect_ratio, a.duration_seconds, a.mime_type, a.captured_at, \
-                a.is_favorite \
+                a.is_favorite, a.deleted_at \
             FROM assets a "
         );
 
@@ -30,6 +31,13 @@ impl AssetRepo {
 
         builder.push(" WHERE a.is_private = ");
         builder.push_bind(privacy_level);
+
+        // --- TRASH SEPARATION ---
+        if show_trash {
+            builder.push(" AND a.deleted_at IS NOT NULL ");
+        } else {
+            builder.push(" AND a.deleted_at IS NULL ");
+        }
 
         if let Some(ref expr) = fts_query {
             builder.push(" AND fts.is_private = ");
@@ -119,8 +127,8 @@ impl AssetRepo {
         }
         builder.push_bind(fetch_limit);
 
-        // Sub-album retrieval now passes media_type for strict separation
-        let albums = if q.cursor_id.is_none() {
+        // Sub-album retrieval (do not show sub-albums when viewing trash)
+        let albums = if q.cursor_id.is_none() && !show_trash {
             let curr = q.folder_path.as_deref().unwrap_or("");
             Self::get_sub_albums(pool, curr, q.media_type.as_deref(), privacy_level).await.unwrap_or_default()
         } else {
@@ -148,6 +156,7 @@ impl AssetRepo {
         q: &MediaQuery,
     ) -> Result<DynamicFiltersResponse, sqlx::Error> {
         let privacy_level = if q.is_private.unwrap_or(false) { 1 } else { 0 };
+        let show_trash = q.show_trash.unwrap_or(false);
 
         let mut builder: QueryBuilder<Sqlite> = QueryBuilder::new(
             "SELECT a.id FROM assets a "
@@ -161,6 +170,13 @@ impl AssetRepo {
         builder.push(" WHERE a.is_private = ");
         builder.push_bind(privacy_level);
 
+        // --- TRASH SEPARATION ---
+        if show_trash {
+            builder.push(" AND a.deleted_at IS NOT NULL ");
+        } else {
+            builder.push(" AND a.deleted_at IS NULL ");
+        }
+
         if let Some(ref expr) = fts_query {
             builder.push(" AND fts.is_private = ");
             builder.push_bind(privacy_level);
@@ -168,7 +184,6 @@ impl AssetRepo {
             builder.push_bind(expr);
         }
 
-        // Photo vs Video filter
         if let Some(ref m_type) = q.media_type {
             match m_type.as_str() {
                 "photos" => { builder.push(" AND a.duration_seconds IS NULL "); }
@@ -181,7 +196,6 @@ impl AssetRepo {
             builder.push_bind(if fav { 1 } else { 0 });
         }
 
-        // Multi-Person
         if let Some(ref pids_str) = q.person_id {
             let pids: Vec<&str> = pids_str.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
             let count = pids.len() as i64;
@@ -195,7 +209,6 @@ impl AssetRepo {
             }
         }
 
-        // Multi-Tag
         if let Some(ref tags_str) = q.tag {
             let tags: Vec<String> = tags_str.split(',').map(|s| s.trim().to_lowercase()).filter(|s| !s.is_empty()).collect();
             let count = tags.len() as i64;
@@ -209,7 +222,6 @@ impl AssetRepo {
             }
         }
 
-        // Folder Path
         if let Some(ref folder) = q.folder_path {
             builder.push(" AND a.folder_path = ");
             builder.push_bind(folder);
@@ -239,7 +251,6 @@ impl AssetRepo {
 
         let total_media = matching_ids.len() as i64;
 
-        // Photo / Video Breakdown & Date range
         let mut stats_builder: QueryBuilder<Sqlite> = QueryBuilder::new(
             r#"
             SELECT 
@@ -261,7 +272,6 @@ impl AssetRepo {
         let min_date: Option<String> = stats_row.try_get("min_d").ok();
         let max_date: Option<String> = stats_row.try_get("max_d").ok();
 
-        // Time of day
         let mut tod_builder: QueryBuilder<Sqlite> = QueryBuilder::new(
             r#"
             SELECT 
@@ -289,7 +299,6 @@ impl AssetRepo {
             })
             .collect();
 
-        // People
         let mut people_builder: QueryBuilder<Sqlite> = QueryBuilder::new(
             r#"
             SELECT p.id, p.name, COUNT(DISTINCT af.asset_id) as count
@@ -311,7 +320,6 @@ impl AssetRepo {
             })
             .collect();
 
-        // Tags
         let mut tags_builder: QueryBuilder<Sqlite> = QueryBuilder::new(
             r#"
             SELECT t.name, COUNT(DISTINCT at.asset_id) as count
@@ -333,7 +341,6 @@ impl AssetRepo {
             })
             .collect();
 
-        // Locations
         let mut loc_builder: QueryBuilder<Sqlite> = QueryBuilder::new(
             "SELECT city, COUNT(*) as count FROM assets WHERE city IS NOT NULL AND id IN ("
         );
@@ -350,7 +357,6 @@ impl AssetRepo {
             })
             .collect();
 
-        // Cameras
         let mut cam_builder: QueryBuilder<Sqlite> = QueryBuilder::new(
             "SELECT camera_model, COUNT(*) as count FROM assets WHERE camera_model IS NOT NULL AND id IN ("
         );
@@ -367,7 +373,6 @@ impl AssetRepo {
             })
             .collect();
 
-        // Albums / Folders
         let mut album_builder: QueryBuilder<Sqlite> = QueryBuilder::new(
             "SELECT folder_path, COUNT(*) as count FROM assets WHERE folder_path IS NOT NULL AND folder_path != 'root' AND id IN ("
         );
@@ -420,7 +425,6 @@ impl AssetRepo {
         }
     }
 
-    /// Indexes or updates an asset's entry in the FTS5 search index
     /// Indexes or updates an asset's entry in the FTS5 search index
     pub async fn sync_search_index(pool: &SqlitePool, asset_id: &str) -> Result<(), sqlx::Error> {
         sqlx::query("DELETE FROM asset_search_index WHERE asset_id = ?1")
@@ -657,5 +661,112 @@ impl AssetRepo {
             .collect();
 
         Ok(albums)
+    }
+
+    pub async fn fetch_and_purge_expired_trash(
+        pool: &SqlitePool,
+        storage_root: &std::path::Path,
+    ) -> Result<usize, sqlx::Error> {
+        let rows = sqlx::query(
+            r#"
+            SELECT id, rel_path, thumb_path, preview_path, is_private 
+            FROM assets 
+            WHERE deleted_at IS NOT NULL 
+              AND datetime(deleted_at, '+30 days') <= datetime('now')
+            "#
+        )
+        .fetch_all(pool)
+        .await?;
+
+        let count = rows.len();
+
+        for r in rows {
+            let id: String = r.get("id");
+            let rel_path: String = r.get("rel_path");
+            let thumb_path: String = r.get("thumb_path");
+            let preview_path: String = r.get("preview_path");
+            let is_private: i64 = r.get("is_private");
+
+            let base = if is_private != 0 {
+                storage_root.join("originals/private")
+            } else {
+                storage_root.join("originals/public")
+            };
+
+            let _ = tokio::fs::remove_file(base.join(&rel_path)).await;
+            let _ = tokio::fs::remove_file(storage_root.join(&thumb_path)).await;
+            let _ = tokio::fs::remove_file(storage_root.join(&preview_path)).await;
+
+            let _ = sqlx::query("DELETE FROM assets WHERE id = ?1")
+                .bind(&id)
+                .execute(pool)
+                .await;
+        }
+
+        Ok(count)
+    }
+
+    pub async fn toggle_soft_delete(
+        pool: &SqlitePool,
+        id: &str,
+    ) -> Result<Option<String>, sqlx::Error> {
+        let row = sqlx::query(
+            r#"
+            UPDATE assets
+            SET deleted_at = CASE 
+                WHEN deleted_at IS NULL THEN CURRENT_TIMESTAMP 
+                ELSE NULL 
+            END,
+            updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?1
+            RETURNING deleted_at
+            "#,
+        )
+        .bind(id)
+        .fetch_one(pool)
+        .await?;
+
+        let deleted_at: Option<String> = row.get("deleted_at");
+        Ok(deleted_at)
+    }
+
+    pub async fn purge_asset(
+        pool: &SqlitePool,
+        id: &str,
+        storage_root: &std::path::Path,
+    ) -> Result<bool, sqlx::Error> {
+        let row = sqlx::query(
+            "SELECT rel_path, thumb_path, preview_path, is_private FROM assets WHERE id = ?1",
+        )
+        .bind(id)
+        .fetch_optional(pool)
+        .await?;
+
+        let row = match row {
+            Some(r) => r,
+            None => return Ok(false),
+        };
+
+        let rel_path: String = row.get("rel_path");
+        let thumb_path: String = row.get("thumb_path");
+        let preview_path: String = row.get("preview_path");
+        let is_private: i64 = row.get("is_private");
+
+        let orig_base = if is_private != 0 {
+            storage_root.join("originals/private")
+        } else {
+            storage_root.join("originals/public")
+        };
+
+        let _ = tokio::fs::remove_file(orig_base.join(&rel_path)).await;
+        let _ = tokio::fs::remove_file(storage_root.join(&thumb_path)).await;
+        let _ = tokio::fs::remove_file(storage_root.join(&preview_path)).await;
+
+        sqlx::query("DELETE FROM assets WHERE id = ?1")
+            .bind(id)
+            .execute(pool)
+            .await?;
+
+        Ok(true)
     }
 }

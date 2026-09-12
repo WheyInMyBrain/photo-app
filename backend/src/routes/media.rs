@@ -1,5 +1,6 @@
 use axum::{
     extract::{Path as AxumPath, Query, Request, State},
+    http::StatusCode,
     response::{IntoResponse, Json},
 };
 use serde::Serialize;
@@ -14,6 +15,13 @@ use crate::AppState;
 pub struct FavoriteToggleResponse {
     pub asset_id: String,
     pub is_favorite: bool,
+}
+
+#[derive(Serialize)]
+pub struct SoftDeleteResponse {
+    pub id: String,
+    pub is_deleted: bool,
+    pub deleted_at: Option<String>,
 }
 
 /// GET /api/media
@@ -91,4 +99,39 @@ pub async fn get_available_filters(
         .map_err(|e| AppError::Internal(e.to_string()))?;
 
     Ok(Json(filters))
+}
+
+/// POST /api/assets/:id/delete
+pub async fn toggle_soft_delete(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<SoftDeleteResponse>, AppError> {
+    let deleted_at = AssetRepo::toggle_soft_delete(&state.db, &id)
+        .await
+        .map_err(|e| match e {
+            sqlx::Error::RowNotFound => AppError::NotFound(format!("Asset {} not found", id)),
+            other => AppError::Internal(other.to_string()),
+        })?;
+
+    Ok(Json(SoftDeleteResponse {
+        id,
+        is_deleted: deleted_at.is_some(),
+        deleted_at,
+    }))
+}
+
+/// POST /api/assets/:id/purge
+pub async fn hard_delete_asset(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<StatusCode, AppError> {
+    let found = AssetRepo::purge_asset(&state.db, &id, &state.config.storage_root)
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+
+    if !found {
+        return Err(AppError::NotFound(format!("Asset {} not found", id)));
+    }
+
+    Ok(StatusCode::NO_CONTENT)
 }

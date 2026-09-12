@@ -53,7 +53,6 @@
   let lastEscPress = 0;
   let filterDebounce: ReturnType<typeof setTimeout> | null = null;
 
-  // High-efficiency activity recorder: avoids timer rebuilds
   function recordUserActivity() {
     const now = Date.now();
     if (now - lastActivity > THROTTLE_WINDOW_MS) {
@@ -62,7 +61,6 @@
   }
 
   function handleVisibilityChange() {
-    // Drop back to public immediately when switching tabs, minimizing, or locking screen
     if (document.visibilityState === 'hidden' && $filterStore.is_private) {
       filterStore.lockVault();
     }
@@ -81,7 +79,6 @@
     }
   }
 
-  // Manage low-frequency idle checker
   $: if (browser) {
     if ($filterStore.is_private) {
       lastActivity = Date.now();
@@ -90,7 +87,7 @@
           if ($filterStore.is_private && Date.now() - lastActivity > IDLE_TIMEOUT_MS) {
             filterStore.lockVault();
           }
-        }, 30 * 1000); // Check once every 30s
+        }, 30 * 1000);
       }
     } else if (idleInterval) {
       clearInterval(idleInterval);
@@ -108,7 +105,6 @@
     }
   }
 
-  // Debounced filter refresh to avoid rapid-fire requests on startup & keystrokes
   $: if (browser && $filterQueryString !== undefined) {
     if (filterDebounce) clearTimeout(filterDebounce);
     filterDebounce = setTimeout(() => {
@@ -333,8 +329,23 @@
       {/if}
     </div>
 
-    <!-- Reset -->
-    <div class="pt-3 border-t border-neutral-900">
+    <!-- Bottom Actions: Trash & Reset -->
+    <div class="pt-3 border-t border-neutral-900 space-y-2">
+      <!-- Trash Filter Button (Placed at the very bottom) -->
+      <button
+        type="button"
+        on:click={() => filterStore.toggleTrash()}
+        class="w-full py-1.5 px-2.5 text-xs rounded-lg flex items-center justify-between border transition-all cursor-pointer {$filterStore.show_trash ? 'bg-red-950/60 border-red-800 text-red-200 font-medium' : 'bg-neutral-900/80 border-neutral-800 text-neutral-400 hover:text-white'}"
+      >
+        <span class="flex items-center gap-1.5">
+          🗑️ <span>{$filterStore.show_trash ? 'Viewing Trash' : 'Trash (30d Auto-Purge)'}</span>
+        </span>
+        {#if $filterStore.show_trash}
+          <span class="text-[9px] bg-red-900/80 text-red-200 px-1 py-0.2 rounded font-mono">ACTIVE</span>
+        {/if}
+      </button>
+
+      <!-- Reset -->
       <button
         type="button"
         on:click={() => filterStore.reset()}
