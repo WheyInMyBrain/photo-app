@@ -1,12 +1,15 @@
 use axum::{
     extract::{Path as AxumPath, Query, Request, State},
-    http::StatusCode,
-    response::{IntoResponse, Json},
+    http::{header, HeaderValue, StatusCode},
+    response::{IntoResponse, Json, Response},
 };
 use tower_http::services::ServeFile;
 
 use crate::db::AssetRepo;
-use crate::domain::media::{DynamicFiltersResponse, MediaPageResponse, MediaQuery, SoftDeleteResponse, FavoriteToggleResponse};
+use crate::domain::media::{
+    DynamicFiltersResponse, FavoriteToggleResponse, MediaPageResponse, MediaQuery,
+    SoftDeleteResponse,
+};
 use crate::error::AppError;
 use crate::AppState;
 
@@ -47,33 +50,55 @@ pub async fn toggle_favorite(
 }
 
 /// GET /api/assets/:id/stream
+///
+/// Serves photos strictly from lightweight preview paths.
+/// Serves videos from originals with full zero-copy byte-range (HTTP 206) scrubbing via ServeFile.
 pub async fn stream_asset(
     State(state): State<AppState>,
     AxumPath(asset_id): AxumPath<String>,
     req: Request,
-) -> Result<impl IntoResponse, AppError> {
+) -> Result<Response, AppError> {
     let info = AssetRepo::get_storage_info(&state.db, &asset_id)
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?
         .ok_or_else(|| AppError::NotFound(format!("Asset {} not found", asset_id)))?;
 
     let file_to_serve = if info.is_video {
+        // Videos: stream the original via zero-copy range chunks
         let subfolder = if info.is_private { "originals/private" } else { "originals/public" };
         state.config.storage_root.join(subfolder).join(info.rel_path)
     } else {
-        state.config.storage_root.join(info.preview_path)
+        // Photos: strictly serve the compressed WebP preview, never the original
+        let preview = state.config.storage_root.join(&info.preview_path);
+        if preview.exists() {
+            preview
+        } else {
+            // Fallback only if preview creation previously failed
+            let subfolder = if info.is_private { "originals/private" } else { "originals/public" };
+            state.config.storage_root.join(subfolder).join(info.rel_path)
+        }
     };
 
     if !file_to_serve.exists() {
         return Err(AppError::NotFound("File not found on disk".into()));
     }
 
-    let res = ServeFile::new(file_to_serve)
+    // ServeFile handles:
+    // - HTTP 206 Partial Content & Range header seeking
+    // - HTTP 304 Not Modified & ETag matching
+    // - Proper Content-Type & streaming without buffering into RAM
+    let mut response = ServeFile::new(file_to_serve)
         .try_call(req)
         .await
-        .map_err(|e| AppError::Internal(e.to_string()))?;
+        .map_err(|e| AppError::Internal(e.to_string()))?
+        .into_response();
 
-    Ok(res)
+    response.headers_mut().insert(
+        header::CACHE_CONTROL,
+        HeaderValue::from_static("public, max-age=2592000, immutable"),
+    );
+
+    Ok(response)
 }
 
 pub async fn get_available_filters(

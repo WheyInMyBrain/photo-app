@@ -562,6 +562,8 @@ pub async fn upload_chunk(
     file.write_all(&body)
         .await
         .map_err(|e| AppError::Internal(format!("Failed writing chunk bytes at offset {}: {}", offset, e)))?;
+    
+    file.sync_all().await?;
 
     tracing::debug!(
         upload_id = %query.upload_id,
