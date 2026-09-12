@@ -56,43 +56,59 @@
   let editingName = '';
 
   let detailAbortCtrl: AbortController | null = null;
+  let videoEl: HTMLVideoElement | null = null;
 
   function focusInput(node: HTMLElement) {
     node.focus();
   }
 
-  // Preload neighboring media into memory for zero-latency transitions
-  $: if (nextAsset && !nextAsset.mime_type.startsWith('video/')) {
+  function isImage(item: { mime_type?: string } | null): boolean {
+    if (!item?.mime_type) return false;
+    return !item.mime_type.startsWith('video/');
+  }
+
+  // Preload ONLY photos. Videos are strictly skipped.
+  $: if (nextAsset && isImage(nextAsset)) {
     const img = new Image();
     img.src = `/api/assets/${nextAsset.id}/stream`;
   }
 
-  $: if (prevAsset && !prevAsset.mime_type.startsWith('video/')) {
+  $: if (prevAsset && isImage(prevAsset)) {
     const img = new Image();
     img.src = `/api/assets/${prevAsset.id}/stream`;
   }
 
+  // Teardown active video hardware decoding pipelines before asset changes
   $: if (asset?.id) {
+    if (videoEl) {
+      videoEl.pause();
+      videoEl.removeAttribute('src');
+      videoEl.load();
+    }
     isFavorite = Boolean(asset.is_favorite);
     editingFaceId = null;
     loadDetails(asset.id);
   }
 
-  onMount(async () => {
-    try {
-      const res = await fetch('/api/persons/names');
-      if (res.ok) knownPeople = await res.json();
-    } catch (e) {
-      console.error('Failed to load names directory', e);
-    }
-  });
-
   onMount(() => {
     const originalOverflow = document.body.style.overflow;
     document.body.style.overflow = 'hidden';
 
+    // Fetch names directory
+    fetch('/api/persons/names')
+      .then((res) => (res.ok ? res.json() : []))
+      .then((data) => {
+        knownPeople = data;
+      })
+      .catch((e) => console.error('Failed to load names directory', e));
+
     return () => {
       document.body.style.overflow = originalOverflow;
+      if (videoEl) {
+        videoEl.pause();
+        videoEl.removeAttribute('src');
+        videoEl.load();
+      }
     };
   });
 
@@ -235,6 +251,7 @@
       <div class="relative max-h-full max-w-full flex items-center justify-center">
         {#if asset.mime_type.startsWith('video/')}
           <video
+            bind:this={videoEl}
             src="/api/assets/{asset.id}/stream"
             controls
             autoplay
