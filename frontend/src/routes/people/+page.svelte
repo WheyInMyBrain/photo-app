@@ -114,6 +114,10 @@
     goto('/');
   }
 
+  function focusOnMount(node: HTMLElement) {
+    node.focus();
+  }
+
   onMount(loadPeople);
 </script>
 
@@ -121,7 +125,7 @@
 <datalist id="people-name-suggestions">
   {#each nameDirectory as item}
     {#if item.name}
-      <option value={item.name} />
+      <option value={item.value}>{item.label || item.value}</option>
     {/if}
   {/each}
 </datalist>
@@ -173,16 +177,14 @@
           {#if editingId === p.id}
             <input
               type="text"
-              list="people-name-suggestions"
+              use:focusOnMount
               bind:value={editingName}
-              placeholder="Search or enter name..."
-              on:blur={() => saveName(p)}
-              on:keydown={(e) => {
-                if (e.key === 'Enter') saveName(p);
-                if (e.key === 'Escape') editingId = null;
-              }}
               on:click|stopPropagation
-              autofocus
+              on:blur={() => savePersonName(person)}
+              on:keydown={(e) => {
+                if (e.key === 'Enter') savePersonName(person);
+                if (e.key === 'Escape') editingPersonId = null;
+              }}
               class="w-full bg-black border border-purple-500 text-xs text-center text-white rounded px-1 outline-none"
             />
           {:else}
