@@ -4,3 +4,4 @@ pub mod people;
 pub mod tags;
 pub mod upload;
 pub mod auth;
+pub mod events;

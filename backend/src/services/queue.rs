@@ -2,13 +2,14 @@ use sqlx::{Row, SqlitePool};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::{Notify, Semaphore};
+use tokio::sync::{broadcast, Notify, Semaphore};
 use tracing::{error, info};
 
 use crate::db::{AssetRepo, JobRepo};
 use crate::domain::job_repo::DbJob;
 use crate::domain::media::NewAssetRecord;
 use crate::services::cluster_cache::SharedClusterCache;
+use crate::WsMediaEvent;
 
 use media_processing::{MediaEngine, ProcessedMediaResult};
 
@@ -34,6 +35,7 @@ impl QueueService {
         cluster_cache: SharedClusterCache,
         concurrency: usize,
         notify: Arc<Notify>,
+        tx_events: broadcast::Sender<WsMediaEvent>,
     ) {
         let semaphore = Arc::new(Semaphore::new(concurrency.max(1)));
         info!(concurrency = concurrency, "Unified media queue worker active");
@@ -53,13 +55,14 @@ impl QueueService {
                         let thumbs_root = thumbs_root.clone();
                         let media_engine = media_engine.clone();
                         let cluster_cache = cluster_cache.clone();
+                        let tx_events = tx_events.clone();
 
                         tokio::spawn(async move {
                             let _guard = permit;
                             let job_id = job.id.clone();
                             let asset_id = job.asset_id.clone();
 
-                            // 1. Read existing clusters from RAM (0 SQL queries!)
+                            // 1. Read existing clusters from RAM
                             let known_clusters = {
                                 let read_guard = cluster_cache.read().await;
                                 read_guard.clone()
@@ -69,15 +72,14 @@ impl QueueService {
                             let thumbs_dir = thumbs_root.clone();
                             let engine = media_engine.clone();
 
-                            // 2. Offload everything to CPU/ONNX in spawn_blocking
-                            // Image/video detection, resizing, EXIF, faces, and tags all happen here
+                            // 2. Offload processing to CPU/ONNX via spawn_blocking
                             let process_res = tokio::task::spawn_blocking(move || {
                                 engine.process_asset_sync(
                                     &disk_path,
                                     &asset_id,
                                     &thumbs_dir,
                                     known_clusters,
-                                    true, // run AI
+                                    true,
                                 )
                             })
                             .await;
@@ -88,17 +90,27 @@ impl QueueService {
                                     let err_msg = e.to_string();
                                     error!("Processing error on {}: {}", job.asset_id, err_msg);
                                     let _ = JobRepo::mark_failed(&pool, &job_id, &err_msg).await;
+                                    let _ = tx_events.send(WsMediaEvent {
+                                        event_type: "asset_failed".to_string(),
+                                        asset_id: job.asset_id.clone(),
+                                        thumb_path: String::new(),
+                                    });
                                     return;
                                 }
                                 Err(join_err) => {
                                     let err_msg = join_err.to_string();
                                     error!("Worker panic on {}: {}", job.asset_id, err_msg);
                                     let _ = JobRepo::mark_failed(&pool, &job_id, &err_msg).await;
+                                    let _ = tx_events.send(WsMediaEvent {
+                                        event_type: "asset_failed".to_string(),
+                                        asset_id: job.asset_id.clone(),
+                                        thumb_path: String::new(),
+                                    });
                                     return;
                                 }
                             };
 
-                            // 3. Atomically update in-memory cache with newly discovered/updated faces
+                            // 3. Atomically update in-memory cache with new/updated faces
                             if !processed.new_persons.is_empty() || !processed.updated_clusters.is_empty() {
                                 let mut write_guard = cluster_cache.write().await;
                                 for np in &processed.new_persons {
@@ -119,13 +131,25 @@ impl QueueService {
 
                             // 4. Single database commit for asset, tags, and faces
                             match Self::commit_to_db(&pool, &job, processed).await {
-                                Ok(_) => {
+                                Ok(thumb_path) => {
                                     let _ = JobRepo::mark_completed(&pool, &job_id).await;
                                     info!(id = %job.asset_id, "Asset processed & indexed successfully");
+
+                                    // Emit real-time completion event to frontends
+                                    let _ = tx_events.send(WsMediaEvent {
+                                        event_type: "asset_ready".to_string(),
+                                        asset_id: job.asset_id.clone(),
+                                        thumb_path,
+                                    });
                                 }
                                 Err(e) => {
                                     error!("DB commit failed on {}: {}", job.asset_id, e);
                                     let _ = JobRepo::mark_failed(&pool, &job_id, &e).await;
+                                    let _ = tx_events.send(WsMediaEvent {
+                                        event_type: "asset_failed".to_string(),
+                                        asset_id: job.asset_id.clone(),
+                                        thumb_path: String::new(),
+                                    });
                                 }
                             }
                         });
@@ -145,13 +169,14 @@ impl QueueService {
         });
     }
 
-    /// Single atomic SQLite transaction for the entire asset
+    /// Single atomic SQLite transaction returning thumb_path for instant client consumption
     async fn commit_to_db(
         pool: &SqlitePool,
         job: &DbJob,
         res: ProcessedMediaResult,
-    ) -> Result<(), String> {
+    ) -> Result<String, String> {
         let mut tx = pool.begin().await.map_err(|e| e.to_string())?;
+        let thumb_path_out = res.thumb_path.clone();
 
         // 1. Insert Base Asset
         let record = NewAssetRecord {
@@ -194,7 +219,7 @@ impl QueueService {
             let embedding_bytes: &[u8] = bytemuck::cast_slice(&np.centroid);
             sqlx::query(
                 "INSERT INTO persons (id, name, cover_face_id, face_count, centroid_embedding)
-                 VALUES (?1, NULL, ?2, 1, ?3)"
+                 VALUES (?1, NULL, ?2, 1, ?3)",
             )
             .bind(&np.person_id)
             .bind(&np.cover_face_id)
@@ -208,7 +233,7 @@ impl QueueService {
             let embedding_bytes: &[u8] = bytemuck::cast_slice(&uc.new_centroid);
             sqlx::query(
                 "UPDATE persons SET centroid_embedding = ?1, face_count = ?2, updated_at = CURRENT_TIMESTAMP
-                 WHERE id = ?3"
+                 WHERE id = ?3",
             )
             .bind(embedding_bytes)
             .bind(uc.new_face_count)
@@ -225,7 +250,7 @@ impl QueueService {
                 "INSERT INTO asset_faces (
                     id, asset_id, person_id, bbox_x, bbox_y, bbox_w, bbox_h,
                     detection_score, face_thumb_path, embedding, is_verified
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 0)"
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 0)",
             )
             .bind(&face.face_id)
             .bind(&job.asset_id)
@@ -264,7 +289,7 @@ impl QueueService {
             sqlx::query(
                 "INSERT INTO asset_tags (asset_id, tag_id, confidence, source)
                  VALUES (?1, ?2, ?3, 'AI')
-                 ON CONFLICT(asset_id, tag_id) DO UPDATE SET confidence = excluded.confidence"
+                 ON CONFLICT(asset_id, tag_id) DO UPDATE SET confidence = excluded.confidence",
             )
             .bind(&job.asset_id)
             .bind(tag_id)
@@ -286,6 +311,6 @@ impl QueueService {
         // Refresh search index outside transaction
         let _ = AssetRepo::sync_search_index(pool, &job.asset_id).await;
 
-        Ok(())
+        Ok(thumb_path_out)
     }
 }

@@ -5,19 +5,21 @@
   export let minHeight: number = 240;
 
   let containerEl: HTMLElement;
-  let isVisible = false;
+  // Default to true so the active viewport never flashes an empty spacer on mount
+  let isVisible = true;
   let recordedHeight: number = minHeight;
   let observer: IntersectionObserver | null = null;
   let resizeObserver: ResizeObserver | null = null;
 
-  // Pre-calculate estimated height to eliminate initial scroll jumping
-  $: if (recordedHeight === minHeight && itemCount > 0) {
+  $: if (itemCount > 0) {
     const estimatedRows = Math.ceil(itemCount / 4);
-    recordedHeight = Math.max(minHeight, estimatedRows * 220 + 40);
+    const calculated = estimatedRows * 220 + 40;
+    if (calculated > recordedHeight) {
+      recordedHeight = calculated;
+    }
   }
 
   onMount(() => {
-    // Scoped resolution to the actual scroll ancestor
     const scrollContainer = containerEl ? containerEl.closest('main') : null;
 
     observer = new IntersectionObserver(

@@ -15,7 +15,7 @@ use axum::{
 use config::Config;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::sync::Notify;
+use tokio::sync::{Notify, broadcast};
 use tower_http::{
     services::ServeDir,
     set_header::SetResponseHeaderLayer,
@@ -29,11 +29,19 @@ use services::cluster_cache::ClusterCacheManager;
 use services::queue::QueueService;
 use services::trash_purger::TrashPurgerService;
 
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct WsMediaEvent {
+    pub event_type: String, // "asset_ready", "asset_failed"
+    pub asset_id: String,
+    pub thumb_path: String,
+}
+
 #[derive(Clone)]
 pub struct AppState {
     pub db: sqlx::SqlitePool,
     pub config: Config,
     pub queue_notify: Arc<Notify>,
+    pub tx_events: broadcast::Sender<WsMediaEvent>,
 }
 
 #[tokio::main]
@@ -70,6 +78,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let queue_notify = Arc::new(Notify::new());
 
+    let (tx_events, _) = broadcast::channel::<WsMediaEvent>(100);
+
     // 4. Start worker with unified MediaEngine & the RAM cluster cache
     QueueService::start_worker(
         pool.clone(),
@@ -78,12 +88,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         cluster_cache,
         config.worker_concurrency,
         queue_notify.clone(),
+        tx_events.clone(),
     );
 
     let state = AppState {
         db: pool,
         config: config.clone(),
         queue_notify,
+        tx_events,
     };
 
     let thumbs_router = Router::new()
@@ -113,6 +125,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/upload/chunk/finalize", post(routes::upload::finalize_chunk))
         .route("/api/upload/inspect", post(routes::upload::inspect_link))
         .route("/api/upload/commit", post(routes::upload::commit_link_download))
+
+        // Event
+        .route("/api/events", get(routes::events::stream_events))
 
         // Folder Structure
         .route("/api/albums", get(routes::albums::get_album_contents))

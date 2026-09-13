@@ -25,3 +25,9 @@ export interface MediaPageResponse {
   next_cursor_id: string | null;
   has_more: boolean;
 }
+
+export interface WsMediaEvent {
+  event_type: 'asset_ready' | 'asset_failed';
+  asset_id: string;
+  thumb_path: string;
+}

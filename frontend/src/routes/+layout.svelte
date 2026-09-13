@@ -45,11 +45,11 @@
   let showAuthModal = false;
   let droppedFiles: File[] = [];
   let isDraggingOverWindow = false;
-  let dragCounter = 0; // Fixes drag flicker bug across nested DOM elements
+  let dragCounter = 0;
 
-  // AbortController to prevent race conditions from out-of-order responses
   let filterAbortCtrl: AbortController | null = null;
   let filterDebounce: ReturnType<typeof setTimeout> | null = null;
+  let isFilterUpdating = false;
 
   $: isOnPeoplePage = $page.url.pathname.startsWith('/people');
 
@@ -105,11 +105,11 @@
   async function refreshFilters(qs: string) {
     if (!browser) return;
 
-    // Cancel any pending request so stale parameters never overwrite new ones
     if (filterAbortCtrl) {
       filterAbortCtrl.abort();
     }
     filterAbortCtrl = new AbortController();
+    isFilterUpdating = true;
 
     try {
       const res = await fetch(`/api/media/filters${qs}`, {
@@ -122,6 +122,8 @@
       if (e?.name !== 'AbortError') {
         console.error('Failed to load dynamic filters', e);
       }
+    } finally {
+      isFilterUpdating = false;
     }
   }
 
@@ -138,7 +140,6 @@
     if (filterAbortCtrl) filterAbortCtrl.abort();
   });
 
-  // --- Robust Drag & Drop Handling (Zero Flicker) ---
   function isValidFileDrag(e: DragEvent): boolean {
     const types = e.dataTransfer?.types;
     return !!(types && types.includes('Files') && !types.includes('text/plain') && !types.includes('application/x-face-id'));
@@ -235,21 +236,21 @@
         <button
           type="button"
           on:click={() => filterStore.setMediaType('all')}
-          class="flex-1 py-1 rounded-md text-center cursor-pointer {$filterStore.media_type === 'all' ? 'bg-neutral-800 text-white font-medium' : 'text-neutral-400 hover:text-white'}"
+          class="flex-1 py-1 rounded-md text-center cursor-pointer transition-all {$filterStore.media_type === 'all' ? 'bg-neutral-800 text-white font-medium shadow-sm' : 'text-neutral-400 hover:text-white'}"
         >
           All ({filters.total_media})
         </button>
         <button
           type="button"
           on:click={() => filterStore.setMediaType('photos')}
-          class="flex-1 py-1 rounded-md text-center cursor-pointer {$filterStore.media_type === 'photos' ? 'bg-neutral-800 text-white font-medium' : 'text-neutral-400 hover:text-white'}"
+          class="flex-1 py-1 rounded-md text-center cursor-pointer transition-all {$filterStore.media_type === 'photos' ? 'bg-neutral-800 text-white font-medium shadow-sm' : 'text-neutral-400 hover:text-white'}"
         >
           Photos ({filters.photos_count ?? 0})
         </button>
         <button
           type="button"
           on:click={() => filterStore.setMediaType('videos')}
-          class="flex-1 py-1 rounded-md text-center cursor-pointer {$filterStore.media_type === 'videos' ? 'bg-neutral-800 text-white font-medium' : 'text-neutral-400 hover:text-white'}"
+          class="flex-1 py-1 rounded-md text-center cursor-pointer transition-all {$filterStore.media_type === 'videos' ? 'bg-neutral-800 text-white font-medium shadow-sm' : 'text-neutral-400 hover:text-white'}"
         >
           Videos ({filters.videos_count ?? 0})
         </button>
@@ -313,7 +314,7 @@
               <button
                 type="button"
                 on:click={() => filterStore.togglePerson(p.value)}
-                class="text-[11px] px-2 py-0.5 rounded-md border transition-all cursor-pointer {$filterStore.person_ids.has(p.value) ? 'bg-purple-600 border-purple-500 text-white font-medium' : 'bg-neutral-900 border-neutral-800 text-neutral-400 hover:text-white'}"
+                class="text-[11px] px-2 py-0.5 rounded-md border transition-all cursor-pointer {$filterStore.person_ids.has(p.value) ? 'bg-purple-600 border-purple-500 text-white font-medium shadow-sm' : 'bg-neutral-900 border-neutral-800 text-neutral-400 hover:text-white'}"
               >
                 {p.label} <span class="text-[9px] opacity-60">({p.count})</span>
               </button>
@@ -331,7 +332,7 @@
               <button
                 type="button"
                 on:click={() => filterStore.toggleTag(t.value)}
-                class="text-[11px] px-1.5 py-0.5 rounded border transition-all cursor-pointer {$filterStore.tags.has(t.value) ? 'bg-purple-600 border-purple-500 text-white font-medium' : 'bg-neutral-900 border-neutral-800 text-neutral-400 hover:text-white'}"
+                class="text-[11px] px-1.5 py-0.5 rounded border transition-all cursor-pointer {$filterStore.tags.has(t.value) ? 'bg-purple-600 border-purple-500 text-white font-medium shadow-sm' : 'bg-neutral-900 border-neutral-800 text-neutral-400 hover:text-white'}"
               >
                 #{t.label} <span class="text-[9px] opacity-50">({t.count})</span>
               </button>
@@ -436,7 +437,6 @@
       </button>
     </div>
 
-    <!-- Gallery / Route Slot -->
     <slot />
 
     <!-- Bottom-Right Floating '+' Upload Button -->
@@ -450,7 +450,7 @@
     </button>
   </main>
 
-  <!-- Fullscreen Drag Overlay (Guaranteed Zero Flicker) -->
+  <!-- Fullscreen Drag Overlay -->
   {#if isDraggingOverWindow}
     <div class="fixed inset-0 z-50 bg-black/70 border-2 border-dashed border-neutral-400 flex items-center justify-center pointer-events-none backdrop-blur-xs">
       <div class="bg-neutral-900 px-6 py-3 rounded-xl border border-neutral-800 text-sm font-medium text-white shadow-2xl">

@@ -1,7 +1,14 @@
 <script lang="ts">
   import { browser } from '$app/environment';
   import { onMount, onDestroy } from 'svelte';
+  import { flip } from 'svelte/animate';
+  import { scale, fade } from 'svelte/transition';
+  import { cubicOut } from 'svelte/easing';
+
   import { filterStore, filterQueryString } from '$lib/stores/filterStore';
+  import { createMediaSelection } from '$lib/stores/mediaSelection';
+  import { buildGroupedSections, buildIndexMap } from '$lib/utils/mediaGrouper';
+  import { initMediaEvents } from '$lib/utils/mediaEvents';
   import type { SubAlbum, MediaItem, MediaPageResponse } from '$lib/types/media';
 
   import VirtualSection from '$lib/components/VirtualSection.svelte';
@@ -10,13 +17,13 @@
   import BatchActionBar from '$lib/components/BatchActionBar.svelte';
   import PhotoModal from '$lib/components/PhotoModal.svelte';
 
+  // Core media state
   let albums: SubAlbum[] = [];
   let items: MediaItem[] = [];
-  let itemIndexMap = new Map<string, number>();
+  $: itemIndexMap = buildIndexMap(items);
+  $: groupedSections = buildGroupedSections(items);
 
-  let groupedSections: [string, MediaItem[]][] = [];
-  let groupIndexMap = new Map<string, number>();
-
+  // Pagination cursors
   let nextCapturedAt: string | null = null;
   let nextId: string | null = null;
   let hasMore = true;
@@ -24,16 +31,17 @@
   let scrollTrigger: HTMLDivElement;
   let observer: IntersectionObserver | null = null;
   let filterDebounceTimer: ReturnType<typeof setTimeout> | null = null;
-
   let pageAbortCtrl: AbortController | null = null;
-  let lastFetchErrorTime = 0;
-  const RETRY_BACKOFF_MS = 3000;
 
-  let selectedMap: Record<string, boolean> = {};
-  let selectedCount = 0;
-  let lastSelectedId: string | null = null;
-  let isActionLoading = false;
+  // Real-time animation tracking
+  let recentAssetIds = new Set<string>();
+  let sseSubscription: { close: () => void } | null = null;
 
+  // Selection domain
+  const selection = createMediaSelection(() => fetchMedia(true));
+  const { selectedMap, selectedCount, isActionLoading } = selection;
+
+  // Modal inspection
   let selectedIndex: number | null = null;
   $: selectedAsset = selectedIndex !== null ? items[selectedIndex] : null;
 
@@ -41,30 +49,17 @@
     ? $filterStore.folder_path.split('/').filter(Boolean)
     : [];
 
-  function getGroupHeader(dateStr: string | null): string {
-    if (!dateStr) return 'Undated';
-    const d = new Date(dateStr);
-    return isNaN(d.getTime())
-      ? 'Undated'
-      : d.toLocaleDateString(undefined, { month: 'long', year: 'numeric' });
-  }
+  function prependItem(item: MediaItem) {
+    if (itemIndexMap.has(item.id)) return;
 
-  function appendItemsToGroups(newItems: MediaItem[], startIndex: number) {
-    for (let i = 0; i < newItems.length; i++) {
-      const item = newItems[i];
-      itemIndexMap.set(item.id, startIndex + i);
+    recentAssetIds.add(item.id);
+    recentAssetIds = new Set(recentAssetIds);
+    setTimeout(() => {
+      recentAssetIds.delete(item.id);
+      recentAssetIds = new Set(recentAssetIds);
+    }, 2000);
 
-      const key = getGroupHeader(item.captured_at);
-      const gIdx = groupIndexMap.get(key);
-
-      if (gIdx === undefined) {
-        groupIndexMap.set(key, groupedSections.length);
-        groupedSections.push([key, [item]]);
-      } else {
-        groupedSections[gIdx][1].push(item);
-      }
-    }
-    groupedSections = groupedSections;
+    items = [item, ...items];
   }
 
   async function fetchMedia(reset = false) {
@@ -72,175 +67,86 @@
 
     if (reset) {
       if (pageAbortCtrl) pageAbortCtrl.abort();
-      items = [];
-      itemIndexMap.clear();
-      albums = [];
-      groupedSections = [];
-      groupIndexMap.clear();
-      selectedMap = {};
-      selectedCount = 0;
-      lastSelectedId = null;
+      // DO NOT reset items = [] here. Retaining the array allows Svelte to run FLIP transitions.
+      selection.clearSelection();
       nextCapturedAt = null;
       nextId = null;
       hasMore = true;
-      lastFetchErrorTime = 0;
-    } else {
-      if (isLoading || Date.now() - lastFetchErrorTime < RETRY_BACKOFF_MS) return;
+    } else if (isLoading) {
+      return;
     }
 
     pageAbortCtrl = new AbortController();
     isLoading = true;
 
     try {
-      const baseParams = new URLSearchParams($filterQueryString.replace(/^\?/, ''));
-      baseParams.set('limit', '50');
+      const params = new URLSearchParams($filterQueryString.replace(/^\?/, ''));
+      params.set('limit', '50');
 
       if (nextCapturedAt && nextId) {
-        baseParams.set('cursor_captured_at', nextCapturedAt);
-        baseParams.set('cursor_id', nextId);
+        params.set('cursor_captured_at', nextCapturedAt);
+        params.set('cursor_id', nextId);
       }
 
-      const res = await fetch(`/api/media?${baseParams.toString()}`, {
-        signal: pageAbortCtrl.signal
-      });
+      const res = await fetch(`/api/media?${params.toString()}`, { signal: pageAbortCtrl.signal });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data: MediaPageResponse = await res.json();
 
       albums = reset ? data.albums ?? [] : albums;
 
-      const newItems = data.items;
-      const startIndex = items.length;
-      items = reset ? newItems : [...items, ...newItems];
-
-      appendItemsToGroups(newItems, startIndex);
+      // In-place replacement triggers FLIP transitions for remaining items
+      items = reset ? data.items : [...items, ...data.items];
 
       nextCapturedAt = data.next_cursor_captured_at;
       nextId = data.next_cursor_id;
       hasMore = data.has_more;
-      lastFetchErrorTime = 0;
     } catch (err: any) {
-      if (err?.name === 'AbortError') return;
-      lastFetchErrorTime = Date.now();
-      console.error('Failed fetching media:', err);
+      if (err?.name !== 'AbortError') console.error('Failed fetching media:', err);
     } finally {
       isLoading = false;
     }
   }
 
+  async function handleAssetReady(assetId: string) {
+    try {
+      const params = new URLSearchParams($filterQueryString.replace(/^\?/, ''));
+      params.set('limit', '50');
+      params.delete('cursor_id');
+      params.delete('cursor_captured_at');
+
+      const res = await fetch(`/api/media?${params.toString()}`);
+      if (!res.ok) return;
+
+      const data: MediaPageResponse = await res.json();
+      const match = data.items.find((i) => i.id === assetId);
+
+      if (match) {
+        prependItem(match);
+      } else {
+        fetchMedia(true);
+      }
+    } catch (err) {
+      fetchMedia(true);
+    }
+  }
+
   $: if (browser && $filterQueryString !== undefined) {
     if (filterDebounceTimer) clearTimeout(filterDebounceTimer);
-    filterDebounceTimer = setTimeout(() => {
-      fetchMedia(true);
-    }, 200);
-  }
-
-  function toggleSelect(id: string, e: MouseEvent) {
-    e.stopPropagation();
-
-    if (e.shiftKey && lastSelectedId && lastSelectedId !== id) {
-      const startIdx = itemIndexMap.get(lastSelectedId);
-      const endIdx = itemIndexMap.get(id);
-
-      if (startIdx !== undefined && endIdx !== undefined) {
-        const [low, high] = [Math.min(startIdx, endIdx), Math.max(startIdx, endIdx)];
-        for (let i = low; i <= high; i++) {
-          const target = items[i];
-          if (target && !selectedMap[target.id]) {
-            selectedMap[target.id] = true;
-            selectedCount += 1;
-          }
-        }
-        lastSelectedId = id;
-        selectedMap = selectedMap;
-        return;
-      }
-    }
-
-    if (selectedMap[id]) {
-      delete selectedMap[id];
-      selectedCount -= 1;
-      lastSelectedId = null;
-    } else {
-      selectedMap[id] = true;
-      selectedCount += 1;
-      lastSelectedId = id;
-    }
-    selectedMap = selectedMap;
-  }
-
-  function clearSelection() {
-    selectedMap = {};
-    selectedCount = 0;
-    lastSelectedId = null;
-  }
-
-  async function handleBatchToggleDelete() {
-    const ids = Object.keys(selectedMap);
-    if (ids.length === 0 || isActionLoading) return;
-    isActionLoading = true;
-
-    try {
-      const res = await fetch('/api/assets/batch/delete', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ ids })
-      });
-
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-
-      clearSelection();
-      fetchMedia(true);
-    } catch (e) {
-      console.error('Batch delete error', e);
-    } finally {
-      isActionLoading = false;
-    }
-  }
-
-  async function handleBatchPurge() {
-    const ids = Object.keys(selectedMap);
-    if (ids.length === 0 || isActionLoading) return;
-    if (!confirm(`Permanently delete ${ids.length} item(s)? This cannot be undone.`)) return;
-
-    isActionLoading = true;
-    try {
-      const res = await fetch('/api/assets/batch/purge', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ ids })
-      });
-
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-
-      clearSelection();
-      fetchMedia(true);
-    } catch (e) {
-      console.error('Batch purge error', e);
-    } finally {
-      isActionLoading = false;
-    }
-  }
-
-  function openModalForAsset(id: string) {
-    const idx = itemIndexMap.get(id);
-    if (idx !== undefined) selectedIndex = idx;
+    filterDebounceTimer = setTimeout(() => fetchMedia(true), 200);
   }
 
   onMount(() => {
     const handleRefresh = () => fetchMedia(true);
     window.addEventListener('vault:refresh-timeline', handleRefresh);
 
+    sseSubscription = initMediaEvents(handleAssetReady);
+
     const scrollContainer = document.querySelector('main');
     observer = new IntersectionObserver(
       (entries) => {
-        if (entries[0].isIntersecting && hasMore && !isLoading) {
-          fetchMedia();
-        }
+        if (entries[0].isIntersecting && hasMore && !isLoading) fetchMedia();
       },
-      {
-        root: scrollContainer ?? null,
-        rootMargin: '600px'
-      }
+      { root: scrollContainer ?? null, rootMargin: '600px' }
     );
     if (scrollTrigger) observer.observe(scrollTrigger);
 
@@ -253,6 +159,7 @@
     if (pageAbortCtrl) pageAbortCtrl.abort();
     if (filterDebounceTimer) clearTimeout(filterDebounceTimer);
     if (observer) observer.disconnect();
+    if (sseSubscription) sseSubscription.close();
   });
 </script>
 
@@ -286,12 +193,13 @@
     {/if}
   </div>
 
-  <!-- Folder Grid Component -->
   <FolderGrid {albums} />
 
-  <!-- Media Grid with Section Windowing -->
   {#if items.length === 0 && albums.length === 0 && !isLoading}
-    <div class="flex-1 flex flex-col items-center justify-center text-center py-16 text-neutral-500 text-xs">
+    <div
+      in:fade={{ duration: 250 }}
+      class="flex-1 flex flex-col items-center justify-center text-center py-16 text-neutral-500 text-xs"
+    >
       <div class="text-2xl mb-1">
         {$filterStore.show_trash ? '🗑️' : $filterStore.is_private ? '🔒' : '📷'}
       </div>
@@ -312,12 +220,22 @@
           </h2>
           <div class="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 gap-2.5">
             {#each groupList as asset (asset.id)}
-              <MediaCard
-                {asset}
-                isSelected={Boolean(selectedMap[asset.id])}
-                on:open={() => openModalForAsset(asset.id)}
-                on:select={(e) => toggleSelect(asset.id, e.detail)}
-              />
+              <div
+                animate:flip={{ duration: 380, easing: cubicOut }}
+                in:scale={{ start: 0.88, duration: 300, opacity: 0, easing: cubicOut }}
+                out:scale={{ start: 0.88, duration: 220, opacity: 0, easing: cubicOut }}
+                class="relative will-change-transform rounded-lg overflow-hidden transition-shadow duration-500 {recentAssetIds.has(asset.id) ? 'animate-incoming ring-2 ring-blue-500/60' : ''}"
+              >
+                <MediaCard
+                  {asset}
+                  isSelected={Boolean($selectedMap[asset.id])}
+                  on:open={() => {
+                    const idx = itemIndexMap.get(asset.id);
+                    if (idx !== undefined) selectedIndex = idx;
+                  }}
+                  on:select={(e) => selection.toggleSelect(asset.id, e.detail, items, itemIndexMap)}
+                />
+              </div>
             {/each}
           </div>
         </VirtualSection>
@@ -325,21 +243,20 @@
     </div>
   {/if}
 
-  <!-- Infinite Scroll Intersection Target -->
-  <div bind:this={scrollTrigger} class="py-6 text-center text-xs text-neutral-600">
-    {#if isLoading}Loading more...{/if}
+  <div bind:this={scrollTrigger} class="py-6 text-center text-xs text-neutral-600 min-h-[2rem]">
+    {#if isLoading}
+      <span in:fade={{ duration: 150 }}>Loading more...</span>
+    {/if}
   </div>
 
-  <!-- Floating Multi-Select Action Bar Component -->
   <BatchActionBar
-    count={selectedCount}
-    {isActionLoading}
-    on:toggleDelete={handleBatchToggleDelete}
-    on:purge={handleBatchPurge}
-    on:clear={clearSelection}
+    count={$selectedCount}
+    isActionLoading={$isActionLoading}
+    on:toggleDelete={selection.batchToggleDelete}
+    on:purge={selection.batchPurge}
+    on:clear={selection.clearSelection}
   />
 
-  <!-- Single Photo Modal View -->
   {#if selectedAsset && selectedIndex !== null}
     <PhotoModal
       asset={selectedAsset}
@@ -360,3 +277,18 @@
     />
   {/if}
 </div>
+
+<style>
+  @keyframes incoming-fade {
+    0% {
+      box-shadow: 0 0 0 2px rgba(59, 130, 246, 0.7), 0 8px 24px rgba(59, 130, 246, 0.25);
+    }
+    100% {
+      box-shadow: 0 0 0 0 transparent, 0 0 0 transparent;
+    }
+  }
+
+  :global(.animate-incoming) {
+    animation: incoming-fade 2s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+  }
+</style>
