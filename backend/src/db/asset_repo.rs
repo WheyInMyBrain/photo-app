@@ -1,7 +1,8 @@
 use sqlx::{QueryBuilder, Row, Sqlite, SqlitePool};
 
 use crate::domain::media::{
-    AssetStorageInfo, MediaPageResponse, MediaQuery, MediaSummary, NewAssetRecord, DynamicFiltersResponse, FilterOption, SubAlbum,
+    AssetStorageInfo, MediaPageResponse, MediaQuery, MediaSummary, SubAlbum,
+    NewAssetRecord, DynamicFiltersResponse, FilterOption
 };
 
 pub struct AssetRepo;
@@ -58,6 +59,20 @@ impl AssetRepo {
         if let Some(fav) = q.is_favorite {
             builder.push(" AND a.is_favorite = ");
             builder.push_bind(if fav { 1 } else { 0 });
+        }
+
+        // --- VECTOR SEARCH CANDIDATE INJECTION ---
+        if let Some(ref cids) = q.candidate_ids {
+            if cids.is_empty() {
+                builder.push(" AND 1 = 0 ");
+            } else {
+                builder.push(" AND a.id IN (");
+                let mut sep = builder.separated(", ");
+                for cid in cids {
+                    sep.push_bind(cid);
+                }
+                sep.push_unseparated(") ");
+            }
         }
 
         // --- ROBUST MULTI-PERSON ---
@@ -207,6 +222,19 @@ impl AssetRepo {
             if let Some(fav) = q.is_favorite {
                 builder.push(" AND a.is_favorite = ");
                 builder.push_bind(if fav { 1 } else { 0 });
+            }
+
+            if let Some(ref cids) = q.candidate_ids {
+                if cids.is_empty() {
+                    builder.push(" AND 1 = 0 ");
+                } else {
+                    builder.push(" AND a.id IN (");
+                    let mut sep = builder.separated(", ");
+                    for cid in cids {
+                        sep.push_bind(cid);
+                    }
+                    sep.push_unseparated(") ");
+                }
             }
 
             if !pids.is_empty() {
@@ -509,61 +537,53 @@ impl AssetRepo {
     }
 
     pub async fn insert_asset_tx(
-        conn: &mut sqlx::SqliteConnection,
-        a: &NewAssetRecord,
+        tx: &mut sqlx::SqliteConnection,
+        record: &NewAssetRecord,
     ) -> Result<(), sqlx::Error> {
         sqlx::query(
             r#"
             INSERT INTO assets (
-                id, sha256, file_name, rel_path, folder_path,
-                thumb_path, preview_path, file_size_bytes, mime_type,
-                width, height, aspect_ratio, duration_seconds, is_private,
-                captured_at, year, month, day, hour,
-                latitude, longitude, altitude_meters,
-                city, subdivision, country, country_code,
-                camera_make, camera_model,
-                face_processed, tags_processed
+                id, sha256, file_name, rel_path, folder_path, thumb_path, preview_path,
+                file_size_bytes, mime_type, width, height, aspect_ratio, duration_seconds,
+                is_private, captured_at, year, month, day, hour, latitude, longitude,
+                altitude_meters, city, subdivision, country, country_code, camera_make, camera_model,
+                clip_embedding
             ) VALUES (
-                ?1, ?2, ?3, ?4, ?5,
-                ?6, ?7, ?8, ?9,
-                ?10, ?11, ?12, ?13, ?14,
-                ?15, ?16, ?17, ?18, ?19,
-                ?20, ?21, ?22,
-                ?23, ?24, ?25, ?26,
-                ?27, ?28,
-                0, 0
+                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
+                ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29
             )
-            "#,
+            "#
         )
-        .bind(&a.id)
-        .bind(&a.sha256)
-        .bind(&a.file_name)
-        .bind(&a.rel_path)
-        .bind(&a.folder_path)
-        .bind(&a.thumb_path)
-        .bind(&a.preview_path)
-        .bind(a.file_size_bytes)
-        .bind(&a.mime_type)
-        .bind(a.width)
-        .bind(a.height)
-        .bind(a.aspect_ratio)
-        .bind(a.duration_seconds)
-        .bind(if a.is_private { 1 } else { 0 })
-        .bind(&a.captured_at)
-        .bind(a.year)
-        .bind(a.month)
-        .bind(a.day)
-        .bind(a.hour)
-        .bind(a.latitude)
-        .bind(a.longitude)
-        .bind(a.altitude)
-        .bind(&a.city)
-        .bind(&a.subdivision)
-        .bind(&a.country)
-        .bind(&a.country_code)
-        .bind(&a.camera_make)
-        .bind(&a.camera_model)
-        .execute(&mut *conn)
+        .bind(&record.id)
+        .bind(&record.sha256)
+        .bind(&record.file_name)
+        .bind(&record.rel_path)
+        .bind(&record.folder_path)
+        .bind(&record.thumb_path)
+        .bind(&record.preview_path)
+        .bind(record.file_size_bytes)
+        .bind(&record.mime_type)
+        .bind(record.width)
+        .bind(record.height)
+        .bind(record.aspect_ratio)
+        .bind(record.duration_seconds)
+        .bind(record.is_private)
+        .bind(&record.captured_at)
+        .bind(record.year)
+        .bind(record.month)
+        .bind(record.day)
+        .bind(record.hour)
+        .bind(record.latitude)
+        .bind(record.longitude)
+        .bind(record.altitude)
+        .bind(&record.city)
+        .bind(&record.subdivision)
+        .bind(&record.country)
+        .bind(&record.country_code)
+        .bind(&record.camera_make)
+        .bind(&record.camera_model)
+        .bind(&record.clip_embedding)
+        .execute(tx)
         .await?;
 
         Ok(())

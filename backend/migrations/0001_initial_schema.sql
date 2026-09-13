@@ -20,6 +20,10 @@ CREATE TABLE IF NOT EXISTS assets (
     is_private INTEGER NOT NULL DEFAULT 0 CHECK (is_private IN (0, 1)),
     is_favorite INTEGER NOT NULL DEFAULT 0 CHECK (is_favorite IN (0, 1)),
 
+    -- CLIP BLOB
+    clip_processed INTEGER NOT NULL DEFAULT 0 CHECK (clip_processed IN (0, 1)),
+    clip_embedding BLOB,
+
     -- Pipeline flags (O(1) queue lookups via partial indexes)
     face_processed INTEGER NOT NULL DEFAULT 0 CHECK (face_processed IN (0, 1)),
     tags_processed INTEGER NOT NULL DEFAULT 0 CHECK (tags_processed IN (0, 1)),
@@ -93,6 +97,14 @@ CREATE INDEX IF NOT EXISTS idx_assets_unprocessed_faces
 CREATE INDEX IF NOT EXISTS idx_assets_unprocessed_tags 
     ON assets(id) 
     WHERE tags_processed = 0 AND deleted_at IS NULL;
+
+CREATE INDEX IF NOT EXISTS idx_assets_clip 
+    ON assets(id) 
+    WHERE clip_embedding IS NOT NULL;
+
+CREATE INDEX IF NOT EXISTS idx_assets_unprocessed_clip
+    ON assets(id)
+    WHERE clip_processed = 0 AND deleted_at IS NULL;
 
 -- 5. Filtering & Aggregation Indexes (Active assets only)
 CREATE INDEX IF NOT EXISTS idx_assets_folder_seek 

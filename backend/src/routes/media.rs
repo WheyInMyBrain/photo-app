@@ -8,7 +8,7 @@ use tower_http::services::ServeFile;
 use crate::db::AssetRepo;
 use crate::domain::media::{
     DynamicFiltersResponse, FavoriteToggleResponse, MediaPageResponse, MediaQuery,
-    SoftDeleteResponse, BatchActionRequest, BatchActionResponse
+    SoftDeleteResponse, BatchActionRequest, BatchActionResponse, SimilarMediaItem,
 };
 use crate::error::AppError;
 use crate::AppState;
@@ -16,13 +16,16 @@ use crate::AppState;
 /// GET /api/media
 pub async fn list_media(
     State(state): State<AppState>,
-    Query(params): Query<MediaQuery>,
+    Query(mut params): Query<MediaQuery>, // <-- Make params `mut`
 ) -> Result<Json<MediaPageResponse>, AppError> {
     if params.cursor_captured_at.is_some() ^ params.cursor_id.is_some() {
         return Err(AppError::BadRequest(
             "Both cursor_captured_at and cursor_id must be supplied together".into(),
         ));
     }
+
+    // Resolve Hybrid Search (Person entity extraction + CLIP text encoding)
+    resolve_hybrid_query(&state, &mut params).await;
 
     let page = AssetRepo::query_media(&state.db, &params)
         .await
@@ -106,10 +109,14 @@ pub async fn stream_asset(
     Ok(response)
 }
 
+/// GET /api/media/filters
 pub async fn get_available_filters(
     State(state): State<AppState>,
-    Query(params): Query<MediaQuery>,
+    Query(mut params): Query<MediaQuery>, // <-- Make params `mut`
 ) -> Result<Json<DynamicFiltersResponse>, AppError> {
+    // Resolve Hybrid Search so sidebar facet counts match the vector search results
+    resolve_hybrid_query(&state, &mut params).await;
+
     let filters = AssetRepo::get_dynamic_filters(&state.db, &params)
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?;
@@ -182,4 +189,63 @@ pub async fn batch_purge_assets(
         .map_err(|e| AppError::Internal(e.to_string()))?;
 
     Ok(Json(BatchActionResponse { affected_count }))
+}
+
+/// GET /api/assets/:id/similar
+pub async fn get_similar_assets(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<Vec<SimilarMediaItem>>, AppError> {
+    let similar = state.clip_cache.find_similar(&id, 0.55, 12).await;
+    Ok(Json(similar))
+}
+
+async fn resolve_hybrid_query(state: &AppState, q: &mut MediaQuery) {
+    let raw_q = match q.q.as_deref().map(str::trim) {
+        Some(s) if !s.is_empty() => s,
+        _ => return,
+    };
+
+    let is_private = q.is_private.unwrap_or(false);
+    let mut words: Vec<String> = raw_q.split_whitespace().map(String::from).collect();
+
+    // 1. Check if any word matches an identified person's name in SQLite
+    let named_persons: Vec<(String, String)> = sqlx::query_as(
+        "SELECT id, name FROM persons WHERE name IS NOT NULL"
+    )
+    .fetch_all(&state.db)
+    .await
+    .unwrap_or_default();
+
+    for (pid, name) in named_persons {
+        let name_lower = name.to_lowercase();
+        if let Some(pos) = words.iter().position(|w| w.to_lowercase() == name_lower) {
+            // Append to person_id filter
+            q.person_id = match q.person_id.take() {
+                Some(existing) => Some(format!("{},{}", existing, pid)),
+                None => Some(pid),
+            };
+            words.remove(pos); // Strip out name so it doesn't pollute CLIP text
+            break;
+        }
+    }
+
+    let visual_prompt = words.join(" ");
+
+    // 2. If visual keywords remain, compute CLIP text embedding
+    if !visual_prompt.is_empty() {
+        if let Ok(text_vector) = state.clip_engine.extract_text_embedding(&visual_prompt) {
+            // 0.24 threshold for text-to-image similarity
+            let matches = state.clip_cache.search_by_vector(&text_vector, is_private, 0.24, 200).await;
+            let matched_ids: Vec<String> = matches.into_iter().map(|(id, _)| id).collect();
+
+            q.candidate_ids = Some(matched_ids);
+            
+            // Clear lexical fts query: visual concept search is handled by CLIP embeddings
+            q.q = None;
+        }
+    } else {
+        // Only person names were in the search query, clear q.q so it only uses person_id filter
+        q.q = None;
+    }
 }

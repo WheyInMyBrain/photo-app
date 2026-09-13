@@ -30,3 +30,4 @@ serde_json = "1.0.151"
 anyhow = "1.0"
 tracing = "0.1.44"
 uuid = { version = "1.26.0", features = ["v4"] }
+tokenizers = { version = "0.23.2", default-features = false, features = ["onig"] }

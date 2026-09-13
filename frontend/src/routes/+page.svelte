@@ -267,6 +267,17 @@
       on:close={() => (selectedIndex = null)}
       on:prev={() => selectedIndex && (selectedIndex -= 1)}
       on:next={() => selectedIndex !== null && (selectedIndex += 1)}
+      on:selectAsset={(e) => {
+        const targetIdx = itemIndexMap.get(e.detail.id);
+        if (targetIdx !== undefined) {
+          selectedIndex = targetIdx;
+        } else {
+          fetch(`/api/media?limit=1`)
+            .then((r) => r.json())
+            .then(() => {
+            });
+        }
+      }}
       on:toggleFavorite={(e) => {
         const item = items.find((i) => i.id === e.detail.id);
         if (item) {

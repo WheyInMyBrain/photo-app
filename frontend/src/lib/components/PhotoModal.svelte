@@ -21,6 +21,7 @@
     prev: void;
     next: void;
     toggleFavorite: { id: string; is_favorite: boolean };
+    selectAsset: { id: string };
   }>();
 
   interface FaceDetail {
@@ -45,10 +46,19 @@
     name: string | null;
   }
 
+  interface SimilarItem {
+    id: string;
+    thumb_path: string;
+    mime_type: string;
+    similarity: number;
+  }
+
   let faces: FaceDetail[] = [];
   let tags: TagItem[] = [];
+  let similarItems: SimilarItem[] = [];
   let knownPeople: PersonCandidate[] = [];
   let loadingDetails = true;
+  let loadingSimilar = true;
   let showBoxes = true;
   let isFavorite = false;
 
@@ -66,7 +76,6 @@
     return !item.mime_type.startsWith('video/');
   }
 
-  // Preload neighboring images only
   $: if (nextAsset && isImage(nextAsset)) {
     const img = new Image();
     img.src = `/api/assets/${nextAsset.id}/stream`;
@@ -109,21 +118,26 @@
     }
     detailAbortCtrl = new AbortController();
     loadingDetails = true;
+    loadingSimilar = true;
 
     try {
-      const [fRes, tRes] = await Promise.all([
+      const [fRes, tRes, sRes] = await Promise.all([
         fetch(`/api/assets/${id}/faces`, { signal: detailAbortCtrl.signal }),
-        fetch(`/api/assets/${id}/tags`, { signal: detailAbortCtrl.signal })
+        fetch(`/api/assets/${id}/tags`, { signal: detailAbortCtrl.signal }),
+        fetch(`/api/assets/${id}/similar`, { signal: detailAbortCtrl.signal })
       ]);
       faces = fRes.ok ? await fRes.json() : [];
       tags = tRes.ok ? await tRes.json() : [];
+      similarItems = sRes.ok ? await sRes.json() : [];
     } catch (e: any) {
       if (e?.name !== 'AbortError') {
         faces = [];
         tags = [];
+        similarItems = [];
       }
     } finally {
       loadingDetails = false;
+      loadingSimilar = false;
     }
   }
 
@@ -209,9 +223,8 @@
       ✕
     </button>
 
-    <!-- Main Canvas Viewport -->
+    <!-- Main Viewport -->
     <div class="flex-1 relative flex items-center justify-center p-4 overflow-hidden">
-      <!-- Previous Navigation Arrow -->
       {#if hasPrev}
         <button
           type="button"
@@ -223,7 +236,6 @@
         </button>
       {/if}
 
-      <!-- Next Navigation Arrow -->
       {#if hasNext}
         <button
           type="button"
@@ -369,6 +381,50 @@
                 <span class="px-2 py-0.5 rounded text-[10px] bg-neutral-900 border border-neutral-800 text-neutral-300">
                   #{t.name}
                 </span>
+              {/each}
+            </div>
+          {/if}
+        </div>
+
+        <!-- Visual Similarity Section -->
+        <div class="border-t border-neutral-900 pt-4">
+          <div class="flex items-center justify-between mb-2.5">
+            <span class="text-[10px] uppercase font-semibold text-neutral-500 tracking-wider">Similar Media</span>
+            {#if similarItems.length > 0}
+              <span class="text-[10px] text-neutral-500 font-mono">{similarItems.length} found</span>
+            {/if}
+          </div>
+
+          {#if loadingSimilar}
+            <div class="text-xs text-neutral-600">Finding visually similar...</div>
+          {:else if similarItems.length === 0}
+            <div class="text-xs text-neutral-600 italic">No visually similar items</div>
+          {:else}
+            <div class="grid grid-cols-3 gap-2">
+              {#each similarItems as s (s.id)}
+                <button
+                  type="button"
+                  on:click={() => dispatch('selectAsset', { id: s.id })}
+                  class="group relative aspect-square rounded-md overflow-hidden bg-neutral-900 border border-neutral-800/80 hover:border-blue-500/80 transition-all cursor-pointer text-left"
+                  title="Similarity: {Math.round(s.similarity * 100)}%"
+                >
+                  <img
+                    src="/{s.thumb_path}"
+                    alt=""
+                    loading="lazy"
+                    class="w-full h-full object-cover group-hover:scale-105 transition-transform duration-200"
+                  />
+                  {#if s.mime_type.startsWith('video/')}
+                    <div class="absolute top-1 left-1 bg-black/60 backdrop-blur-xs px-1 py-0.5 rounded text-[8px] text-white">
+                      ▶
+                    </div>
+                  {/if}
+                  <div class="absolute inset-x-0 bottom-0 bg-gradient-to-t from-black/80 to-transparent p-1 opacity-0 group-hover:opacity-100 transition-opacity flex justify-end">
+                    <span class="text-[9px] font-mono text-blue-300">
+                      {Math.round(s.similarity * 100)}%
+                    </span>
+                  </div>
+                </button>
               {/each}
             </div>
           {/if}

@@ -24,8 +24,9 @@ use tower_http::{
 use tracing::info;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-use media_processing::{FaceEngine, MediaEngine, TagEngine};
+use media_processing::{FaceEngine, MediaEngine, TagEngine, ClipEngine};
 use services::cluster_cache::ClusterCacheManager;
+use services::clip_cache::ClipCacheManager;
 use services::queue::QueueService;
 use services::trash_purger::TrashPurgerService;
 
@@ -42,6 +43,8 @@ pub struct AppState {
     pub config: Config,
     pub queue_notify: Arc<Notify>,
     pub tx_events: broadcast::Sender<WsMediaEvent>,
+    pub clip_cache: ClipCacheManager,
+    pub clip_engine: Arc<ClipEngine>,
 }
 
 #[tokio::main]
@@ -69,12 +72,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let models_dir = config.storage_root.join("models");
     let face_engine = Arc::new(FaceEngine::init(&models_dir).map_err(|e| e.to_string())?);
     let tag_engine = Arc::new(TagEngine::init(&models_dir).map_err(|e| e.to_string())?);
+    let clip_engine = Arc::new(ClipEngine::init(&models_dir).map_err(|e| e.to_string())?);
 
     // 2. Wrap them into the unified MediaEngine
-    let media_engine = Arc::new(MediaEngine::new(face_engine, tag_engine));
+    let media_engine = Arc::new(MediaEngine::new(face_engine, tag_engine, clip_engine.clone()));
 
-    // 3. Load centroids using ClusterCacheManager directly
+    // 3. Load cahches directly
     let cluster_cache = ClusterCacheManager::load_initial(&pool).await?;
+    let clip_cache = ClipCacheManager::load_initial(&pool).await?;
 
     let queue_notify = Arc::new(Notify::new());
 
@@ -86,6 +91,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.storage_root.join("thumbs"),
         media_engine,
         cluster_cache,
+        clip_cache.clone(),
         config.worker_concurrency,
         queue_notify.clone(),
         tx_events.clone(),
@@ -96,6 +102,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config: config.clone(),
         queue_notify,
         tx_events,
+        clip_cache: clip_cache.clone(),
+        clip_engine,
     };
 
     let thumbs_router = Router::new()
@@ -114,6 +122,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/media/filters", get(routes::media::get_available_filters))
         .route("/api/assets/{id}/stream", get(routes::media::stream_asset))
         .route("/api/assets/{id}/favorite", post(routes::media::toggle_favorite))
+        .route("/api/assets/{id}/similar", get(routes::media::get_similar_assets))
         .route("/api/assets/{id}/delete", post(routes::media::toggle_soft_delete))
         .route("/api/assets/{id}/purge", post(routes::media::hard_delete_asset))
         .route("/api/assets/batch/delete", post(routes::media::batch_toggle_soft_delete))

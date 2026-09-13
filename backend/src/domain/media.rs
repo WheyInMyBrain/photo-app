@@ -52,6 +52,7 @@ pub struct NewAssetRecord {
     pub country_code: Option<String>,
     pub camera_make: Option<String>,
     pub camera_model: Option<String>,
+    pub clip_embedding: Option<Vec<u8>>,
 }
 
 /// The unified filter parameters struct for querying media across the entire app.
@@ -89,6 +90,10 @@ pub struct MediaQuery {
     pub limit: Option<i64>,
     pub is_private: Option<bool>,
     pub show_trash: Option<bool>,
+
+    // Internal vector search candidate IDs (not sent by frontend, populated by backend)
+    #[serde(skip)]
+    pub candidate_ids: Option<Vec<String>>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
@@ -152,4 +157,12 @@ pub struct SoftDeleteResponse {
     pub id: String,
     pub is_deleted: bool,
     pub deleted_at: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct SimilarMediaItem {
+    pub id: String,
+    pub thumb_path: String,
+    pub mime_type: String,
+    pub similarity: f32,
 }
