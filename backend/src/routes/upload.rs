@@ -15,8 +15,9 @@ use crate::db::AssetRepo;
 use crate::domain::upload::{StagedFile, BatchUploadReceipt, UploadItemResult, InspectLinkRequest, InspectResult, InspectLinkResponse, CandidateItem, CommitLinkRequest, RawUploadQuery, ChunkUploadQuery, ChunkUploadResponse, FinalizeChunkQuery}; 
 use crate::error::AppError;
 use crate::services::queue::{ProcessJob, QueueService};
-use crate::services::storage::StorageService;
 use crate::AppState;
+
+use media_processing::StorageService;
 
 async fn persist_and_enqueue_bytes(
     state: &AppState,

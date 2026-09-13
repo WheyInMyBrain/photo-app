@@ -1,6 +1,6 @@
 [workspace]
 members = [
     "backend",
-    "crates/media_downloader",
+    "crates/media_downloader", "crates/media_processing",
 ]
 resolver = "2"

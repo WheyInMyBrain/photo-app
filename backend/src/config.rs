@@ -7,6 +7,7 @@ pub struct Config {
     pub storage_root: PathBuf,
     pub db_url: String,
     pub vault_api_key: String,
+    pub worker_concurrency: usize,
 }
 
 impl Config {
@@ -44,12 +45,19 @@ impl Config {
         // 4. API Key for Shortcuts / Mobile upload
         let vault_api_key = std::env::var("VAULT_API_KEY").unwrap_or_default();
 
+        // 5. Workers for media processing
+        let worker_concurrency = std::env::var("WORKER_CONCURRENCY")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(5);
+
         Self {
             server_host,
             server_port,
             storage_root,
             db_url,
             vault_api_key,
+            worker_concurrency,
         }
     }
 }

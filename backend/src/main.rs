@@ -24,9 +24,9 @@ use tower_http::{
 use tracing::info;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-use services::face_engine::FaceEngine;
+use media_processing::{FaceEngine, MediaEngine, TagEngine};
+use services::cluster_cache::ClusterCacheManager;
 use services::queue::QueueService;
-use services::tag_engine::TagEngine;
 use services::trash_purger::TrashPurgerService;
 
 #[derive(Clone)]
@@ -57,18 +57,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     TrashPurgerService::start(pool.clone(), config.storage_root.clone());
 
+    // 1. Initialize ONNX models once inside the media_processing crate
     let models_dir = config.storage_root.join("models");
     let face_engine = Arc::new(FaceEngine::init(&models_dir).map_err(|e| e.to_string())?);
     let tag_engine = Arc::new(TagEngine::init(&models_dir).map_err(|e| e.to_string())?);
 
-    // Initialize wakeup notification primitive for the worker
+    // 2. Wrap them into the unified MediaEngine
+    let media_engine = Arc::new(MediaEngine::new(face_engine, tag_engine));
+
+    // 3. Load centroids using ClusterCacheManager directly
+    let cluster_cache = ClusterCacheManager::load_initial(&pool).await?;
+
     let queue_notify = Arc::new(Notify::new());
 
+    // 4. Start worker with unified MediaEngine & the RAM cluster cache
     QueueService::start_worker(
         pool.clone(),
         config.storage_root.join("thumbs"),
-        face_engine,
-        tag_engine,
+        media_engine,
+        cluster_cache,
+        config.worker_concurrency,
         queue_notify.clone(),
     );
 

@@ -3,8 +3,12 @@ use reverse_geocoder::ReverseGeocoder;
 use std::fs::File;
 use std::io::BufReader;
 use std::path::Path;
+use std::sync::LazyLock;
 
-#[derive(Default, Debug)]
+// Initialized exactly once in memory for the entire process lifetime
+static GEOCODER: LazyLock<ReverseGeocoder> = LazyLock::new(ReverseGeocoder::new);
+
+#[derive(Default, Debug, Clone)]
 pub struct ExtractedMetadata {
     pub captured_at: Option<String>,
     pub year: Option<i32>,
@@ -85,11 +89,12 @@ impl MetadataService {
                 meta.latitude = Some(parsed_lat);
                 meta.longitude = Some(parsed_lon);
 
-                let geocoder = ReverseGeocoder::new();
-                let search_result = geocoder.search((parsed_lat, parsed_lon));
+                // Zero-reallocation search using the global static geocoder
+                let search_result = GEOCODER.search((parsed_lat, parsed_lon));
                 meta.city = Some(search_result.record.name.to_string());
                 meta.subdivision = Some(search_result.record.admin1.to_string());
                 meta.country_code = Some(search_result.record.cc.to_string());
+                meta.country = Some(search_result.record.cc.to_string());
             }
         }
 

@@ -508,7 +508,10 @@ impl AssetRepo {
         Ok(())
     }
 
-    pub async fn insert_asset(pool: &SqlitePool, a: &NewAssetRecord) -> Result<(), sqlx::Error> {
+    pub async fn insert_asset_tx(
+        conn: &mut sqlx::SqliteConnection,
+        a: &NewAssetRecord,
+    ) -> Result<(), sqlx::Error> {
         sqlx::query(
             r#"
             INSERT INTO assets (
@@ -560,7 +563,7 @@ impl AssetRepo {
         .bind(&a.country_code)
         .bind(&a.camera_make)
         .bind(&a.camera_model)
-        .execute(pool)
+        .execute(&mut *conn)
         .await?;
 
         Ok(())

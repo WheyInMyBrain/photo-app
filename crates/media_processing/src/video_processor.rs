@@ -50,7 +50,6 @@ impl VideoProcessor {
         )
     }
 
-    /// Extracts video dimensions (accounting for iPhone/Android rotation), duration, and capture metadata
     pub fn extract_metadata(path: &Path) -> Result<VideoMetadata, Box<dyn std::error::Error + Send + Sync>> {
         let output = Command::new("ffprobe")
             .args([
@@ -69,13 +68,12 @@ impl VideoProcessor {
         let parsed: ProbeOutput = serde_json::from_slice(&output.stdout)?;
         let mut meta = VideoMetadata::default();
 
-        // 1. Resolution & iPhone Rotation Handling
+        // 1. Resolution & Rotation Handling
         if let Some(streams) = parsed.streams {
             if let Some(video_stream) = streams.iter().find(|s| s.width.is_some() && s.height.is_some()) {
                 let mut w = video_stream.width.unwrap_or(0);
                 let mut h = video_stream.height.unwrap_or(0);
 
-                // Detect rotation flag in side_data (QuickTime / MP4)
                 let mut rotation = 0;
                 if let Some(ref side_data) = video_stream.side_data_list {
                     if let Some(entry) = side_data.iter().find(|sd| sd.rotation.is_some()) {
@@ -83,7 +81,6 @@ impl VideoProcessor {
                     }
                 }
 
-                // Fallback: check stream tags for rotation
                 if rotation == 0 {
                     if let Some(ref tags) = video_stream.tags {
                         if let Some(rot_str) = tags.get("rotate").and_then(|v| v.as_str()) {
@@ -92,7 +89,6 @@ impl VideoProcessor {
                     }
                 }
 
-                // Swap width and height if rotated 90 or 270 degrees
                 if rotation.abs() == 90 || rotation.abs() == 270 {
                     std::mem::swap(&mut w, &mut h);
                 }
@@ -102,16 +98,21 @@ impl VideoProcessor {
             }
         }
 
-        // 2. Duration and creation date
+        // 2. Duration & Metadata (with Apple QuickTime fallbacks)
         if let Some(format) = parsed.format {
             if let Some(dur_str) = format.duration {
                 meta.duration_seconds = dur_str.parse::<f64>().unwrap_or(0.0);
             }
 
             if let Some(tags) = format.tags {
-                if let Some(creation) = tags.get("creation_time").and_then(|v| v.as_str()) {
-                    meta.captured_at = Some(creation.to_string());
+                let creation = tags.get("creation_time")
+                    .or_else(|| tags.get("com.apple.quicktime.creationdate"))
+                    .and_then(|v| v.as_str());
+
+                if let Some(c) = creation {
+                    meta.captured_at = Some(c.to_string());
                 }
+
                 if let Some(make) = tags.get("com.apple.quicktime.make").and_then(|v| v.as_str()) {
                     meta.camera_make = Some(make.to_string());
                 }
@@ -124,7 +125,6 @@ impl VideoProcessor {
         Ok(meta)
     }
 
-    /// Extracts 1 frame via FFmpeg with fast input-seeking and auto-rotation
     pub fn generate_poster(
         video_path: &Path,
         asset_id: &str,
@@ -136,8 +136,6 @@ impl VideoProcessor {
         let thumb_dest = target_shard_dir.join(&thumb_filename);
         let preview_dest = target_shard_dir.join(&preview_filename);
 
-        // Seeking to 0.5s avoids initial black fade frames.
-        // Placing `-ss` before `-i` enables keyframe fast-seek.
         let output = Command::new("ffmpeg")
             .args([
                 "-ss", "00:00:00.500",
@@ -150,7 +148,6 @@ impl VideoProcessor {
             .output()?;
 
         if !output.status.success() || output.stdout.is_empty() {
-            // Fallback to start of file if the video is shorter than 500ms
             let fallback_output = Command::new("ffmpeg")
                 .args([
                     "-i", video_path.to_str().ok_or("Invalid path string")?,

@@ -1,11 +1,3 @@
-pub mod image_processor;
-pub mod metadata;
 pub mod queue;
-pub mod storage;
-pub mod video_processor;
-pub mod face_engine;
-pub mod face_detector;
-pub mod face_pipeline;
-pub mod tag_pipeline;
-pub mod tag_engine;
+pub mod cluster_cache;
 pub mod trash_purger;

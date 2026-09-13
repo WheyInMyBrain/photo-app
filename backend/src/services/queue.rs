@@ -1,6 +1,5 @@
-use image::DynamicImage;
-use sqlx::SqlitePool;
-use std::path::{Path, PathBuf};
+use sqlx::{Row, SqlitePool};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{Notify, Semaphore};
@@ -9,27 +8,11 @@ use tracing::{error, info};
 use crate::db::{AssetRepo, JobRepo};
 use crate::domain::job_repo::DbJob;
 use crate::domain::media::NewAssetRecord;
-use crate::services::face_engine::FaceEngine;
-use crate::services::face_pipeline::FacePipeline;
-use crate::services::image_processor::ImageProcessor;
-use crate::services::metadata::{ExtractedMetadata, MetadataService};
-use crate::services::tag_engine::TagEngine;
-use crate::services::tag_pipeline::TagPipeline;
-use crate::services::video_processor::VideoProcessor;
+use crate::services::cluster_cache::SharedClusterCache;
+
+use media_processing::{MediaEngine, ProcessedMediaResult};
 
 pub type ProcessJob = DbJob;
-
-struct MediaArtifacts {
-    meta: ExtractedMetadata,
-    thumb_path: String,
-    preview_path: String,
-    width: i64,
-    height: i64,
-    aspect_ratio: f64,
-    duration_seconds: Option<f64>,
-    mime_type: String,
-    image_buffer: Option<Arc<DynamicImage>>,
-}
 
 pub struct QueueService;
 
@@ -47,88 +30,107 @@ impl QueueService {
     pub fn start_worker(
         pool: SqlitePool,
         thumbs_root: PathBuf,
-        face_engine: Arc<FaceEngine>,
-        tag_engine: Arc<TagEngine>,
+        media_engine: Arc<MediaEngine>,
+        cluster_cache: SharedClusterCache,
+        concurrency: usize,
         notify: Arc<Notify>,
     ) {
-        let cores = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(4);
-        let ai_slots = (cores / 2).clamp(1, 3);
-        let ai_semaphore = Arc::new(Semaphore::new(ai_slots));
-        info!(ai_worker_concurrency = ai_slots, "AI inference throttling active");
+        let semaphore = Arc::new(Semaphore::new(concurrency.max(1)));
+        info!(concurrency = concurrency, "Unified media queue worker active");
 
         tokio::spawn(async move {
-            info!("Persistent background media worker running (FaceEngine + TagEngine)");
-
-            if let Ok(count) = JobRepo::reset_interrupted(&pool).await {
-                if count > 0 {
-                    info!(count = count, "Rescheduled interrupted jobs from previous run");
-                }
-            }
+            let _ = JobRepo::reset_interrupted(&pool).await;
 
             loop {
                 match JobRepo::fetch_next_job(&pool).await {
                     Ok(Some(job)) => {
-                        let job_id = job.id.clone();
-                        let shard = if job.asset_id.len() >= 2 { &job.asset_id[0..2] } else { "misc" };
-                        let shard_dir = thumbs_root.join(shard);
-
-                        if let Err(e) = std::fs::create_dir_all(&shard_dir) {
-                            error!("Failed to create shard directory {:?}: {}", shard_dir, e);
-                            let _ = JobRepo::mark_failed(&pool, &job_id, &e.to_string()).await;
-                            continue;
-                        }
-
-                        let disk_path = job.disk_path.clone();
-                        let asset_id = job.asset_id.clone();
-
-                        let process_res = tokio::task::spawn_blocking(move || {
-                            Self::process_file_sync(&disk_path, &asset_id, &shard_dir)
-                        })
-                        .await;
-
-                        let artifacts = match process_res {
-                            Ok(Ok(data)) => data,
-                            Ok(Err(e)) => {
-                                let err_msg = e.to_string();
-                                error!("Processing error on {}: {}", job.asset_id, err_msg);
-                                let _ = JobRepo::mark_failed(&pool, &job_id, &err_msg).await;
-                                continue;
-                            }
-                            Err(join_err) => {
-                                let err_msg = join_err.to_string();
-                                error!("Worker task panic on {}: {}", job.asset_id, err_msg);
-                                let _ = JobRepo::mark_failed(&pool, &job_id, &err_msg).await;
-                                continue;
-                            }
+                        let permit = match semaphore.clone().acquire_owned().await {
+                            Ok(p) => p,
+                            Err(_) => break,
                         };
 
-                        let pool_ref = pool.clone();
-                        let j_id = job_id.clone();
+                        let pool = pool.clone();
+                        let thumbs_root = thumbs_root.clone();
+                        let media_engine = media_engine.clone();
+                        let cluster_cache = cluster_cache.clone();
 
-                        let index_res = Self::index_and_dispatch(
-                            pool.clone(),
-                            thumbs_root.clone(),
-                            face_engine.clone(),
-                            tag_engine.clone(),
-                            ai_semaphore.clone(),
-                            job,
-                            artifacts,
-                        )
-                        .await;
+                        tokio::spawn(async move {
+                            let _guard = permit;
+                            let job_id = job.id.clone();
+                            let asset_id = job.asset_id.clone();
 
-                        match index_res {
-                            Ok(_) => {
-                                let _ = JobRepo::mark_completed(&pool_ref, &j_id).await;
+                            // 1. Read existing clusters from RAM (0 SQL queries!)
+                            let known_clusters = {
+                                let read_guard = cluster_cache.read().await;
+                                read_guard.clone()
+                            };
+
+                            let disk_path = job.disk_path.clone();
+                            let thumbs_dir = thumbs_root.clone();
+                            let engine = media_engine.clone();
+
+                            // 2. Offload everything to CPU/ONNX in spawn_blocking
+                            // Image/video detection, resizing, EXIF, faces, and tags all happen here
+                            let process_res = tokio::task::spawn_blocking(move || {
+                                engine.process_asset_sync(
+                                    &disk_path,
+                                    &asset_id,
+                                    &thumbs_dir,
+                                    known_clusters,
+                                    true, // run AI
+                                )
+                            })
+                            .await;
+
+                            let processed = match process_res {
+                                Ok(Ok(data)) => data,
+                                Ok(Err(e)) => {
+                                    let err_msg = e.to_string();
+                                    error!("Processing error on {}: {}", job.asset_id, err_msg);
+                                    let _ = JobRepo::mark_failed(&pool, &job_id, &err_msg).await;
+                                    return;
+                                }
+                                Err(join_err) => {
+                                    let err_msg = join_err.to_string();
+                                    error!("Worker panic on {}: {}", job.asset_id, err_msg);
+                                    let _ = JobRepo::mark_failed(&pool, &job_id, &err_msg).await;
+                                    return;
+                                }
+                            };
+
+                            // 3. Atomically update in-memory cache with newly discovered/updated faces
+                            if !processed.new_persons.is_empty() || !processed.updated_clusters.is_empty() {
+                                let mut write_guard = cluster_cache.write().await;
+                                for np in &processed.new_persons {
+                                    write_guard.push(media_processing::KnownPersonCluster {
+                                        person_id: np.person_id.clone(),
+                                        centroid: np.centroid.clone(),
+                                        face_count: 1,
+                                        cover_face_id: Some(np.cover_face_id.clone()),
+                                    });
+                                }
+                                for uc in &processed.updated_clusters {
+                                    if let Some(c) = write_guard.iter_mut().find(|c| c.person_id == uc.person_id) {
+                                        c.centroid = uc.new_centroid.clone();
+                                        c.face_count = uc.new_face_count;
+                                    }
+                                }
                             }
-                            Err(e) => {
-                                let _ = JobRepo::mark_failed(&pool_ref, &j_id, &e).await;
+
+                            // 4. Single database commit for asset, tags, and faces
+                            match Self::commit_to_db(&pool, &job, processed).await {
+                                Ok(_) => {
+                                    let _ = JobRepo::mark_completed(&pool, &job_id).await;
+                                    info!(id = %job.asset_id, "Asset processed & indexed successfully");
+                                }
+                                Err(e) => {
+                                    error!("DB commit failed on {}: {}", job.asset_id, e);
+                                    let _ = JobRepo::mark_failed(&pool, &job_id, &e).await;
+                                }
                             }
-                        }
+                        });
                     }
                     Ok(None) => {
-                        // Sleep until a new job is enqueued (instant) or check every 30s as a fallback
                         tokio::select! {
                             _ = notify.notified() => {},
                             _ = tokio::time::sleep(Duration::from_secs(30)) => {},
@@ -143,178 +145,146 @@ impl QueueService {
         });
     }
 
-    fn process_file_sync(
-        disk_path: &Path,
-        asset_id: &str,
-        shard_dir: &Path,
-    ) -> Result<MediaArtifacts, Box<dyn std::error::Error + Send + Sync>> {
-        let ext = disk_path
-            .extension()
-            .and_then(|s| s.to_str())
-            .unwrap_or("")
-            .to_lowercase();
-
-        if VideoProcessor::is_video(&ext) {
-            let v_meta = VideoProcessor::extract_metadata(disk_path)?;
-            let (thumb_path, preview_path) = VideoProcessor::generate_poster(disk_path, asset_id, shard_dir)?;
-            let aspect = if v_meta.height > 0 { v_meta.width as f64 / v_meta.height as f64 } else { 1.777 };
-
-            let mut meta = ExtractedMetadata::default();
-            meta.captured_at = v_meta.captured_at;
-            meta.camera_make = v_meta.camera_make;
-            meta.camera_model = v_meta.camera_model;
-
-            if let Some(ref dt) = meta.captured_at {
-                let p: Vec<&str> = dt.split(|c| c == '-' || c == 'T' || c == ' ' || c == ':').collect();
-                if p.len() >= 4 {
-                    meta.year = p[0].parse().ok();
-                    meta.month = p[1].parse().ok();
-                    meta.day = p[2].parse().ok();
-                    meta.hour = p[3].parse().ok();
-                }
-            }
-
-            let mime = if ext == "mp4" { "video/mp4" } else { "video/quicktime" };
-
-            Ok(MediaArtifacts {
-                meta,
-                thumb_path,
-                preview_path,
-                width: v_meta.width,
-                height: v_meta.height,
-                aspect_ratio: aspect,
-                duration_seconds: Some(v_meta.duration_seconds),
-                mime_type: mime.to_string(),
-                image_buffer: None,
-            })
-        } else {
-            let meta = MetadataService::extract(disk_path);
-            let img = ImageProcessor::load_image(disk_path)?;
-            let width = img.width() as i64;
-            let height = img.height() as i64;
-            let aspect = if height > 0 { width as f64 / height as f64 } else { 1.0 };
-            let (thumb_path, preview_path) = ImageProcessor::generate_derivatives(&img, asset_id, shard_dir)?;
-
-            let mime = match ext.as_str() {
-                "heic" | "heif" => "image/heic",
-                "png" => "image/png",
-                "webp" => "image/webp",
-                _ => "image/jpeg",
-            };
-
-            Ok(MediaArtifacts {
-                meta,
-                thumb_path,
-                preview_path,
-                width,
-                height,
-                aspect_ratio: aspect,
-                duration_seconds: None,
-                mime_type: mime.to_string(),
-                image_buffer: Some(Arc::new(img)),
-            })
-        }
-    }
-
-    async fn index_and_dispatch(
-        pool: SqlitePool,
-        thumbs_root: PathBuf,
-        face_engine: Arc<FaceEngine>,
-        tag_engine: Arc<TagEngine>,
-        ai_semaphore: Arc<Semaphore>,
-        job: ProcessJob,
-        art: MediaArtifacts,
+    /// Single atomic SQLite transaction for the entire asset
+    async fn commit_to_db(
+        pool: &SqlitePool,
+        job: &DbJob,
+        res: ProcessedMediaResult,
     ) -> Result<(), String> {
-        let asset_id = job.asset_id.clone();
+        let mut tx = pool.begin().await.map_err(|e| e.to_string())?;
 
+        // 1. Insert Base Asset
         let record = NewAssetRecord {
-            id: job.asset_id,
-            sha256: job.sha256,
-            file_name: job.file_name,
-            rel_path: job.rel_path,
-            folder_path: job.folder_path,
-            thumb_path: art.thumb_path,
-            preview_path: art.preview_path,
+            id: job.asset_id.clone(),
+            sha256: job.sha256.clone(),
+            file_name: job.file_name.clone(),
+            rel_path: job.rel_path.clone(),
+            folder_path: job.folder_path.clone(),
+            thumb_path: res.thumb_path,
+            preview_path: res.preview_path,
             file_size_bytes: job.file_size_bytes,
-            mime_type: art.mime_type.clone(),
-            width: art.width,
-            height: art.height,
-            aspect_ratio: art.aspect_ratio,
-            duration_seconds: art.duration_seconds,
+            mime_type: res.mime_type,
+            width: res.width,
+            height: res.height,
+            aspect_ratio: res.aspect_ratio,
+            duration_seconds: res.duration_seconds,
             is_private: job.is_private,
-            captured_at: art.meta.captured_at,
-            year: art.meta.year,
-            month: art.meta.month,
-            day: art.meta.day,
-            hour: art.meta.hour,
-            latitude: art.meta.latitude,
-            longitude: art.meta.longitude,
-            altitude: art.meta.altitude,
-            city: art.meta.city,
-            subdivision: art.meta.subdivision,
-            country: art.meta.country,
-            country_code: art.meta.country_code,
-            camera_make: art.meta.camera_make,
-            camera_model: art.meta.camera_model,
+            captured_at: res.meta.captured_at,
+            year: res.meta.year,
+            month: res.meta.month,
+            day: res.meta.day,
+            hour: res.meta.hour,
+            latitude: res.meta.latitude,
+            longitude: res.meta.longitude,
+            altitude: res.meta.altitude,
+            city: res.meta.city,
+            subdivision: res.meta.subdivision,
+            country: res.meta.country,
+            country_code: res.meta.country_code,
+            camera_make: res.meta.camera_make,
+            camera_model: res.meta.camera_model,
         };
 
-        AssetRepo::insert_asset(&pool, &record)
+        AssetRepo::insert_asset_tx(&mut *tx, &record)
             .await
-            .map_err(|e| format!("Database write failure for {}: {}", asset_id, e))?;
+            .map_err(|e| e.to_string())?;
 
-        info!(id = %asset_id, mime = %art.mime_type, "Indexed asset successfully");
-
-        if let Err(e) = AssetRepo::sync_search_index(&pool, &asset_id).await {
-            error!("Initial search sync failed for {}: {}", asset_id, e);
+        // 2. Insert Persons & Updated Centroids
+        for np in res.new_persons {
+            let embedding_bytes: &[u8] = bytemuck::cast_slice(&np.centroid);
+            sqlx::query(
+                "INSERT INTO persons (id, name, cover_face_id, face_count, centroid_embedding)
+                 VALUES (?1, NULL, ?2, 1, ?3)"
+            )
+            .bind(&np.person_id)
+            .bind(&np.cover_face_id)
+            .bind(embedding_bytes)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| e.to_string())?;
         }
 
-        if let Some(img_arc) = art.image_buffer {
-            // Acquire the permit before delegating to protect memory
-            let permit = ai_semaphore
-                .acquire_owned()
+        for uc in res.updated_clusters {
+            let embedding_bytes: &[u8] = bytemuck::cast_slice(&uc.new_centroid);
+            sqlx::query(
+                "UPDATE persons SET centroid_embedding = ?1, face_count = ?2, updated_at = CURRENT_TIMESTAMP
+                 WHERE id = ?3"
+            )
+            .bind(embedding_bytes)
+            .bind(uc.new_face_count)
+            .bind(&uc.person_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| e.to_string())?;
+        }
+
+        // 3. Insert Faces
+        for face in res.detected_faces {
+            let embedding_bytes: &[u8] = bytemuck::cast_slice(&face.embedding);
+            sqlx::query(
+                "INSERT INTO asset_faces (
+                    id, asset_id, person_id, bbox_x, bbox_y, bbox_w, bbox_h,
+                    detection_score, face_thumb_path, embedding, is_verified
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 0)"
+            )
+            .bind(&face.face_id)
+            .bind(&job.asset_id)
+            .bind(&face.person_id)
+            .bind(face.bbox_x)
+            .bind(face.bbox_y)
+            .bind(face.bbox_w)
+            .bind(face.bbox_h)
+            .bind(face.score)
+            .bind(&face.face_thumb_rel_path)
+            .bind(embedding_bytes)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| e.to_string())?;
+        }
+
+        // 4. Insert Tags
+        for tag in res.tags {
+            let tag_id: i64 = match sqlx::query("SELECT id FROM tags WHERE name = ?1 COLLATE NOCASE")
+                .bind(&tag.name)
+                .fetch_optional(&mut *tx)
                 .await
-                .map_err(|e| e.to_string())?;
-
-            let pool_clone = pool.clone();
-            let a_id = asset_id.clone();
-            let thumbs_clone = thumbs_root.clone();
-
-            tokio::spawn(async move {
-                let _guard = permit;
-
-                let f_engine = face_engine.clone();
-                let f_pool = pool_clone.clone();
-                let f_thumbs = thumbs_clone.clone();
-                let f_id = a_id.clone();
-                let f_img = img_arc.clone();
-
-                let t_engine = tag_engine.clone();
-                let t_pool = pool_clone.clone();
-                let t_id = a_id.clone();
-                let t_img = img_arc.clone();
-
-                let (face_res, tag_res) = tokio::join!(
-                    FacePipeline::process_asset_faces(f_engine, &f_pool, &f_thumbs, &f_id, f_img),
-                    TagPipeline::process_asset_tags(t_engine, &t_pool, &t_id, t_img)
-                );
-
-                match face_res {
-                    Ok(cnt) => info!(id = %a_id, faces = cnt, "Faces clustered"),
-                    Err(e) => error!("Face pipeline failure on {}: {}", a_id, e),
+                .map_err(|e| e.to_string())?
+            {
+                Some(row) => row.try_get("id").map_err(|e| e.to_string())?,
+                None => {
+                    let r = sqlx::query("INSERT INTO tags (name, source) VALUES (?1, 'model')")
+                        .bind(&tag.name)
+                        .execute(&mut *tx)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    r.last_insert_rowid()
                 }
+            };
 
-                match tag_res {
-                    Ok(cnt) => info!(id = %a_id, tags = cnt, "WD Tags stored"),
-                    Err(e) => error!("Tag pipeline failure on {}: {}", a_id, e),
-                }
-
-                if let Err(e) = AssetRepo::sync_search_index(&pool_clone, &a_id).await {
-                    error!("Final FTS5 search sync failed for {}: {}", a_id, e);
-                } else {
-                    info!(id = %a_id, "FTS5 search index refreshed with tags and faces");
-                }
-            });
+            sqlx::query(
+                "INSERT INTO asset_tags (asset_id, tag_id, confidence, source)
+                 VALUES (?1, ?2, ?3, 'AI')
+                 ON CONFLICT(asset_id, tag_id) DO UPDATE SET confidence = excluded.confidence"
+            )
+            .bind(&job.asset_id)
+            .bind(tag_id)
+            .bind(tag.confidence as f64)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| e.to_string())?;
         }
+
+        // 5. Update Status & Sync FTS5 Index
+        sqlx::query("UPDATE assets SET face_processed = 1, tags_processed = 1 WHERE id = ?1")
+            .bind(&job.asset_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| e.to_string())?;
+
+        tx.commit().await.map_err(|e| e.to_string())?;
+
+        // Refresh search index outside transaction
+        let _ = AssetRepo::sync_search_index(pool, &job.asset_id).await;
 
         Ok(())
     }

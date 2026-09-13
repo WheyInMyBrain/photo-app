@@ -1,0 +1,32 @@
+[package]
+name = "media_processing"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# Image loading, manipulation & decoders
+image = { version = "0.25.10", features = ["jpeg", "png", "webp"] }
+imageproc = "0.27.0"
+libheif-rs = "3.0.0"
+
+# Metadata & EXIF & Geolocation
+kamadak-exif = "0.6.1"
+reverse_geocoder = "4.1.1"
+chrono = "0.4.45"
+
+# AI Inference (Faces & Tags)
+ort = "2.0.0-rc.13"
+ndarray = "0.17.2"
+csv = "1.4.0"
+bytemuck = "1.25.2"
+
+# Hashing & File storage calculations
+sha2 = "0.11.0"
+hex = "0.4.3"
+
+# Serialization & Utilities
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+anyhow = "1.0"
+tracing = "0.1.44"
+uuid = { version = "1.26.0", features = ["v4"] }

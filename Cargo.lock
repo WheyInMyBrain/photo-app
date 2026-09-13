@@ -280,18 +280,12 @@ dependencies = [
  "base64 0.23.1",
  "bytemuck",
  "chrono",
- "csv",
  "dotenvy",
  "hex",
  "image",
- "imageproc",
- "kamadak-exif",
- "libheif-rs",
  "media_downloader",
- "ndarray",
- "ort",
+ "media_processing",
  "rand 0.10.2",
- "reverse_geocoder",
  "serde",
  "serde_json",
  "sha2 0.11.0",
@@ -1874,6 +1868,29 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "uuid",
+]
+
+[[package]]
+name = "media_processing"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "bytemuck",
+ "chrono",
+ "csv",
+ "hex",
+ "image",
+ "imageproc",
+ "kamadak-exif",
+ "libheif-rs",
+ "ndarray",
+ "ort",
+ "reverse_geocoder",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tracing",
  "uuid",
 ]
 
