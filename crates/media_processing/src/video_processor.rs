@@ -1,4 +1,4 @@
-use image::{imageops::FilterType, ImageFormat};
+use image::{imageops::FilterType, ImageFormat, DynamicImage};
 use serde::Deserialize;
 use std::fs::File;
 use std::io::Cursor;
@@ -123,6 +123,49 @@ impl VideoProcessor {
         }
 
         Ok(meta)
+    }
+
+    pub fn sample_frames(
+        video_path: &Path,
+        duration_seconds: f64,
+        sample_count: usize,
+    ) -> Vec<DynamicImage> {
+        if duration_seconds < 0.5 || sample_count == 0 {
+            return Vec::new();
+        }
+
+        let mut frames = Vec::with_capacity(sample_count);
+        // Distribute timestamps cleanly (e.g., 25%, 50%, 75% for 3 samples)
+        let interval = duration_seconds / (sample_count + 1) as f64;
+
+        for i in 1..=sample_count {
+            let timestamp = interval * i as f64;
+            let time_str = format!("{:.3}", timestamp);
+
+            let res = Command::new("ffmpeg")
+                .args([
+                    "-ss", &time_str,
+                    "-i", match video_path.to_str() {
+                        Some(p) => p,
+                        None => continue,
+                    },
+                    "-vframes", "1",
+                    "-f", "image2pipe",
+                    "-vcodec", "mjpeg",
+                    "-",
+                ])
+                .output();
+
+            if let Ok(output) = res {
+                if output.status.success() && !output.stdout.is_empty() {
+                    if let Ok(img) = image::load(Cursor::new(&output.stdout), ImageFormat::Jpeg) {
+                        frames.push(img);
+                    }
+                }
+            }
+        }
+
+        frames
     }
 
     pub fn generate_poster(

@@ -127,9 +127,25 @@ impl MediaEngine {
         std::fs::create_dir_all(&shard_dir)?;
 
         if video_processor::VideoProcessor::is_video(&ext) {
-            self.process_video(disk_path, asset_id, &shard_dir, &ext)
+            self.process_video(
+                disk_path,
+                asset_id,
+                thumbs_root,
+                &shard_dir,
+                &ext,
+                existing_clusters,
+                run_ai,
+            )
         } else {
-            self.process_image(disk_path, asset_id, thumbs_root, &shard_dir, &ext, existing_clusters, run_ai)
+            self.process_image(
+                disk_path,
+                asset_id,
+                thumbs_root,
+                &shard_dir,
+                &ext,
+                existing_clusters,
+                run_ai,
+            )
         }
     }
 
@@ -140,8 +156,11 @@ impl MediaEngine {
         &self,
         disk_path: &Path,
         asset_id: &str,
+        thumbs_root: &Path,
         shard_dir: &Path,
         ext: &str,
+        existing_clusters: Vec<KnownPersonCluster>,
+        run_ai: bool,
     ) -> Result<ProcessedMediaResult, Box<dyn std::error::Error + Send + Sync>> {
         let v_meta = video_processor::VideoProcessor::extract_metadata(disk_path)?;
         let (thumb_path, preview_path) =
@@ -170,6 +189,51 @@ impl MediaEngine {
 
         let mime = if ext == "mp4" { "video/mp4" } else { "video/quicktime" };
 
+        if !run_ai {
+            return Ok(ProcessedMediaResult {
+                mime_type: mime.to_string(),
+                width: v_meta.width,
+                height: v_meta.height,
+                aspect_ratio: aspect,
+                duration_seconds: Some(v_meta.duration_seconds),
+                thumb_path,
+                preview_path,
+                meta,
+                detected_faces: Vec::new(),
+                updated_clusters: Vec::new(),
+                new_persons: Vec::new(),
+                tags: Vec::new(),
+            });
+        }
+
+        // 1. Sample 3-4 representative frames across video duration
+        let sample_count = if v_meta.duration_seconds > 60.0 { 4 } else { 3 };
+        let sampled_frames = video_processor::VideoProcessor::sample_frames(
+            disk_path,
+            v_meta.duration_seconds,
+            sample_count,
+        );
+
+        // 2. Aggregate & Deduplicate Tags across all sampled frames
+        let mut tag_map: std::collections::HashMap<String, f32> = std::collections::HashMap::new();
+        for frame in &sampled_frames {
+            if let Ok(predictions) = self.tag_engine.tag_image(frame, 0.35) {
+                for (name, conf) in predictions {
+                    let entry = tag_map.entry(name).or_insert(conf);
+                    if conf > *entry {
+                        *entry = conf;
+                    }
+                }
+            }
+        }
+        let tags: Vec<TagPrediction> = tag_map
+            .into_iter()
+            .map(|(name, confidence)| TagPrediction { name, confidence })
+            .collect();
+
+        // 3. Detect & Cluster Faces across all sampled frames
+        let faces_res = self.process_video_faces(&sampled_frames, thumbs_root, existing_clusters)?;
+
         Ok(ProcessedMediaResult {
             mime_type: mime.to_string(),
             width: v_meta.width,
@@ -179,10 +243,170 @@ impl MediaEngine {
             thumb_path,
             preview_path,
             meta,
-            detected_faces: Vec::new(),
-            updated_clusters: Vec::new(),
-            new_persons: Vec::new(),
-            tags: Vec::new(),
+            detected_faces: faces_res.detected_faces,
+            updated_clusters: faces_res.updated_clusters,
+            new_persons: faces_res.new_persons,
+            tags,
+        })
+    }
+
+    // -------------------------------------------------------------------------
+    // Video Face Detection & Intra-Video Deduplication
+    // -------------------------------------------------------------------------
+    fn process_video_faces(
+        &self,
+        frames: &[DynamicImage],
+        thumbs_root: &Path,
+        mut existing_clusters: Vec<KnownPersonCluster>,
+    ) -> Result<ClusteredFacesResult, Box<dyn std::error::Error + Send + Sync>> {
+        if frames.is_empty() {
+            return Ok(ClusteredFacesResult::default());
+        }
+
+        let faces_dir = thumbs_root.join("faces");
+        std::fs::create_dir_all(&faces_dir)?;
+
+        // Map: person_id -> highest scoring face record in this video
+        let mut best_faces_per_person: std::collections::HashMap<String, NewFaceRecord> =
+            std::collections::HashMap::new();
+        let mut updated_clusters: Vec<ClusterUpdate> = Vec::new();
+        let mut new_persons: Vec<NewPersonRecord> = Vec::new();
+
+        for frame in frames {
+            let detections = match self.face_engine.detect_faces(frame, 0.50, 0.35) {
+                Ok(dets) if !dets.is_empty() => dets,
+                _ => continue,
+            };
+
+            for det in detections {
+                let chip = crop_face_chip(frame, det.x, det.y, det.w, det.h);
+
+                let embedding = match self.face_engine.extract_embedding(&chip) {
+                    Ok(emb) => emb,
+                    Err(_) => continue,
+                };
+
+                // Match against existing person clusters
+                let mut best_match: Option<(usize, f32)> = None;
+                for (idx, cluster) in existing_clusters.iter().enumerate() {
+                    let sim = cosine_similarity(&embedding, &cluster.centroid);
+                    if sim > best_match.map(|(_, s)| s).unwrap_or(-1.0) {
+                        best_match = Some((idx, sim));
+                    }
+                }
+
+                let target_pid = if let Some((idx, sim)) = best_match {
+                    if sim >= 0.40 {
+                        let cluster = &mut existing_clusters[idx];
+                        let pid = cluster.person_id.clone();
+
+                        // Only update the centroid once per video per person
+                        if !best_faces_per_person.contains_key(&pid) {
+                            let n = cluster.face_count as f32;
+                            let mut new_centroid = vec![0.0f32; 512];
+                            for k in 0..512 {
+                                new_centroid[k] = (cluster.centroid[k] * n) + embedding[k];
+                            }
+                            let norm = new_centroid.iter().map(|v| v * v).sum::<f32>().sqrt().max(1e-6);
+                            for v in new_centroid.iter_mut() {
+                                *v /= norm;
+                            }
+
+                            cluster.centroid = new_centroid.clone();
+                            cluster.face_count += 1;
+
+                            updated_clusters.push(ClusterUpdate {
+                                person_id: pid.clone(),
+                                new_centroid,
+                                new_face_count: cluster.face_count,
+                                new_cover_face_id: None,
+                            });
+                        }
+
+                        pid
+                    } else {
+                        // Under threshold -> New Person
+                        let new_pid = Uuid::new_v4().to_string();
+                        let temp_face_id = Uuid::new_v4().to_string();
+
+                        existing_clusters.push(KnownPersonCluster {
+                            person_id: new_pid.clone(),
+                            centroid: embedding.clone(),
+                            face_count: 1,
+                            cover_face_id: Some(temp_face_id.clone()),
+                        });
+
+                        new_persons.push(NewPersonRecord {
+                            person_id: new_pid.clone(),
+                            cover_face_id: temp_face_id,
+                            centroid: embedding.clone(),
+                        });
+
+                        new_pid
+                    }
+                } else {
+                    let new_pid = Uuid::new_v4().to_string();
+                    let temp_face_id = Uuid::new_v4().to_string();
+
+                    existing_clusters.push(KnownPersonCluster {
+                        person_id: new_pid.clone(),
+                        centroid: embedding.clone(),
+                        face_count: 1,
+                        cover_face_id: Some(temp_face_id.clone()),
+                    });
+
+                    new_persons.push(NewPersonRecord {
+                        person_id: new_pid.clone(),
+                        cover_face_id: temp_face_id,
+                        centroid: embedding.clone(),
+                    });
+
+                    new_pid
+                };
+
+                // Keep only the highest-quality face detection for each person in this video
+                let is_better = match best_faces_per_person.get(&target_pid) {
+                    Some(existing) => det.score > existing.score,
+                    None => true,
+                };
+
+                if is_better {
+                    let face_id = Uuid::new_v4().to_string();
+                    let avatar = chip.resize_to_fill(128, 128, FilterType::Triangle);
+                    let avatar_rel = format!("thumbs/faces/{}.webp", face_id);
+                    let avatar_abs = faces_dir.join(format!("{}.webp", face_id));
+
+                    if let Ok(mut out) = std::fs::File::create(&avatar_abs) {
+                        let _ = avatar.write_to(&mut out, ImageFormat::WebP);
+                    }
+
+                    // Update cover_face_id if this person was created in this video pass
+                    if let Some(np) = new_persons.iter_mut().find(|p| p.person_id == target_pid) {
+                        np.cover_face_id = face_id.clone();
+                    }
+
+                    best_faces_per_person.insert(
+                        target_pid.clone(),
+                        NewFaceRecord {
+                            face_id,
+                            person_id: target_pid,
+                            bbox_x: det.x,
+                            bbox_y: det.y,
+                            bbox_w: det.w,
+                            bbox_h: det.h,
+                            score: det.score,
+                            face_thumb_rel_path: avatar_rel,
+                            embedding,
+                        },
+                    );
+                }
+            }
+        }
+
+        Ok(ClusteredFacesResult {
+            detected_faces: best_faces_per_person.into_values().collect(),
+            updated_clusters,
+            new_persons,
         })
     }
 
