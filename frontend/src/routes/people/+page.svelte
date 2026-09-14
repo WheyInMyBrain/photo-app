@@ -3,6 +3,7 @@
   import { goto } from '$app/navigation';
   import { browser } from '$app/environment';
   import { filterStore } from '$lib/stores/filterStore';
+  import { authStore } from '$lib/stores/authStore';
 
   interface PersonCard {
     id: string;
@@ -28,14 +29,19 @@
   let isMerging = false;
 
   async function loadPeople() {
-    if (!browser) return;
+    if (!browser || !$authStore.isAuthenticated) return;
     isLoading = true;
     try {
-      const isPrivate = $filterStore.is_private;
       const [pRes, nRes] = await Promise.all([
-        fetch(`/api/smart-albums/people?is_private=${isPrivate}`),
+        fetch('/api/smart-albums/people'),
         fetch('/api/persons/names')
       ]);
+
+      if (pRes.status === 401 || nRes.status === 401) {
+        authStore.checkStatus();
+        return;
+      }
+
       if (pRes.ok) people = await pRes.json();
       if (nRes.ok) nameDirectory = await nRes.json();
     } catch (e) {
@@ -45,7 +51,7 @@
     }
   }
 
-  $: if (browser && $filterStore.is_private !== undefined) {
+  $: if (browser && $authStore.isAuthenticated) {
     loadPeople();
   }
 
@@ -54,13 +60,12 @@
     editingId = null;
     if (!clean || clean === person.name) return;
 
-    // Check if the typed name already matches an existing person in the directory
+    // Check if the typed name matches an existing person in the user's directory
     const matched = nameDirectory.find(
       (n) => n.name?.toLowerCase() === clean.toLowerCase() && n.id !== person.id
     );
 
     if (matched) {
-      // Auto-merge: User chose an existing identity
       try {
         const res = await fetch('/api/persons/merge', {
           method: 'POST',
@@ -74,7 +79,6 @@
         console.error('Auto-merge failed:', err);
       }
     } else {
-      // Fresh new name for this cluster
       const res = await fetch(`/api/persons/${person.id}/name`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -118,7 +122,11 @@
     node.focus();
   }
 
-  onMount(loadPeople);
+  onMount(() => {
+    if ($authStore.isAuthenticated) {
+      loadPeople();
+    }
+  });
 </script>
 
 <!-- Datalist Autocomplete Source for Inline Renaming -->
@@ -130,18 +138,11 @@
   {/each}
 </datalist>
 
-<div class="p-6 max-w-7xl mx-auto">
+<div class="p-6 max-w-7xl mx-auto select-none">
   <div class="flex items-center justify-between pb-4 mb-6 border-b border-neutral-900">
     <div>
-      <div class="flex items-center gap-2">
-        <h1 class="text-xl font-bold text-white">People</h1>
-        {#if $filterStore.is_private}
-          <span class="text-[10px] bg-purple-950/80 text-purple-300 border border-purple-800/60 px-1.5 py-0.2 rounded font-mono font-medium">
-            PRIVATE VAULT
-          </span>
-        {/if}
-      </div>
-      <p class="text-xs text-neutral-400">Click to filter timeline. Drag onto another person to merge.</p>
+      <h1 class="text-xl font-bold text-white">People</h1>
+      <p class="text-xs text-neutral-400">Click to filter timeline. Drag onto another person to merge identities.</p>
     </div>
     <span class="text-xs text-neutral-500">{people.length} identities</span>
   </div>
@@ -150,11 +151,11 @@
     <div class="text-xs text-neutral-500 text-center py-12">Loading people...</div>
   {:else if people.length === 0}
     <div class="text-xs text-neutral-500 text-center py-12">
-      {$filterStore.is_private ? 'No private faces found.' : 'No public faces found.'}
+      No faces identified in your library yet.
     </div>
   {:else}
     <div class="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-6 gap-3">
-      {#each people as p}
+      {#each people as p (p.id)}
         <div
           role="button"
           tabindex="0"
@@ -164,11 +165,15 @@
           on:drop={() => { if (source && source.id !== p.id) target = p; }}
           on:click={() => selectPerson(p)}
           on:keydown={(e) => e.key === 'Enter' && selectPerson(p)}
-          class="bg-neutral-900/70 hover:bg-neutral-900 border {$filterStore.person_ids.has(p.id) ? 'border-purple-500' : 'border-neutral-800 hover:border-neutral-700'} rounded-xl p-3 flex flex-col items-center text-center cursor-pointer transition-all select-none"
+          class="bg-neutral-900/70 hover:bg-neutral-900 border {$filterStore.person_ids.has(p.id) ? 'border-purple-500' : 'border-neutral-800 hover:border-neutral-700'} rounded-xl p-3 flex flex-col items-center text-center cursor-pointer transition-all"
         >
           <div class="w-20 h-20 rounded-full overflow-hidden bg-neutral-800 border border-neutral-700 mb-2">
             {#if p.avatar_thumb}
-              <img src="/{p.avatar_thumb}" alt={p.name ?? ''} class="w-full h-full object-cover" />
+              <img 
+                src={p.avatar_thumb.startsWith('/') ? p.avatar_thumb : `/${p.avatar_thumb}`} 
+                alt={p.name ?? 'Person'} 
+                class="w-full h-full object-cover" 
+              />
             {:else}
               <div class="w-full h-full flex items-center justify-center text-xl text-neutral-500">👤</div>
             {/if}
@@ -201,7 +206,7 @@
               </button>
             </div>
           {/if}
-          <span class="text-[10px] text-neutral-500 mt-0.5">{p.face_count} photos</span>
+          <span class="text-[10px] text-neutral-500 mt-0.5">{p.face_count} {p.face_count === 1 ? 'photo' : 'photos'}</span>
         </div>
       {/each}
     </div>

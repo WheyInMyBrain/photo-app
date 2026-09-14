@@ -118,9 +118,10 @@ impl ImageProcessor {
             .and_then(|s| s.to_str())
             .unwrap_or("00");
 
+        // Returns shard-relative path, e.g. "89/89c18dd9_thumb.webp"
         Ok((
-            format!("thumbs/{}/{}", shard, thumb_name),
-            format!("thumbs/{}/{}", shard, preview_name),
+            format!("{}/{}", shard, thumb_name),
+            format!("{}/{}", shard, preview_name),
         ))
     }
 }

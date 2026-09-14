@@ -12,11 +12,13 @@ use crate::domain::media::{
     MediaPageResponse, MediaQuery, SimilarMediaItem, SoftDeleteResponse,
 };
 use crate::error::AppError;
+use crate::middleware::auth::AuthUser;
 use crate::AppState;
 
 /// GET /api/media
 pub async fn list_media(
     State(state): State<AppState>,
+    auth_user: AuthUser,
     Query(mut params): Query<MediaQuery>,
 ) -> Result<Json<MediaPageResponse>, AppError> {
     if params.cursor_captured_at.is_some() ^ params.cursor_id.is_some() {
@@ -25,10 +27,10 @@ pub async fn list_media(
         ));
     }
 
-    // Resolve Hybrid Search (extract person names + on-demand CLIP text encoding)
-    resolve_hybrid_query(&state, &mut params).await;
+    // Resolve Hybrid Search (person names + CLIP text search scoped to user)
+    resolve_hybrid_query(&state, &auth_user.id, &mut params).await;
 
-    let page = AssetRepo::query_media(&state.db, &params)
+    let page = AssetRepo::query_media(&state.db, &auth_user.id, &params)
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?;
 
@@ -38,9 +40,10 @@ pub async fn list_media(
 /// POST /api/assets/:id/favorite
 pub async fn toggle_favorite(
     State(state): State<AppState>,
+    auth_user: AuthUser,
     AxumPath(asset_id): AxumPath<String>,
 ) -> Result<Json<FavoriteToggleResponse>, AppError> {
-    let is_favorite = AssetRepo::toggle_favorite(&state.db, &asset_id)
+    let is_favorite = AssetRepo::toggle_favorite(&state.db, &auth_user.id, &asset_id)
         .await
         .map_err(|e| match e {
             sqlx::Error::RowNotFound => AppError::NotFound(format!("Asset {} not found", asset_id)),
@@ -56,24 +59,42 @@ pub async fn toggle_favorite(
 /// GET /api/assets/:id/stream
 pub async fn stream_asset(
     State(state): State<AppState>,
+    auth_user: AuthUser,
     AxumPath(asset_id): AxumPath<String>,
     req: Request,
 ) -> Result<Response, AppError> {
-    let info = AssetRepo::get_storage_info(&state.db, &asset_id)
+    // Only fetch storage info if owned by this user
+    let info = AssetRepo::get_storage_info(&state.db, &auth_user.id, &asset_id)
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?
         .ok_or_else(|| AppError::NotFound(format!("Asset {} not found", asset_id)))?;
 
     let file_to_serve = if info.is_video {
-        let subfolder = if info.is_private { "originals/private" } else { "originals/public" };
-        state.config.storage_root.join(subfolder).join(info.rel_path)
+        state
+            .config
+            .storage_root
+            .join("users")
+            .join(&auth_user.id)
+            .join("originals")
+            .join(&info.rel_path)
     } else {
-        let preview = state.config.storage_root.join(&info.preview_path);
+        // preview_path is: "<user_id>/thumbs/<shard>/<id>_preview.webp"
+        let preview = state
+            .config
+            .storage_root
+            .join("users")
+            .join(&info.preview_path);
+
         if preview.exists() {
             preview
         } else {
-            let subfolder = if info.is_private { "originals/private" } else { "originals/public" };
-            state.config.storage_root.join(subfolder).join(info.rel_path)
+            state
+                .config
+                .storage_root
+                .join("users")
+                .join(&auth_user.id)
+                .join("originals")
+                .join(&info.rel_path)
         }
     };
 
@@ -89,7 +110,7 @@ pub async fn stream_asset(
 
     response.headers_mut().insert(
         header::CACHE_CONTROL,
-        HeaderValue::from_static("public, max-age=2592000, immutable"),
+        HeaderValue::from_static("private, max-age=2592000, immutable"),
     );
 
     response.headers_mut().insert(
@@ -103,11 +124,12 @@ pub async fn stream_asset(
 /// GET /api/media/filters
 pub async fn get_available_filters(
     State(state): State<AppState>,
+    auth_user: AuthUser,
     Query(mut params): Query<MediaQuery>,
 ) -> Result<Json<DynamicFiltersResponse>, AppError> {
-    resolve_hybrid_query(&state, &mut params).await;
+    resolve_hybrid_query(&state, &auth_user.id, &mut params).await;
 
-    let filters = AssetRepo::get_dynamic_filters(&state.db, &params)
+    let filters = AssetRepo::get_dynamic_filters(&state.db, &auth_user.id, &params)
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?;
 
@@ -117,9 +139,10 @@ pub async fn get_available_filters(
 /// POST /api/assets/:id/delete
 pub async fn toggle_soft_delete(
     State(state): State<AppState>,
+    auth_user: AuthUser,
     AxumPath(id): AxumPath<String>,
 ) -> Result<Json<SoftDeleteResponse>, AppError> {
-    let deleted_at = AssetRepo::toggle_soft_delete(&state.db, &id)
+    let deleted_at = AssetRepo::toggle_soft_delete(&state.db, &auth_user.id, &id)
         .await
         .map_err(|e| match e {
             sqlx::Error::RowNotFound => AppError::NotFound(format!("Asset {} not found", id)),
@@ -136,9 +159,10 @@ pub async fn toggle_soft_delete(
 /// POST /api/assets/:id/purge
 pub async fn hard_delete_asset(
     State(state): State<AppState>,
+    auth_user: AuthUser,
     AxumPath(id): AxumPath<String>,
 ) -> Result<StatusCode, AppError> {
-    let found = AssetRepo::purge_asset(&state.db, &id, &state.config.storage_root)
+    let found = AssetRepo::purge_asset(&state.db, &auth_user.id, &id, &state.config.storage_root)
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?;
 
@@ -152,13 +176,14 @@ pub async fn hard_delete_asset(
 /// POST /api/assets/batch/delete
 pub async fn batch_toggle_soft_delete(
     State(state): State<AppState>,
+    auth_user: AuthUser,
     Json(payload): Json<BatchActionRequest>,
 ) -> Result<Json<BatchActionResponse>, AppError> {
     if payload.ids.is_empty() {
         return Ok(Json(BatchActionResponse { affected_count: 0 }));
     }
 
-    let affected_count = AssetRepo::batch_toggle_soft_delete(&state.db, &payload.ids)
+    let affected_count = AssetRepo::batch_toggle_soft_delete(&state.db, &auth_user.id, &payload.ids)
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?;
 
@@ -168,13 +193,14 @@ pub async fn batch_toggle_soft_delete(
 /// POST /api/assets/batch/purge
 pub async fn batch_purge_assets(
     State(state): State<AppState>,
+    auth_user: AuthUser,
     Json(payload): Json<BatchActionRequest>,
 ) -> Result<Json<BatchActionResponse>, AppError> {
     if payload.ids.is_empty() {
         return Ok(Json(BatchActionResponse { affected_count: 0 }));
     }
 
-    let affected_count = AssetRepo::batch_purge(&state.db, &payload.ids, &state.config.storage_root)
+    let affected_count = AssetRepo::batch_purge(&state.db, &auth_user.id, &payload.ids, &state.config.storage_root)
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?;
 
@@ -184,32 +210,33 @@ pub async fn batch_purge_assets(
 /// GET /api/assets/:id/similar
 pub async fn get_similar_assets(
     State(state): State<AppState>,
+    auth_user: AuthUser,
     AxumPath(id): AxumPath<String>,
 ) -> Result<Json<Vec<SimilarMediaItem>>, AppError> {
-    // Lazily loads only the ~20 MB in-memory vector cache; does not load ONNX models
     let clip_cache = state
         .coordinator
         .ensure_clip_cache()
         .await
         .map_err(AppError::Internal)?;
 
-    let similar = clip_cache.find_similar(&id, 0.55, 12).await;
+    // find_similar filtered by user_id
+    let similar = clip_cache.find_similar_for_user(&auth_user.id, &id, 0.55, 12).await;
     Ok(Json(similar))
 }
 
-async fn resolve_hybrid_query(state: &AppState, q: &mut MediaQuery) {
+async fn resolve_hybrid_query(state: &AppState, user_id: &str, q: &mut MediaQuery) {
     let raw_q = match q.q.as_deref().map(str::trim) {
         Some(s) if !s.is_empty() => s,
         _ => return,
     };
 
-    let is_private = q.is_private.unwrap_or(false);
     let mut words: Vec<String> = raw_q.split_whitespace().map(String::from).collect();
 
-    // 1. Check if any query word matches a known person's name in SQLite
+    // 1. Check named persons belonging exclusively to this user
     let named_persons: Vec<(String, String)> = sqlx::query_as(
-        "SELECT id, name FROM persons WHERE name IS NOT NULL"
+        "SELECT id, name FROM persons WHERE user_id = ? AND name IS NOT NULL"
     )
+    .bind(user_id)
     .fetch_all(&state.db)
     .await
     .unwrap_or_default();
@@ -228,7 +255,7 @@ async fn resolve_hybrid_query(state: &AppState, q: &mut MediaQuery) {
 
     let visual_prompt = words.join(" ");
 
-    // 2. If visual keywords remain, lazily acquire CLIP Text Engine (~150MB) and CLIP Vector Cache (~20MB)
+    // 2. If visual search tokens remain, extract text embedding and search the user's vectors
     if !visual_prompt.is_empty() {
         let clip_engine = match state.coordinator.ensure_search_engine().await {
             Ok(engine) => engine,
@@ -247,7 +274,7 @@ async fn resolve_hybrid_query(state: &AppState, q: &mut MediaQuery) {
         };
 
         if let Ok(text_vector) = clip_engine.extract_text_embedding(&visual_prompt) {
-            let matches = clip_cache.search_by_vector(&text_vector, is_private, 0.24, 200).await;
+            let matches = clip_cache.search_by_vector(user_id, &text_vector, 0.24, 200).await;
             let matched_ids: Vec<String> = matches.into_iter().map(|(id, _)| id).collect();
 
             q.candidate_ids = Some(matched_ids);

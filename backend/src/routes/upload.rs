@@ -1,7 +1,6 @@
 use axum::{
     body::Bytes,
     extract::{Multipart, Query, State},
-    http::HeaderMap,
     response::Json,
 };
 use sha2::{Digest, Sha256};
@@ -15,108 +14,80 @@ use crate::db::AssetRepo;
 use crate::domain::upload::{StagedFile, BatchUploadReceipt, UploadItemResult, InspectLinkRequest, InspectResult, InspectLinkResponse, CandidateItem, CommitLinkRequest, RawUploadQuery, ChunkUploadQuery, ChunkUploadResponse, FinalizeChunkQuery}; 
 use crate::error::AppError;
 use crate::services::queue::{ProcessJob, QueueService};
+use crate::middleware::auth::AuthUser;
 use crate::AppState;
 
 use media_processing::StorageService;
+use crate::domain::job_repo::DbJob;
 
 async fn persist_and_enqueue_bytes(
     state: &AppState,
+    user_id: &str,
     file_name: &str,
     bytes: &[u8],
     folder: &str,
-    is_private: bool,
 ) -> UploadItemResult {
-    let bytes_len = bytes.len() as i64;
-
-    // 1. Checksum & Deduplication
-    let mut hasher = Sha256::new();
-    hasher.update(bytes);
-    let sha256_hash = hex::encode(hasher.finalize());
-
-    match AssetRepo::find_id_by_sha256(&state.db, &sha256_hash).await {
-        Ok(Some(existing_id)) => {
-            return UploadItemResult {
-                file_name: file_name.to_string(),
-                status: "duplicate".to_string(),
-                id: Some(existing_id),
-                relative_path: None,
-                message: Some("File with identical checksum already exists".to_string()),
-            };
-        }
-        Err(e) => {
-            return UploadItemResult {
-                file_name: file_name.to_string(),
-                status: "error".to_string(),
-                id: None,
-                relative_path: None,
-                message: Some(format!("Duplicate check failure: {e}")),
-            };
-        }
-        Ok(None) => {}
-    }
-
-    // 2. Directory & Path Resolution
     let sanitized_folder = StorageService::sanitize_folder_path(folder);
-    let target_dir = StorageService::resolve_upload_dir(
-        &state.config.storage_root,
-        is_private,
-        &sanitized_folder,
-    );
+    let sha256 = hex::encode(Sha256::digest(bytes));
 
-    if let Err(e) = fs::create_dir_all(&target_dir).await {
+    // Deduplication check scoped to this user
+    if let Ok(Some(existing_id)) = AssetRepo::find_user_asset_by_sha256(&state.db, user_id, &sha256).await {
         return UploadItemResult {
             file_name: file_name.to_string(),
-            status: "error".to_string(),
-            id: None,
+            status: "duplicate".to_string(),
+            id: Some(existing_id),
             relative_path: None,
-            message: Some(format!("Failed to create directory: {e}")),
+            message: Some("File already exists in library".into()),
         };
     }
 
     let asset_id = Uuid::new_v4().to_string();
-    let disk_file_name = StorageService::generate_disk_filename(&asset_id, file_name);
-    let destination_path = target_dir.join(&disk_file_name);
+    let target_dir = StorageService::resolve_upload_dir(
+        &state.config.storage_root,
+        user_id,
+        &sanitized_folder,
+    );
 
-    // 3. Write & Sync to SSD
-    let mut file = match File::create(&destination_path).await {
-        Ok(f) => f,
-        Err(e) => {
-            return UploadItemResult {
-                file_name: file_name.to_string(),
-                status: "error".to_string(),
-                id: None,
-                relative_path: None,
-                message: Some(format!("Disk write failure: {e}")),
-            };
-        }
-    };
-
-    if let Err(e) = file.write_all(bytes).await {
+    if let Err(e) = tokio::fs::create_dir_all(&target_dir).await {
         return UploadItemResult {
             file_name: file_name.to_string(),
             status: "error".to_string(),
             id: None,
             relative_path: None,
-            message: Some(format!("Failed writing buffer: {e}")),
+            message: Some(format!("Failed creating directory: {e}")),
         };
     }
 
-    file.sync_all().await.ok();
-    drop(file);
+    let disk_filename = StorageService::generate_disk_filename(&asset_id, file_name);
+    let disk_path = target_dir.join(&disk_filename);
 
-    let relative_path = format!("{}/{}", sanitized_folder, disk_file_name);
+    // rel_path must include the folder if not "root"
+    let rel_path = if sanitized_folder == "root" {
+        disk_filename.clone()
+    } else {
+        format!("{}/{}", sanitized_folder, disk_filename)
+    };
 
-    // 4. Enqueue into DB
-    let job = ProcessJob {
+    if let Err(e) = tokio::fs::write(&disk_path, bytes).await {
+        return UploadItemResult {
+            file_name: file_name.to_string(),
+            status: "error".to_string(),
+            id: None,
+            relative_path: None,
+            message: Some(format!("Failed writing file to disk: {e}")),
+        };
+    }
+
+    let job = DbJob {
         id: Uuid::new_v4().to_string(),
+        user_id: user_id.to_string(),
         asset_id: asset_id.clone(),
         file_name: file_name.to_string(),
-        rel_path: relative_path.clone(),
+        rel_path: rel_path.clone(),
         folder_path: sanitized_folder,
-        disk_path: destination_path,
-        sha256: sha256_hash,
-        file_size_bytes: bytes_len,
-        is_private,
+        disk_path,
+        sha256,
+        file_size_bytes: bytes.len() as i64,
     };
 
     if let Err(e) = QueueService::enqueue(&state.db, &state.queue_notify, job).await {
@@ -125,7 +96,7 @@ async fn persist_and_enqueue_bytes(
             status: "error".to_string(),
             id: None,
             relative_path: None,
-            message: Some(format!("Database queue rejected job: {e}")),
+            message: Some(format!("Failed enqueuing job: {e}")),
         };
     }
 
@@ -133,7 +104,7 @@ async fn persist_and_enqueue_bytes(
         file_name: file_name.to_string(),
         status: "queued".to_string(),
         id: Some(asset_id),
-        relative_path: Some(relative_path),
+        relative_path: Some(rel_path),
         message: None,
     }
 }
@@ -141,10 +112,10 @@ async fn persist_and_enqueue_bytes(
 /// Core pipeline for stitched chunk files already present on disk
 async fn persist_and_enqueue_staged_file(
     state: &AppState,
+    user_id: &str,
     part_path: &Path,
     file_name: &str,
     folder: &str,
-    is_private: bool,
 ) -> Result<UploadItemResult, AppError> {
     if !part_path.exists() {
         return Err(AppError::NotFound("Temporary chunk file not found".into()));
@@ -180,23 +151,23 @@ async fn persist_and_enqueue_staged_file(
 
     let sha256_hash = hex::encode(hasher.finalize());
 
-    // 2. Duplicate Check
-    if let Ok(Some(existing_id)) = AssetRepo::find_id_by_sha256(&state.db, &sha256_hash).await {
+    // 2. Duplicate Check (Scoped to the authenticated user)
+    if let Ok(Some(existing_id)) = AssetRepo::find_user_asset_by_sha256(&state.db, user_id, &sha256_hash).await {
         let _ = fs::remove_file(part_path).await;
         return Ok(UploadItemResult {
             file_name: file_name.to_string(),
             status: "duplicate".to_string(),
             id: Some(existing_id),
             relative_path: None,
-            message: Some("Duplicate file exists".to_string()),
+            message: Some("Duplicate file exists in your library".to_string()),
         });
     }
 
-    // 3. Resolve destination & move
+    // 3. Resolve destination & move -> storage_root/originals/<user_id>/<folder>
     let sanitized_folder = StorageService::sanitize_folder_path(folder);
     let target_dir = StorageService::resolve_upload_dir(
         &state.config.storage_root,
-        is_private,
+        user_id,
         &sanitized_folder,
     );
 
@@ -212,11 +183,16 @@ async fn persist_and_enqueue_staged_file(
         .await
         .map_err(|e| AppError::Internal(format!("Failed to move asset to storage: {e}")))?;
 
-    let relative_path = format!("{}/{}", sanitized_folder, disk_file_name);
+    let relative_path = if sanitized_folder.is_empty() || sanitized_folder == "root" {
+        disk_file_name
+    } else {
+        format!("{}/{}", sanitized_folder, disk_file_name)
+    };
 
-    // 4. Enqueue into DB
+    // 4. Enqueue into DB with user_id
     let job = ProcessJob {
         id: Uuid::new_v4().to_string(),
+        user_id: user_id.to_string(),
         asset_id: asset_id.clone(),
         file_name: file_name.to_string(),
         rel_path: relative_path.clone(),
@@ -224,7 +200,6 @@ async fn persist_and_enqueue_staged_file(
         disk_path: destination_path,
         sha256: sha256_hash,
         file_size_bytes: bytes_len,
-        is_private,
     };
 
     QueueService::enqueue(&state.db, &state.queue_notify, job)
@@ -240,40 +215,22 @@ async fn persist_and_enqueue_staged_file(
     })
 }
 
-pub fn verify_vault_api_key(headers: &HeaderMap, expected_key: &str) -> Result<(), AppError> {
-    // If no key is set in config, allow all requests (or enforce strict non-empty check)
-    if expected_key.is_empty() {
-        return Ok(());
-    }
-
-    let provided_key = headers
-        .get("X-Vault-API-Key")
-        .or_else(|| headers.get("X-Vault_API-Key")) // Tolerates underscore variation
-        .or_else(|| headers.get("X-API-Key"))
-        .and_then(|h| h.to_str().ok())
-        .or_else(|| {
-            headers
-                .get("Authorization")
-                .and_then(|h| h.to_str().ok())
-                .and_then(|val| val.strip_prefix("Bearer "))
-        });
-
-    match provided_key {
-        Some(key) if key == expected_key => Ok(()),
-        _ => Err(AppError::Unauthorized("Invalid or missing API key".into())),
-    }
-}
-
 // ==========================================
 // 1. FRONTEND HANDLER (Multipart Form-Data)
 // ==========================================
 
 pub async fn upload_photo(
     State(state): State<AppState>,
+    auth_user: AuthUser,
+    Query(query): Query<RawUploadQuery>,
     mut multipart: Multipart,
 ) -> Result<Json<BatchUploadReceipt>, AppError> {
-    let mut raw_folder = String::from("root");
-    let mut is_private = false;
+    // 1. Initialize from URL query parameter (?folder=weapons), fallback to "root"
+    let mut raw_folder = query
+        .folder
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "root".to_string());
+
     let mut staged_files: Vec<StagedFile> = Vec::new();
     let mut results = Vec::new();
 
@@ -281,15 +238,12 @@ pub async fn upload_photo(
         let field_name = field.name().unwrap_or("").to_string();
 
         match field_name.as_str() {
+            // Form body field can also set/override the folder
             "folder" => {
                 let txt = field.text().await.unwrap_or_default();
                 if !txt.trim().is_empty() {
                     raw_folder = txt;
                 }
-            }
-            "is_private" => {
-                let val = field.text().await.unwrap_or_default();
-                is_private = val.eq_ignore_ascii_case("true") || val == "1";
             }
             "file" | "files" => {
                 let file_name = field.file_name().unwrap_or("media.raw").to_string();
@@ -311,13 +265,15 @@ pub async fn upload_photo(
         }
     }
 
+    let sanitized_folder = StorageService::sanitize_folder_path(&raw_folder);
+
     for staged in staged_files {
         let res = persist_and_enqueue_bytes(
             &state,
+            &auth_user.id,
             &staged.file_name,
             &staged.bytes,
-            &raw_folder,
-            is_private,
+            &sanitized_folder,
         )
         .await;
         results.push(res);
@@ -327,8 +283,7 @@ pub async fn upload_photo(
 
     Ok(Json(BatchUploadReceipt {
         total_uploaded: success_count,
-        folder: StorageService::sanitize_folder_path(&raw_folder),
-        is_private,
+        folder: sanitized_folder,
         items: results,
     }))
 }
@@ -378,12 +333,11 @@ fn detect_extension_from_magic_bytes(bytes: &[u8]) -> Option<&'static str> {
 
 pub async fn upload_raw_binary(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    auth_user: AuthUser,
+    headers: axum::http::HeaderMap,
     Query(query): Query<RawUploadQuery>,
     body: Bytes,
 ) -> Result<Json<UploadItemResult>, AppError> {
-    verify_vault_api_key(&headers, &state.config.vault_api_key)?;
-
     if body.is_empty() {
         return Err(AppError::BadRequest("Upload body cannot be empty".into()));
     }
@@ -420,21 +374,24 @@ pub async fn upload_raw_binary(
     }
 
     let raw_folder = query.folder.unwrap_or_else(|| "root".to_string());
-    let is_private = query.is_private.unwrap_or(false);
 
-    let result = persist_and_enqueue_bytes(&state, &file_name, &body, &raw_folder, is_private).await;
+    let result = persist_and_enqueue_bytes(
+        &state,
+        &auth_user.id,
+        &file_name,
+        &body,
+        &raw_folder,
+    )
+    .await;
 
     Ok(Json(result))
 }
 
 pub async fn inspect_link(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    auth_user: AuthUser,
     Json(payload): Json<InspectLinkRequest>,
 ) -> Result<Json<InspectResult>, AppError> {
-    // Enforce API Key
-    verify_vault_api_key(&headers, &state.config.vault_api_key)?;
-
     let meta = media_downloader::extract_links(&payload.url)
         .await
         .map_err(|e| AppError::BadRequest(format!("Link inspection failed: {e}")))?;
@@ -480,21 +437,18 @@ pub async fn inspect_link(
         })
         .collect();
 
-    // Fast-path: single item skips frontend selection entirely
+    // Single item downloads and enqueues immediately
     if total == 1 {
         let commit_req = CommitLinkRequest {
             platform: meta.platform.clone(),
             folder: Some(format!("{}/{}", meta.platform, meta.author)),
-            is_private: true,
             selected_items: candidate_items,
         };
 
-        // Notice we forward `headers` directly into commit_link_download
-        let Json(receipt) = commit_link_download(State(state), headers, Json(commit_req)).await?;
+        let Json(receipt) = commit_link_download(State(state), auth_user, Json(commit_req)).await?;
         return Ok(Json(InspectResult::Committed(receipt)));
     }
 
-    // Multi-item path: return candidate thumbnails to the frontend
     Ok(Json(InspectResult::Preview(InspectLinkResponse {
         suggested_folder: format!("{}/{}", meta.platform, meta.author),
         platform: meta.platform,
@@ -505,15 +459,13 @@ pub async fn inspect_link(
     })))
 }
 
-/// Step 2: Directly fetches only the user-selected URLs from CDNs and runs the ingestion pipeline
+/// POST /api/media/commit-link
+/// Fetches user-selected items from CDN and enqueues them for processing
 pub async fn commit_link_download(
     State(state): State<AppState>,
-    headers: HeaderMap,
+    auth_user: AuthUser,
     Json(payload): Json<CommitLinkRequest>,
 ) -> Result<Json<BatchUploadReceipt>, AppError> {
-    // Enforce API Key
-    verify_vault_api_key(&headers, &state.config.vault_api_key)?;
-
     if payload.selected_items.is_empty() {
         return Err(AppError::BadRequest("No items selected for download".to_string()));
     }
@@ -544,10 +496,10 @@ pub async fn commit_link_download(
 
         let res = persist_and_enqueue_bytes(
             &state,
+            &auth_user.id,
             &item.suggested_filename,
             &bytes,
             &raw_folder,
-            payload.is_private,
         )
         .await;
 
@@ -559,15 +511,15 @@ pub async fn commit_link_download(
     Ok(Json(BatchUploadReceipt {
         total_uploaded: success_count,
         folder: StorageService::sanitize_folder_path(&raw_folder),
-        is_private: payload.is_private,
         items: results,
     }))
 }
 
 /// POST /api/upload/chunk
-/// Writes a byte slice directly to its calculated byte offset in the staging file
+/// Writes a chunk directly to its byte offset in staging
 pub async fn upload_chunk(
     State(state): State<AppState>,
+    _auth_user: AuthUser, // Validates authenticated session or API key
     Query(query): Query<ChunkUploadQuery>,
     body: Bytes,
 ) -> Result<Json<ChunkUploadResponse>, AppError> {
@@ -582,7 +534,6 @@ pub async fn upload_chunk(
 
     let part_path = temp_dir.join(format!("{}.part", query.upload_id));
 
-    // Open with write permissions (NOT append) so we can seek arbitrarily
     let mut file = OpenOptions::new()
         .create(true)
         .write(true)
@@ -590,7 +541,6 @@ pub async fn upload_chunk(
         .await
         .map_err(|e| AppError::Internal(format!("Failed to open chunk file: {}", e)))?;
 
-    // Determine target byte offset: chunk_index * standard_chunk_size
     let offset = (query.chunk_index as u64) * query.chunk_size;
     file.seek(SeekFrom::Start(offset))
         .await
@@ -599,7 +549,7 @@ pub async fn upload_chunk(
     file.write_all(&body)
         .await
         .map_err(|e| AppError::Internal(format!("Failed writing chunk bytes at offset {}: {}", offset, e)))?;
-    
+
     file.sync_all().await?;
 
     tracing::debug!(
@@ -618,22 +568,22 @@ pub async fn upload_chunk(
 }
 
 /// POST /api/upload/chunk/finalize
-/// Streams file from disk in 64KB blocks to hash, checks duplicates, moves to vault, and enqueues worker
+/// Stitches and commits chunked uploads into user storage
 pub async fn finalize_chunk(
     State(state): State<AppState>,
+    auth_user: AuthUser,
     Query(query): Query<FinalizeChunkQuery>,
 ) -> Result<Json<UploadItemResult>, AppError> {
     let temp_dir = state.config.storage_root.join("temp_chunks");
     let part_path = temp_dir.join(format!("{}.part", query.upload_id));
     let raw_folder = query.folder.unwrap_or_else(|| "root".to_string());
-    let is_private = query.is_private.unwrap_or(false);
 
     let result = persist_and_enqueue_staged_file(
         &state,
+        &auth_user.id,
         &part_path,
         &query.file_name,
         &raw_folder,
-        is_private,
     )
     .await?;
 

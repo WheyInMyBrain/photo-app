@@ -21,6 +21,7 @@ impl FaceClusterer {
             _ => return Ok(ClusteredFacesResult::default()),
         };
 
+        // Absolute target: storage_root/users/<user_id>/thumbs/faces/
         let faces_dir = thumbs_root.join("faces");
         std::fs::create_dir_all(&faces_dir)?;
 
@@ -208,14 +209,20 @@ impl FaceClusterer {
         (new_pid, true)
     }
 
-    fn save_face_thumb(chip: &DynamicImage, faces_dir: &Path, face_id: &str) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    fn save_face_thumb(
+        chip: &DynamicImage,
+        faces_dir: &Path,
+        face_id: &str,
+    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
         let avatar = chip.resize_to_fill(128, 128, FilterType::Triangle);
-        let avatar_rel = format!("thumbs/faces/{}.webp", face_id);
-        let avatar_abs = faces_dir.join(format!("{}.webp", face_id));
+        let avatar_filename = format!("{}.webp", face_id);
+        let avatar_abs = faces_dir.join(&avatar_filename);
 
         if let Ok(mut out) = std::fs::File::create(&avatar_abs) {
             let _ = avatar.write_to(&mut out, ImageFormat::WebP);
         }
-        Ok(avatar_rel)
+
+        // Returns "faces/<face_id>.webp" (QueueService prefixes users/<user_id>/thumbs/)
+        Ok(format!("faces/{}", avatar_filename))
     }
 }

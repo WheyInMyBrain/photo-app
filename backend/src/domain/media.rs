@@ -4,7 +4,6 @@ use serde::{Deserialize, Serialize};
 pub struct AssetStorageInfo {
     pub rel_path: String,
     pub preview_path: String,
-    pub is_private: bool,
     pub is_video: bool,
 }
 
@@ -25,6 +24,7 @@ pub struct MediaSummary {
 #[derive(Debug, Clone)]
 pub struct NewAssetRecord {
     pub id: String,
+    pub user_id: String,
     pub sha256: String,
     pub file_name: String,
     pub rel_path: String,
@@ -37,7 +37,6 @@ pub struct NewAssetRecord {
     pub height: i64,
     pub aspect_ratio: f64,
     pub duration_seconds: Option<f64>,
-    pub is_private: bool,
     pub captured_at: Option<String>,
     pub year: Option<i32>,
     pub month: Option<i32>,
@@ -88,7 +87,6 @@ pub struct MediaQuery {
     pub cursor_captured_at: Option<String>,
     pub cursor_id: Option<String>,
     pub limit: Option<i64>,
-    pub is_private: Option<bool>,
     pub show_trash: Option<bool>,
 
     // Internal vector search candidate IDs (not sent by frontend, populated by backend)

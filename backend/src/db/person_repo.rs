@@ -4,8 +4,8 @@ use crate::domain::person::{AssetFaceDetail, PersonCard};
 pub struct PersonRepo;
 
 impl PersonRepo {
-    /// Returns clustered identities visible strictly within the specified privacy realm (0 = public, 1 = private)
-    pub async fn get_overview(pool: &SqlitePool, privacy_level: i64) -> Result<Vec<PersonCard>, sqlx::Error> {
+    /// Returns clustered identities visible strictly for the given user
+    pub async fn get_overview(pool: &SqlitePool, user_id: &str) -> Result<Vec<PersonCard>, sqlx::Error> {
         let rows = sqlx::query(
             r#"
             SELECT 
@@ -17,21 +17,24 @@ impl PersonRepo {
                     FROM asset_faces af2
                     JOIN assets a2 ON af2.asset_id = a2.id
                     WHERE af2.person_id = p.id 
-                      AND a2.is_private = ?1
+                      AND a2.user_id = ?1
+                      AND a2.deleted_at IS NULL
                     ORDER BY af2.detection_score DESC 
                     LIMIT 1
                 ) AS avatar_thumb
             FROM persons p
             JOIN asset_faces af ON af.person_id = p.id
             JOIN assets a ON af.asset_id = a.id
-            WHERE a.is_private = ?1 
+            WHERE p.user_id = ?1
+              AND a.user_id = ?1
+              AND a.deleted_at IS NULL 
               AND p.is_hidden = 0
             GROUP BY p.id
             HAVING face_count >= 1
             ORDER BY face_count DESC
             "#,
         )
-        .bind(privacy_level)
+        .bind(user_id)
         .fetch_all(pool)
         .await?;
 
@@ -50,7 +53,11 @@ impl PersonRepo {
         Ok(people)
     }
 
-    pub async fn get_faces_by_asset(pool: &SqlitePool, asset_id: &str) -> Result<Vec<AssetFaceDetail>, sqlx::Error> {
+    pub async fn get_faces_by_asset(
+        pool: &SqlitePool,
+        user_id: &str,
+        asset_id: &str,
+    ) -> Result<Vec<AssetFaceDetail>, sqlx::Error> {
         let rows = sqlx::query(
             r#"
             SELECT 
@@ -65,12 +72,16 @@ impl PersonRepo {
                 af.detection_score,
                 af.is_verified
             FROM asset_faces af
+            JOIN assets a ON af.asset_id = a.id
             LEFT JOIN persons p ON af.person_id = p.id
             WHERE af.asset_id = ?1
+              AND a.user_id = ?2
+              AND a.deleted_at IS NULL
             ORDER BY af.bbox_x ASC
             "#,
         )
         .bind(asset_id)
+        .bind(user_id)
         .fetch_all(pool)
         .await?;
 
@@ -95,46 +106,100 @@ impl PersonRepo {
         Ok(faces)
     }
 
-    pub async fn rename_person(pool: &SqlitePool, person_id: &str, name: &str) -> Result<Vec<String>, sqlx::Error> {
-        sqlx::query("UPDATE persons SET name = ?1, updated_at = CURRENT_TIMESTAMP WHERE id = ?2")
-            .bind(name)
-            .bind(person_id)
-            .execute(pool)
-            .await?;
+    pub async fn rename_person(
+        pool: &SqlitePool,
+        user_id: &str,
+        person_id: &str,
+        name: &str,
+    ) -> Result<Vec<String>, sqlx::Error> {
+        let res = sqlx::query(
+            "UPDATE persons SET name = ?1, updated_at = CURRENT_TIMESTAMP WHERE id = ?2 AND user_id = ?3",
+        )
+        .bind(name)
+        .bind(person_id)
+        .bind(user_id)
+        .execute(pool)
+        .await?;
+
+        if res.rows_affected() == 0 {
+            return Err(sqlx::Error::RowNotFound);
+        }
 
         let affected_ids: Vec<String> = sqlx::query_scalar(
-            "SELECT DISTINCT asset_id FROM asset_faces WHERE person_id = ?1",
+            r#"
+            SELECT DISTINCT af.asset_id 
+            FROM asset_faces af
+            JOIN assets a ON af.asset_id = a.id
+            WHERE af.person_id = ?1 AND a.user_id = ?2
+            "#,
         )
         .bind(person_id)
+        .bind(user_id)
         .fetch_all(pool)
         .await?;
 
         Ok(affected_ids)
     }
 
-    pub async fn verify_face(pool: &SqlitePool, face_id: &str) -> Result<(), sqlx::Error> {
-        sqlx::query("UPDATE asset_faces SET is_verified = 1 WHERE id = ?1")
-            .bind(face_id)
-            .execute(pool)
-            .await?;
+    pub async fn verify_face(pool: &SqlitePool, user_id: &str, face_id: &str) -> Result<(), sqlx::Error> {
+        let res = sqlx::query(
+            r#"
+            UPDATE asset_faces 
+            SET is_verified = 1 
+            WHERE id = ?1 
+              AND asset_id IN (SELECT id FROM assets WHERE user_id = ?2)
+            "#,
+        )
+        .bind(face_id)
+        .bind(user_id)
+        .execute(pool)
+        .await?;
+
+        if res.rows_affected() == 0 {
+            return Err(sqlx::Error::RowNotFound);
+        }
+
         Ok(())
     }
 
     pub async fn reassign_face(
         pool: &SqlitePool,
+        user_id: &str,
         face_id: &str,
         target_person_id: &str,
     ) -> Result<String, sqlx::Error> {
         let mut tx = pool.begin().await?;
 
-        let row = sqlx::query("SELECT asset_id, person_id FROM asset_faces WHERE id = ?1")
-            .bind(face_id)
-            .fetch_optional(&mut *tx)
-            .await?
-            .ok_or(sqlx::Error::RowNotFound)?;
+        // Ensure both the face and target person belong to the user
+        let row = sqlx::query(
+            r#"
+            SELECT af.asset_id, af.person_id 
+            FROM asset_faces af
+            JOIN assets a ON af.asset_id = a.id
+            WHERE af.id = ?1 AND a.user_id = ?2
+            "#,
+        )
+        .bind(face_id)
+        .bind(user_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or(sqlx::Error::RowNotFound)?;
 
         let asset_id: String = row.get("asset_id");
         let old_person_id: Option<String> = row.get("person_id");
+
+        let target_exists: bool = sqlx::query_scalar::<_, i64>(
+            "SELECT 1 FROM persons WHERE id = ?1 AND user_id = ?2",
+        )
+        .bind(target_person_id)
+        .bind(user_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .is_some();
+
+        if !target_exists {
+            return Err(sqlx::Error::RowNotFound);
+        }
 
         sqlx::query("UPDATE asset_faces SET person_id = ?1, is_verified = 1 WHERE id = ?2")
             .bind(target_person_id)
@@ -142,11 +207,11 @@ impl PersonRepo {
             .execute(&mut *tx)
             .await?;
 
-        Self::recompute_cluster_centroid(&mut tx, target_person_id).await?;
+        Self::recompute_cluster_centroid(&mut tx, user_id, target_person_id).await?;
 
         if let Some(old_pid) = old_person_id {
             if old_pid != target_person_id {
-                Self::recompute_cluster_centroid(&mut tx, &old_pid).await?;
+                Self::recompute_cluster_centroid(&mut tx, user_id, &old_pid).await?;
             }
         }
 
@@ -156,18 +221,39 @@ impl PersonRepo {
 
     pub async fn merge_persons(
         pool: &SqlitePool,
+        user_id: &str,
         source_person_id: &str,
         target_person_id: &str,
     ) -> Result<Vec<String>, sqlx::Error> {
+        let mut tx = pool.begin().await?;
+
+        // Verify both persons belong to this user
+        let valid_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM persons WHERE user_id = ?1 AND id IN (?2, ?3)",
+        )
+        .bind(user_id)
+        .bind(source_person_id)
+        .bind(target_person_id)
+        .fetch_one(&mut *tx)
+        .await?;
+
+        if valid_count < 2 {
+            return Err(sqlx::Error::RowNotFound);
+        }
+
         let affected_asset_ids: Vec<String> = sqlx::query_scalar(
-            "SELECT DISTINCT asset_id FROM asset_faces WHERE person_id IN (?1, ?2)",
+            r#"
+            SELECT DISTINCT af.asset_id 
+            FROM asset_faces af
+            JOIN assets a ON af.asset_id = a.id
+            WHERE af.person_id IN (?1, ?2) AND a.user_id = ?3
+            "#,
         )
         .bind(source_person_id)
         .bind(target_person_id)
-        .fetch_all(pool)
+        .bind(user_id)
+        .fetch_all(&mut *tx)
         .await?;
-
-        let mut tx = pool.begin().await?;
 
         sqlx::query("UPDATE asset_faces SET person_id = ?1 WHERE person_id = ?2")
             .bind(target_person_id)
@@ -175,10 +261,11 @@ impl PersonRepo {
             .execute(&mut *tx)
             .await?;
 
-        Self::recompute_cluster_centroid(&mut tx, target_person_id).await?;
+        Self::recompute_cluster_centroid(&mut tx, user_id, target_person_id).await?;
 
-        sqlx::query("DELETE FROM persons WHERE id = ?1")
+        sqlx::query("DELETE FROM persons WHERE id = ?1 AND user_id = ?2")
             .bind(source_person_id)
+            .bind(user_id)
             .execute(&mut *tx)
             .await?;
 
@@ -188,16 +275,26 @@ impl PersonRepo {
 
     async fn recompute_cluster_centroid(
         tx: &mut Transaction<'_, sqlx::Sqlite>,
+        user_id: &str,
         person_id: &str,
     ) -> Result<(), sqlx::Error> {
-        let rows = sqlx::query("SELECT id, embedding FROM asset_faces WHERE person_id = ?1")
-            .bind(person_id)
-            .fetch_all(&mut **tx)
-            .await?;
+        let rows = sqlx::query(
+            r#"
+            SELECT af.id, af.embedding 
+            FROM asset_faces af
+            JOIN assets a ON af.asset_id = a.id
+            WHERE af.person_id = ?1 AND a.user_id = ?2
+            "#,
+        )
+        .bind(person_id)
+        .bind(user_id)
+        .fetch_all(&mut **tx)
+        .await?;
 
         if rows.is_empty() {
-            sqlx::query("DELETE FROM persons WHERE id = ?1")
+            sqlx::query("DELETE FROM persons WHERE id = ?1 AND user_id = ?2")
                 .bind(person_id)
+                .bind(user_id)
                 .execute(&mut **tx)
                 .await?;
             return Ok(());
@@ -248,29 +345,34 @@ impl PersonRepo {
                 face_count = ?2, 
                 cover_face_id = ?3, 
                 updated_at = CURRENT_TIMESTAMP
-            WHERE id = ?4
+            WHERE id = ?4 AND user_id = ?5
             "#,
         )
         .bind(centroid_bytes)
         .bind(count as i64)
         .bind(best_face_id)
         .bind(person_id)
+        .bind(user_id)
         .execute(&mut **tx)
         .await?;
 
         Ok(())
     }
 
-    /// Returns only names and IDs for datalist autocomplete (no image paths or counts)
-    pub async fn get_name_directory(pool: &SqlitePool) -> Result<Vec<PersonCard>, sqlx::Error> {
+    /// Returns autocomplete name suggestions strictly for the authenticated user
+    pub async fn get_name_directory(pool: &SqlitePool, user_id: &str) -> Result<Vec<PersonCard>, sqlx::Error> {
         let rows = sqlx::query(
             r#"
             SELECT id, name
             FROM persons
-            WHERE name IS NOT NULL AND TRIM(name) != '' AND is_hidden = 0
+            WHERE user_id = ?1 
+              AND name IS NOT NULL 
+              AND TRIM(name) != '' 
+              AND is_hidden = 0
             ORDER BY name ASC
             "#,
         )
+        .bind(user_id)
         .fetch_all(pool)
         .await?;
 

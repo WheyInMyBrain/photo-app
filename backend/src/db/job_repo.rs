@@ -6,17 +6,16 @@ pub struct JobRepo;
 
 impl JobRepo {
     pub async fn enqueue(pool: &SqlitePool, job: &DbJob) -> Result<(), sqlx::Error> {
-        let is_private_int: i64 = if job.is_private { 1 } else { 0 };
-
         sqlx::query(
             r#"
             INSERT INTO processing_jobs (
-                id, asset_id, file_name, rel_path, folder_path,
-                disk_path, sha256, file_size_bytes, is_private, status
+                id, user_id, asset_id, file_name, rel_path, folder_path,
+                disk_path, sha256, file_size_bytes, status
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')
             "#,
         )
         .bind(&job.id)
+        .bind(&job.user_id)
         .bind(&job.asset_id)
         .bind(&job.file_name)
         .bind(&job.rel_path)
@@ -24,7 +23,6 @@ impl JobRepo {
         .bind(job.disk_path.to_string_lossy().to_string())
         .bind(&job.sha256)
         .bind(job.file_size_bytes)
-        .bind(is_private_int)
         .execute(pool)
         .await?;
 
@@ -46,8 +44,8 @@ impl JobRepo {
 
         let row = sqlx::query(
             r#"
-            SELECT id, asset_id, file_name, rel_path, folder_path,
-                   disk_path, sha256, file_size_bytes, is_private
+            SELECT id, user_id, asset_id, file_name, rel_path, folder_path,
+                   disk_path, sha256, file_size_bytes
             FROM processing_jobs
             WHERE status = 'pending' AND attempts < 3
             ORDER BY created_at ASC
@@ -60,6 +58,7 @@ impl JobRepo {
         if let Some(r) = row {
             let job = DbJob {
                 id: r.get("id"),
+                user_id: r.get("user_id"),
                 asset_id: r.get("asset_id"),
                 file_name: r.get("file_name"),
                 rel_path: r.get("rel_path"),
@@ -67,7 +66,6 @@ impl JobRepo {
                 disk_path: PathBuf::from(r.get::<String, _>("disk_path")),
                 sha256: r.get("sha256"),
                 file_size_bytes: r.get("file_size_bytes"),
-                is_private: r.get::<i64, _>("is_private") == 1,
             };
 
             sqlx::query(

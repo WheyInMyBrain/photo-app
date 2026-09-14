@@ -1,5 +1,6 @@
 import { writable, derived, get } from 'svelte/store';
 import type { MediaItem } from '$lib/types/media';
+import { authStore } from '$lib/stores/authStore';
 
 export function createMediaSelection(onChanged: () => void) {
   const selectedMap = writable<Record<string, boolean>>({});
@@ -13,7 +14,12 @@ export function createMediaSelection(onChanged: () => void) {
     lastSelectedId.set(null);
   }
 
-  function toggleSelect(id: string, e: MouseEvent, items: MediaItem[], itemIndexMap: Map<string, number>) {
+  function toggleSelect(
+    id: string,
+    e: MouseEvent,
+    items: MediaItem[],
+    itemIndexMap: Map<string, number>
+  ) {
     e.stopPropagation();
     const currentMap = { ...get(selectedMap) };
     const lastId = get(lastSelectedId);
@@ -56,11 +62,18 @@ export function createMediaSelection(onChanged: () => void) {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ ids })
       });
+
+      if (res.status === 401) {
+        authStore.checkStatus();
+        return;
+      }
+
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
+
       clearSelection();
       onChanged();
     } catch (e) {
-      console.error('Batch delete error', e);
+      console.error('Batch delete error:', e);
     } finally {
       isActionLoading.set(false);
     }
@@ -78,11 +91,18 @@ export function createMediaSelection(onChanged: () => void) {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ ids })
       });
+
+      if (res.status === 401) {
+        authStore.checkStatus();
+        return;
+      }
+
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
+
       clearSelection();
       onChanged();
     } catch (e) {
-      console.error('Batch purge error', e);
+      console.error('Batch purge error:', e);
     } finally {
       isActionLoading.set(false);
     }

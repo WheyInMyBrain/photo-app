@@ -21,8 +21,7 @@ frontend/src/app.d.ts.timestamp-*
 # ==========================================
 # Local storage and user data
 # ==========================================
-storage/originals/*
-storage/thumbs/*
+storage/users/*
 storage/db/**
 storage/db/*.db
 storage/db/*.db-wal

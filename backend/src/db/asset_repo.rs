@@ -1,4 +1,5 @@
 use sqlx::{QueryBuilder, Row, Sqlite, SqlitePool};
+use std::path::Path;
 
 use crate::domain::media::{
     AssetStorageInfo, MediaPageResponse, MediaQuery, MediaSummary, SubAlbum,
@@ -10,11 +11,11 @@ pub struct AssetRepo;
 impl AssetRepo {
     pub async fn query_media(
         pool: &SqlitePool,
+        user_id: &str,
         q: &MediaQuery,
     ) -> Result<MediaPageResponse, sqlx::Error> {
         let limit = q.limit.unwrap_or(50).clamp(1, 200);
         let fetch_limit = limit + 1;
-        let privacy_level = if q.is_private.unwrap_or(false) { 1 } else { 0 };
         let show_trash = q.show_trash.unwrap_or(false);
 
         let mut builder: QueryBuilder<Sqlite> = QueryBuilder::new(
@@ -30,8 +31,9 @@ impl AssetRepo {
             builder.push(" JOIN asset_search_index fts ON fts.asset_id = a.id ");
         }
 
-        builder.push(" WHERE a.is_private = ");
-        builder.push_bind(privacy_level);
+        // --- HARD USER ISOLATION ---
+        builder.push(" WHERE a.user_id = ");
+        builder.push_bind(user_id);
 
         // --- TRASH SEPARATION ---
         if show_trash {
@@ -41,8 +43,8 @@ impl AssetRepo {
         }
 
         if let Some(ref expr) = fts_query {
-            builder.push(" AND fts.is_private = ");
-            builder.push_bind(privacy_level);
+            builder.push(" AND fts.user_id = ");
+            builder.push_bind(user_id);
             builder.push(" AND asset_search_index MATCH ");
             builder.push_bind(expr);
         }
@@ -75,26 +77,30 @@ impl AssetRepo {
             }
         }
 
-        // --- ROBUST MULTI-PERSON ---
+        // --- ROBUST MULTI-PERSON (USER-SCOPED) ---
         if let Some(ref pids_str) = q.person_id {
             let pids: Vec<&str> = pids_str.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
             let count = pids.len() as i64;
             if count > 0 {
-                builder.push(" AND a.id IN (SELECT asset_id FROM asset_faces WHERE person_id IN (");
+                builder.push(" AND a.id IN (SELECT af.asset_id FROM asset_faces af JOIN persons p ON af.person_id = p.id WHERE p.user_id = ");
+                builder.push_bind(user_id);
+                builder.push(" AND af.person_id IN (");
                 let mut sep = builder.separated(", ");
                 for pid in &pids { sep.push_bind(pid); }
-                sep.push_unseparated(") GROUP BY asset_id HAVING COUNT(DISTINCT person_id) = ");
+                sep.push_unseparated(") GROUP BY af.asset_id HAVING COUNT(DISTINCT af.person_id) = ");
                 builder.push_bind(count);
                 builder.push(") ");
             }
         }
 
-        // --- ROBUST MULTI-TAG ---
+        // --- ROBUST MULTI-TAG (USER-SCOPED) ---
         if let Some(ref tags_str) = q.tag {
             let tags: Vec<String> = tags_str.split(',').map(|s| s.trim().to_lowercase()).filter(|s| !s.is_empty()).collect();
             let count = tags.len() as i64;
             if count > 0 {
-                builder.push(" AND a.id IN (SELECT at.asset_id FROM asset_tags at JOIN tags t ON at.tag_id = t.id WHERE LOWER(t.name) IN (");
+                builder.push(" AND a.id IN (SELECT at.asset_id FROM asset_tags at JOIN tags t ON at.tag_id = t.id WHERE t.user_id = ");
+                builder.push_bind(user_id);
+                builder.push(" AND LOWER(t.name) IN (");
                 let mut sep = builder.separated(", ");
                 for t in &tags { sep.push_bind(t); }
                 sep.push_unseparated(") GROUP BY at.asset_id HAVING COUNT(DISTINCT LOWER(t.name)) = ");
@@ -142,10 +148,10 @@ impl AssetRepo {
         }
         builder.push_bind(fetch_limit);
 
-        // Sub-album retrieval (do not show sub-albums when viewing trash)
+        // Sub-album retrieval (scoped by user_id)
         let albums = if q.cursor_id.is_none() && !show_trash {
             let curr = q.folder_path.as_deref().unwrap_or("");
-            Self::get_sub_albums(pool, curr, q.media_type.as_deref(), privacy_level).await.unwrap_or_default()
+            Self::get_sub_albums(pool, user_id, curr, q.media_type.as_deref()).await.unwrap_or_default()
         } else {
             Vec::new()
         };
@@ -168,9 +174,9 @@ impl AssetRepo {
 
     pub async fn get_dynamic_filters(
         pool: &SqlitePool,
+        user_id: &str,
         q: &MediaQuery,
     ) -> Result<DynamicFiltersResponse, sqlx::Error> {
-        let privacy_level = if q.is_private.unwrap_or(false) { 1 } else { 0 };
         let show_trash = q.show_trash.unwrap_or(false);
         let fts_query = q.q.as_deref().and_then(Self::sanitize_query);
 
@@ -187,7 +193,7 @@ impl AssetRepo {
             .map(|s| s.split(',').map(|t| t.trim().to_lowercase()).filter(|t| !t.is_empty()).collect())
             .unwrap_or_default();
 
-        // Helper to construct a fresh CTE builder since QueryBuilder cannot be cloned
+        // Helper to construct a fresh CTE builder scoped strictly to user_id
         let build_cte = || {
             let mut builder: QueryBuilder<Sqlite> = QueryBuilder::new("WITH filtered AS (SELECT a.* FROM assets a ");
 
@@ -195,8 +201,8 @@ impl AssetRepo {
                 builder.push(" JOIN asset_search_index fts ON fts.asset_id = a.id ");
             }
 
-            builder.push(" WHERE a.is_private = ");
-            builder.push_bind(privacy_level);
+            builder.push(" WHERE a.user_id = ");
+            builder.push_bind(user_id);
 
             if show_trash {
                 builder.push(" AND a.deleted_at IS NOT NULL ");
@@ -205,8 +211,8 @@ impl AssetRepo {
             }
 
             if let Some(ref expr) = fts_query {
-                builder.push(" AND fts.is_private = ");
-                builder.push_bind(privacy_level);
+                builder.push(" AND fts.user_id = ");
+                builder.push_bind(user_id);
                 builder.push(" AND asset_search_index MATCH ");
                 builder.push_bind(expr);
             }
@@ -239,17 +245,21 @@ impl AssetRepo {
 
             if !pids.is_empty() {
                 let count = pids.len() as i64;
-                builder.push(" AND a.id IN (SELECT asset_id FROM asset_faces WHERE person_id IN (");
+                builder.push(" AND a.id IN (SELECT af.asset_id FROM asset_faces af JOIN persons p ON af.person_id = p.id WHERE p.user_id = ");
+                builder.push_bind(user_id);
+                builder.push(" AND af.person_id IN (");
                 let mut sep = builder.separated(", ");
                 for pid in &pids { sep.push_bind(pid); }
-                sep.push_unseparated(") GROUP BY asset_id HAVING COUNT(DISTINCT person_id) = ");
+                sep.push_unseparated(") GROUP BY af.asset_id HAVING COUNT(DISTINCT af.person_id) = ");
                 builder.push_bind(count);
                 builder.push(") ");
             }
 
             if !tags.is_empty() {
                 let count = tags.len() as i64;
-                builder.push(" AND a.id IN (SELECT at.asset_id FROM asset_tags at JOIN tags t ON at.tag_id = t.id WHERE LOWER(t.name) IN (");
+                builder.push(" AND a.id IN (SELECT at.asset_id FROM asset_tags at JOIN tags t ON at.tag_id = t.id WHERE t.user_id = ");
+                builder.push_bind(user_id);
+                builder.push(" AND LOWER(t.name) IN (");
                 let mut sep = builder.separated(", ");
                 for t in &tags { sep.push_bind(t); }
                 sep.push_unseparated(") GROUP BY at.asset_id HAVING COUNT(DISTINCT LOWER(t.name)) = ");
@@ -336,7 +346,7 @@ impl AssetRepo {
             })
             .collect();
 
-        // 3. People breakdown
+        // 3. People breakdown (strictly user's named persons)
         let mut people_builder = build_cte();
         people_builder.push(
             r#"
@@ -344,7 +354,13 @@ impl AssetRepo {
             FROM asset_faces af
             JOIN persons p ON af.person_id = p.id
             JOIN filtered f ON af.asset_id = f.id
-            WHERE p.name IS NOT NULL
+            WHERE p.user_id = 
+            "#
+        );
+        people_builder.push_bind(user_id);
+        people_builder.push(
+            r#"
+              AND p.name IS NOT NULL
             GROUP BY p.id 
             ORDER BY count DESC 
             LIMIT 30
@@ -360,7 +376,7 @@ impl AssetRepo {
             })
             .collect();
 
-        // 4. Tags breakdown
+        // 4. Tags breakdown (strictly user's dictionary)
         let mut tags_builder = build_cte();
         tags_builder.push(
             r#"
@@ -368,6 +384,12 @@ impl AssetRepo {
             FROM asset_tags at
             JOIN tags t ON at.tag_id = t.id
             JOIN filtered f ON at.asset_id = f.id
+            WHERE t.user_id = 
+            "#
+        );
+        tags_builder.push_bind(user_id);
+        tags_builder.push(
+            r#"
             GROUP BY t.id 
             ORDER BY count DESC 
             LIMIT 40
@@ -485,57 +507,6 @@ impl AssetRepo {
         }
     }
 
-    /// Indexes or updates an asset's entry in the FTS5 search index
-    pub async fn sync_search_index(pool: &SqlitePool, asset_id: &str) -> Result<(), sqlx::Error> {
-        sqlx::query("DELETE FROM asset_search_index WHERE asset_id = ?1")
-            .bind(asset_id)
-            .execute(pool)
-            .await?;
-
-        sqlx::query(
-            r#"
-            INSERT INTO asset_search_index (asset_id, is_private, persons, tags, location, temporal, camera, file_name)
-            SELECT 
-                a.id,
-                a.is_private,
-                COALESCE((
-                    SELECT GROUP_CONCAT(name, ' ')
-                    FROM (
-                        SELECT DISTINCT p.name AS name
-                        FROM asset_faces af
-                        JOIN persons p ON af.person_id = p.id
-                        WHERE af.asset_id = a.id 
-                          AND p.name IS NOT NULL 
-                          AND TRIM(p.name) != ''
-                    )
-                ), '') AS persons,
-                COALESCE((
-                    SELECT GROUP_CONCAT(name, ' ')
-                    FROM (
-                        SELECT DISTINCT t.name AS name
-                        FROM asset_tags at
-                        JOIN tags t ON at.tag_id = t.id
-                        WHERE at.asset_id = a.id
-                    )
-                ), '') AS tags,
-                TRIM(COALESCE(a.city, '') || ' ' || COALESCE(a.subdivision, '') || ' ' || COALESCE(a.country, '')) AS location,
-                TRIM(
-                    COALESCE(CAST(a.year AS TEXT), '') || ' ' ||
-                    COALESCE(SUBSTR(a.captured_at, 1, 10), '')
-                ) AS temporal,
-                TRIM(COALESCE(a.camera_make, '') || ' ' || COALESCE(a.camera_model, '') || ' ' || COALESCE(a.lens_model, '')) AS camera,
-                a.file_name
-            FROM assets a
-            WHERE a.id = ?1
-            "#,
-        )
-        .bind(asset_id)
-        .execute(pool)
-        .await?;
-
-        Ok(())
-    }
-
     pub async fn insert_asset_tx(
         tx: &mut sqlx::SqliteConnection,
         record: &NewAssetRecord,
@@ -543,18 +514,19 @@ impl AssetRepo {
         sqlx::query(
             r#"
             INSERT INTO assets (
-                id, sha256, file_name, rel_path, folder_path, thumb_path, preview_path,
+                id, user_id, sha256, file_name, rel_path, folder_path, thumb_path, preview_path,
                 file_size_bytes, mime_type, width, height, aspect_ratio, duration_seconds,
-                is_private, captured_at, year, month, day, hour, latitude, longitude,
+                captured_at, year, month, day, hour, latitude, longitude,
                 altitude_meters, city, subdivision, country, country_code, camera_make, camera_model,
                 clip_embedding
             ) VALUES (
                 ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
                 ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29
             )
-            "#
+            "#,
         )
         .bind(&record.id)
+        .bind(&record.user_id)
         .bind(&record.sha256)
         .bind(&record.file_name)
         .bind(&record.rel_path)
@@ -567,7 +539,6 @@ impl AssetRepo {
         .bind(record.height)
         .bind(record.aspect_ratio)
         .bind(record.duration_seconds)
-        .bind(record.is_private)
         .bind(&record.captured_at)
         .bind(record.year)
         .bind(record.month)
@@ -589,49 +560,115 @@ impl AssetRepo {
         Ok(())
     }
 
-    pub async fn toggle_favorite(pool: &SqlitePool, asset_id: &str) -> Result<bool, sqlx::Error> {
-        let row = sqlx::query("SELECT is_favorite FROM assets WHERE id = ?1")
+    pub async fn sync_search_index(
+        pool: &SqlitePool,
+        user_id: &str,
+        asset_id: &str,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query("DELETE FROM asset_search_index WHERE asset_id = ?1 AND user_id = ?2")
             .bind(asset_id)
-            .fetch_one(pool)
+            .bind(user_id)
+            .execute(pool)
             .await?;
+
+        sqlx::query(
+            r#"
+            INSERT INTO asset_search_index (asset_id, user_id, persons, tags, location, temporal, camera, file_name)
+            SELECT 
+                a.id,
+                a.user_id,
+                COALESCE((
+                    SELECT GROUP_CONCAT(name, ' ')
+                    FROM (
+                        SELECT DISTINCT p.name AS name
+                        FROM asset_faces af
+                        JOIN persons p ON af.person_id = p.id
+                        WHERE af.asset_id = a.id 
+                          AND p.user_id = a.user_id
+                          AND p.name IS NOT NULL 
+                          AND TRIM(p.name) != ''
+                    )
+                ), '') AS persons,
+                COALESCE((
+                    SELECT GROUP_CONCAT(name, ' ')
+                    FROM (
+                        SELECT DISTINCT t.name AS name
+                        FROM asset_tags at
+                        JOIN tags t ON at.tag_id = t.id
+                        WHERE at.asset_id = a.id
+                          AND t.user_id = a.user_id
+                    )
+                ), '') AS tags,
+                TRIM(COALESCE(a.city, '') || ' ' || COALESCE(a.subdivision, '') || ' ' || COALESCE(a.country, '')) AS location,
+                TRIM(
+                    COALESCE(CAST(a.year AS TEXT), '') || ' ' ||
+                    COALESCE(SUBSTR(a.captured_at, 1, 10), '')
+                ) AS temporal,
+                TRIM(COALESCE(a.camera_make, '') || ' ' || COALESCE(a.camera_model, '') || ' ' || COALESCE(a.lens_model, '')) AS camera,
+                a.file_name
+            FROM assets a
+            WHERE a.id = ?1 AND a.user_id = ?2
+            "#,
+        )
+        .bind(asset_id)
+        .bind(user_id)
+        .execute(pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// Toggles the favorite flag on an asset owned by the user.
+    pub async fn toggle_favorite(
+        pool: &SqlitePool,
+        user_id: &str,
+        asset_id: &str,
+    ) -> Result<bool, sqlx::Error> {
+        let row = sqlx::query(
+            "SELECT is_favorite FROM assets WHERE id = ?1 AND user_id = ?2 AND deleted_at IS NULL",
+        )
+        .bind(asset_id)
+        .bind(user_id)
+        .fetch_one(pool)
+        .await?;
 
         let current: i64 = row.try_get("is_favorite").unwrap_or(0);
         let new_state = if current == 1 { 0 } else { 1 };
 
-        sqlx::query("UPDATE assets SET is_favorite = ?1, updated_at = CURRENT_TIMESTAMP WHERE id = ?2")
-            .bind(new_state)
-            .bind(asset_id)
-            .execute(pool)
-            .await?;
+        sqlx::query(
+            "UPDATE assets SET is_favorite = ?1, updated_at = CURRENT_TIMESTAMP WHERE id = ?2 AND user_id = ?3",
+        )
+        .bind(new_state)
+        .bind(asset_id)
+        .bind(user_id)
+        .execute(pool)
+        .await?;
 
         Ok(new_state == 1)
     }
 
-    pub async fn find_id_by_sha256(
-        pool: &SqlitePool,
-        sha256: &str,
-    ) -> Result<Option<String>, sqlx::Error> {
-        sqlx::query_scalar("SELECT id FROM assets WHERE sha256 = ?1")
-            .bind(sha256)
-            .fetch_optional(pool)
-            .await
-    }
-
+    /// Retrieves asset file metadata strictly scoped to the authenticated user.
     pub async fn get_storage_info(
         pool: &SqlitePool,
+        user_id: &str,
         asset_id: &str,
     ) -> Result<Option<AssetStorageInfo>, sqlx::Error> {
         let row = sqlx::query(
-            "SELECT rel_path, preview_path, is_private, (duration_seconds IS NOT NULL) AS is_video FROM assets WHERE id = ?1"
+            r#"
+            SELECT rel_path, preview_path, (duration_seconds IS NOT NULL) AS is_video 
+            FROM assets 
+            WHERE id = ?1 AND user_id = ?2 AND deleted_at IS NULL
+            LIMIT 1
+            "#,
         )
         .bind(asset_id)
+        .bind(user_id)
         .fetch_optional(pool)
         .await?;
 
         let info = row.map(|r| AssetStorageInfo {
             rel_path: r.try_get("rel_path").unwrap_or_default(),
             preview_path: r.try_get("preview_path").unwrap_or_default(),
-            is_private: r.try_get::<i64, _>("is_private").unwrap_or(0) == 1,
             is_video: r.try_get::<bool, _>("is_video").unwrap_or(false),
         });
 
@@ -641,9 +678,9 @@ impl AssetRepo {
     /// Discovers immediate child folders under a given path
     pub async fn get_sub_albums(
         pool: &SqlitePool,
+        user_id: &str,
         current_folder: &str,
         media_type: Option<&str>,
-        privacy_level: i64,
     ) -> Result<Vec<SubAlbum>, sqlx::Error> {
         let prefix = if current_folder.is_empty() || current_folder == "root" {
             String::new()
@@ -655,14 +692,15 @@ impl AssetRepo {
             r#"
             SELECT folder_path, thumb_path
             FROM assets
-            WHERE folder_path LIKE 
-            "#
+            WHERE user_id = 
+            "#,
         );
+        builder.push_bind(user_id);
+        builder.push(" AND deleted_at IS NULL ");
+        builder.push(" AND folder_path LIKE ");
         builder.push_bind(format!("{}%", prefix));
         builder.push(" AND folder_path != ");
         builder.push_bind(if current_folder.is_empty() { "root" } else { current_folder });
-        builder.push(" AND is_private = ");
-        builder.push_bind(privacy_level);
 
         // Photo / Video separation in album tree
         if let Some(m_type) = media_type {
@@ -720,15 +758,15 @@ impl AssetRepo {
 
     pub async fn fetch_and_purge_expired_trash(
         pool: &SqlitePool,
-        storage_root: &std::path::Path,
+        storage_root: &Path,
     ) -> Result<usize, sqlx::Error> {
         let rows = sqlx::query(
             r#"
-            SELECT id, rel_path, thumb_path, preview_path, is_private 
+            SELECT id, user_id, rel_path, thumb_path, preview_path 
             FROM assets 
             WHERE deleted_at IS NOT NULL 
               AND datetime(deleted_at, '+30 days') <= datetime('now')
-            "#
+            "#,
         )
         .fetch_all(pool)
         .await?;
@@ -737,23 +775,26 @@ impl AssetRepo {
 
         for r in rows {
             let id: String = r.get("id");
+            let user_id: String = r.get("user_id");
             let rel_path: String = r.get("rel_path");
             let thumb_path: String = r.get("thumb_path");
             let preview_path: String = r.get("preview_path");
-            let is_private: i64 = r.get("is_private");
 
-            let base = if is_private != 0 {
-                storage_root.join("originals/private")
-            } else {
-                storage_root.join("originals/public")
-            };
+            // storage_root/users/<user_id>/originals/<rel_path>
+            let orig_file = storage_root
+                .join("users")
+                .join(&user_id)
+                .join("originals")
+                .join(&rel_path);
 
-            let _ = tokio::fs::remove_file(base.join(&rel_path)).await;
+            // thumb_path & preview_path already include "users/<user_id>/thumbs/..."
+            let _ = tokio::fs::remove_file(orig_file).await;
             let _ = tokio::fs::remove_file(storage_root.join(&thumb_path)).await;
             let _ = tokio::fs::remove_file(storage_root.join(&preview_path)).await;
 
-            let _ = sqlx::query("DELETE FROM assets WHERE id = ?1")
+            let _ = sqlx::query("DELETE FROM assets WHERE id = ?1 AND user_id = ?2")
                 .bind(&id)
+                .bind(&user_id)
                 .execute(pool)
                 .await;
         }
@@ -761,8 +802,10 @@ impl AssetRepo {
         Ok(count)
     }
 
+    /// Toggles deleted_at timestamp strictly for the authenticated user's asset.
     pub async fn toggle_soft_delete(
         pool: &SqlitePool,
+        user_id: &str,
         id: &str,
     ) -> Result<Option<String>, sqlx::Error> {
         let row = sqlx::query(
@@ -773,11 +816,12 @@ impl AssetRepo {
                 ELSE NULL 
             END,
             updated_at = CURRENT_TIMESTAMP
-            WHERE id = ?1
+            WHERE id = ?1 AND user_id = ?2
             RETURNING deleted_at
             "#,
         )
         .bind(id)
+        .bind(user_id)
         .fetch_one(pool)
         .await?;
 
@@ -785,15 +829,18 @@ impl AssetRepo {
         Ok(deleted_at)
     }
 
+    /// Deletes asset rows and unlinks files from SSD strictly scoped to the user.
     pub async fn purge_asset(
         pool: &SqlitePool,
+        user_id: &str,
         id: &str,
-        storage_root: &std::path::Path,
+        storage_root: &Path,
     ) -> Result<bool, sqlx::Error> {
         let row = sqlx::query(
-            "SELECT rel_path, thumb_path, preview_path, is_private FROM assets WHERE id = ?1",
+            "SELECT rel_path, thumb_path, preview_path FROM assets WHERE id = ?1 AND user_id = ?2",
         )
         .bind(id)
+        .bind(user_id)
         .fetch_optional(pool)
         .await?;
 
@@ -805,28 +852,32 @@ impl AssetRepo {
         let rel_path: String = row.get("rel_path");
         let thumb_path: String = row.get("thumb_path");
         let preview_path: String = row.get("preview_path");
-        let is_private: i64 = row.get("is_private");
 
-        let orig_base = if is_private != 0 {
-            storage_root.join("originals/private")
-        } else {
-            storage_root.join("originals/public")
-        };
+        // storage_root/users/<user_id>/originals/<rel_path>
+        let orig_file = storage_root
+            .join("users")
+            .join(user_id)
+            .join("originals")
+            .join(&rel_path);
 
-        let _ = tokio::fs::remove_file(orig_base.join(&rel_path)).await;
+        // thumb_path & preview_path already include "users/<user_id>/thumbs/..."
+        let _ = tokio::fs::remove_file(orig_file).await;
         let _ = tokio::fs::remove_file(storage_root.join(&thumb_path)).await;
         let _ = tokio::fs::remove_file(storage_root.join(&preview_path)).await;
 
-        sqlx::query("DELETE FROM assets WHERE id = ?1")
+        sqlx::query("DELETE FROM assets WHERE id = ?1 AND user_id = ?2")
             .bind(id)
+            .bind(user_id)
             .execute(pool)
             .await?;
 
         Ok(true)
     }
 
+    /// Batch soft-deletes/restores multiple assets belonging to the user.
     pub async fn batch_toggle_soft_delete(
         pool: &SqlitePool,
+        user_id: &str,
         ids: &[String],
     ) -> Result<usize, sqlx::Error> {
         if ids.is_empty() {
@@ -837,18 +888,19 @@ impl AssetRepo {
         let mut count = 0;
 
         for id in ids {
-            // Toggles deleted_at: if NULL -> set to CURRENT_TIMESTAMP, if set -> restore to NULL
             let res = sqlx::query(
                 r#"
                 UPDATE assets
                 SET deleted_at = CASE 
                     WHEN deleted_at IS NULL THEN CURRENT_TIMESTAMP 
                     ELSE NULL 
-                END
-                WHERE id = ?1
-                "#
+                END,
+                updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?1 AND user_id = ?2
+                "#,
             )
             .bind(id)
+            .bind(user_id)
             .execute(&mut *tx)
             .await?;
 
@@ -859,10 +911,12 @@ impl AssetRepo {
         Ok(count)
     }
 
+    /// Batch hard-purges multiple assets belonging to the user.
     pub async fn batch_purge(
         pool: &SqlitePool,
+        user_id: &str,
         ids: &[String],
-        storage_root: &std::path::Path,
+        storage_root: &Path,
     ) -> Result<usize, sqlx::Error> {
         if ids.is_empty() {
             return Ok(0);
@@ -870,13 +924,28 @@ impl AssetRepo {
 
         let mut purged_count = 0;
 
-        // Perform file unlinks and DB removals
         for id in ids {
-            if let Ok(true) = Self::purge_asset(pool, id, storage_root).await {
+            if let Ok(true) = Self::purge_asset(pool, user_id, id, storage_root).await {
                 purged_count += 1;
             }
         }
 
         Ok(purged_count)
+    }
+
+    pub async fn find_user_asset_by_sha256(
+        pool: &SqlitePool,
+        user_id: &str,
+        sha256: &str,
+    ) -> Result<Option<String>, sqlx::Error> {
+        let row = sqlx::query_scalar::<_, String>(
+            "SELECT id FROM assets WHERE user_id = ? AND sha256 = ? AND deleted_at IS NULL LIMIT 1"
+        )
+        .bind(user_id)
+        .bind(sha256)
+        .fetch_optional(pool)
+        .await?;
+
+        Ok(row)
     }
 }

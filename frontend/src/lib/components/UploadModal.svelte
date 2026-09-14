@@ -1,9 +1,9 @@
 <script lang="ts">
   import { createEventDispatcher, onMount } from 'svelte';
+  import { authStore } from '$lib/stores/authStore';
 
   export let isOpen = false;
   export let initialFiles: File[] = [];
-  export let isPrivate = false;
 
   const dispatch = createEventDispatcher<{
     close: void;
@@ -12,20 +12,15 @@
 
   let stagedFiles: File[] = [];
   let folderPath = '';
-  let uploadIsPrivate = false;
   let isUploading = false;
   let uploadProgress = 0;
   let statusMessage = '';
   let fileInputEl: HTMLInputElement;
   let existingFolders: string[] = [];
 
-  // Thresholds: files > 75 MB are sliced into 20 MB chunks to easily clear Cloudflare limits
+  // Files > 75 MB are sliced into 20 MB chunks
   const CHUNK_THRESHOLD_BYTES = 75 * 1024 * 1024;
   const CHUNK_SIZE_BYTES = 20 * 1024 * 1024;
-
-  $: if (isOpen) {
-    uploadIsPrivate = isPrivate;
-  }
 
   $: if (initialFiles && initialFiles.length > 0) {
     addFiles(initialFiles);
@@ -35,6 +30,10 @@
   onMount(async () => {
     try {
       const res = await fetch('/api/media/filters');
+      if (res.status === 401) {
+        authStore.checkStatus();
+        return;
+      }
       if (res.ok) {
         const data = await res.json();
         if (Array.isArray(data.albums)) {
@@ -42,7 +41,7 @@
         }
       }
     } catch {
-      existingFolders = ['college', 'college/sem1', 'vacation', 'family'];
+      existingFolders = [];
     }
   });
 
@@ -83,11 +82,9 @@
     return `${parseFloat((bytes / Math.pow(k, i)).toFixed(1))} ${sizes[i]}`;
   }
 
-  // Upload small files using the default /api/upload
   async function uploadDirect(file: File) {
     const formData = new FormData();
     formData.append('folder', folderPath.trim() || 'root');
-    formData.append('is_private', uploadIsPrivate ? 'true' : 'false');
     formData.append('file', file);
 
     const res = await fetch('/api/upload', {
@@ -95,13 +92,17 @@
       body: formData,
     });
 
+    if (res.status === 401) {
+      authStore.checkStatus();
+      throw new Error('Session expired. Please log in again.');
+    }
+
     if (!res.ok) {
       const text = await res.text();
       throw new Error(text || `HTTP ${res.status}`);
     }
   }
 
-  // Upload heavy files in sliced 20MB chunks
   async function uploadChunked(file: File) {
     const uploadId = crypto.randomUUID();
     const totalChunks = Math.ceil(file.size / CHUNK_SIZE_BYTES);
@@ -126,23 +127,31 @@
         body: slice,
       });
 
+      if (res.status === 401) {
+        authStore.checkStatus();
+        throw new Error('Session expired.');
+      }
+
       if (!res.ok) {
         throw new Error(`Failed uploading chunk ${chunkIdx + 1}/${totalChunks}`);
       }
     }
 
-    // Finalize after all chunks are sent
     statusMessage = `Processing ${file.name}...`;
     const finalizeParams = new URLSearchParams({
       upload_id: uploadId,
       file_name: file.name,
       folder: folderPath.trim() || 'root',
-      is_private: uploadIsPrivate ? 'true' : 'false',
     });
 
     const finalizeRes = await fetch(`/api/upload/chunk/finalize?${finalizeParams.toString()}`, {
       method: 'POST',
     });
+
+    if (finalizeRes.status === 401) {
+      authStore.checkStatus();
+      throw new Error('Session expired.');
+    }
 
     if (!finalizeRes.ok) {
       throw new Error(`Failed to finalize upload for ${file.name}`);
@@ -218,18 +227,9 @@
         <div>
           <h2 class="text-sm font-bold text-white flex items-center gap-2">
             Upload Media
-            {#if uploadIsPrivate}
-              <span class="text-[10px] bg-purple-950/80 text-purple-300 border border-purple-800/60 px-1.5 py-0.2 rounded font-mono font-medium">
-                TO PRIVATE VAULT
-              </span>
-            {:else}
-              <span class="text-[10px] bg-neutral-800 text-neutral-400 border border-neutral-700/60 px-1.5 py-0.2 rounded font-mono font-medium">
-                TO PUBLIC
-              </span>
-            {/if}
           </h2>
           <p class="text-[11px] text-neutral-400 mt-0.5">
-            Small files upload directly; large video files are sliced automatically.
+            Files are saved to your personal library and processed automatically.
           </p>
         </div>
         <button
@@ -244,33 +244,6 @@
 
       <!-- Body / Form -->
       <div class="p-5 space-y-4 overflow-y-auto flex-1">
-        <!-- Privacy Destination Toggle -->
-        <div class="space-y-1.5">
-          <span class="text-[11px] uppercase font-semibold text-neutral-400 tracking-wider">
-            Privacy Realm
-          </span>
-          <div class="grid grid-cols-2 bg-neutral-950 p-1 rounded-lg border border-neutral-800 gap-1 text-xs">
-            <button
-              type="button"
-              disabled={isUploading}
-              on:click={() => (uploadIsPrivate = false)}
-              class="py-1.5 rounded-md text-center cursor-pointer transition-all flex items-center justify-center gap-1.5 {!uploadIsPrivate ? 'bg-neutral-800 text-white font-medium shadow-xs' : 'text-neutral-500 hover:text-neutral-300'}"
-            >
-              <span>📷</span>
-              <span>Public Gallery</span>
-            </button>
-            <button
-              type="button"
-              disabled={isUploading}
-              on:click={() => (uploadIsPrivate = true)}
-              class="py-1.5 rounded-md text-center cursor-pointer transition-all flex items-center justify-center gap-1.5 {uploadIsPrivate ? 'bg-purple-600 text-white font-medium shadow-xs' : 'text-neutral-500 hover:text-purple-400'}"
-            >
-              <span>🔒</span>
-              <span>Private Vault</span>
-            </button>
-          </div>
-        </div>
-
         <!-- Target Album/Folder Input -->
         <div class="space-y-1.5">
           <label for="upload-folder-input" class="text-[11px] uppercase font-semibold text-neutral-400 tracking-wider">
@@ -281,7 +254,7 @@
             type="text"
             list="folder-suggestions"
             bind:value={folderPath}
-            placeholder="root (or type e.g. college/sem1)..."
+            placeholder="root (or enter e.g. vacation/day1)..."
             disabled={isUploading}
             class="w-full bg-neutral-950 border border-neutral-800 focus:border-purple-500 rounded-lg px-3 py-2 text-xs text-white placeholder-neutral-600 outline-none transition-colors"
           />
@@ -320,7 +293,7 @@
             >
               <div class="text-2xl mb-1">📁</div>
               <span class="text-xs text-neutral-300 font-medium">Click to select files</span>
-              <span class="text-[10px] text-neutral-500">Supports JPG, PNG, WEBP, MP4, MOV</span>
+              <span class="text-[10px] text-neutral-500">Supports JPG, PNG, WEBP, MP4, MOV, HEIC</span>
             </button>
           {:else}
             <div class="space-y-1.5 max-h-56 overflow-y-auto pr-1">

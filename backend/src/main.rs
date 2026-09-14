@@ -10,7 +10,7 @@ use axum::{
     extract::DefaultBodyLimit,
     http::{header, HeaderValue},
     routing::{get, post},
-    Router,
+    Extension, Router,
 };
 use config::Config;
 use std::net::SocketAddr;
@@ -57,12 +57,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with(tracing_subscriber::fmt::layer())
         .init();
 
+    // Initialize required user storage directories
     tokio::fs::create_dir_all(&config.storage_root.join("db")).await?;
-    tokio::fs::create_dir_all(&config.storage_root.join("originals/public")).await?;
-    tokio::fs::create_dir_all(&config.storage_root.join("originals/private")).await?;
+    tokio::fs::create_dir_all(&config.storage_root.join("users")).await?;
     tokio::fs::create_dir_all(&config.storage_root.join("temp_chunks")).await?;
-    tokio::fs::create_dir_all(&config.storage_root.join("thumbs")).await?;
-    tokio::fs::create_dir_all(&config.storage_root.join("thumbs/faces")).await?;
     tokio::fs::create_dir_all(&config.storage_root.join("models")).await?;
 
     let pool = db::init_db_pool(&config.db_url).await?;
@@ -79,7 +77,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 2. Start worker with the coordinator (Idle worker consumes ~0 MB until a job arrives)
     QueueService::start_worker(
         pool.clone(),
-        config.storage_root.join("thumbs"),
+        config.storage_root.clone(),
         coordinator.clone(),
         config.worker_concurrency,
         queue_notify.clone(),
@@ -87,15 +85,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let state = AppState {
-        db: pool,
+        db: pool.clone(),
         config: config.clone(),
         queue_notify,
         tx_events,
         coordinator,
     };
 
+    // Serves /users/<user_id>/thumbs/<shard>/<file> from <storage_root>/users/
+    let users_static_router = Router::new()
+        .fallback_service(ServeDir::new(config.storage_root.join("users")))
+        .layer(SetResponseHeaderLayer::overriding(
+            header::CACHE_CONTROL,
+            HeaderValue::from_static("public, max-age=31536000, immutable"),
+        ));
+
+    // Serves /thumbs/users/<user_id>/thumbs/<shard>/<file> if requested with /thumbs prefix
     let thumbs_router = Router::new()
-        .fallback_service(ServeDir::new(config.storage_root.join("thumbs")))
+        .fallback_service(ServeDir::new(&config.storage_root))
         .layer(SetResponseHeaderLayer::overriding(
             header::CACHE_CONTROL,
             HeaderValue::from_static("public, max-age=31536000, immutable"),
@@ -118,12 +125,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // Upload
         .route("/api/upload", post(routes::upload::upload_photo))
+        .route("/api/upload/raw", post(routes::upload::upload_raw_binary))
         .route("/api/upload/chunk", post(routes::upload::upload_chunk))
         .route("/api/upload/chunk/finalize", post(routes::upload::finalize_chunk))
         .route("/api/upload/inspect", post(routes::upload::inspect_link))
         .route("/api/upload/commit", post(routes::upload::commit_link_download))
 
-        // Event
+        // Event Stream
         .route("/api/events", get(routes::events::stream_events))
 
         // Folder Structure
@@ -142,17 +150,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/assets/{id}/tags", get(routes::tags::get_asset_tags))
         .route("/api/persons/names", get(routes::people::get_names_directory))
 
+        // Static Asset Mounts
+        .nest("/users", users_static_router)
         .nest("/thumbs", thumbs_router)
         .nest(
             "/api/shortcuts",
             Router::new()
                 .route("/upload", post(routes::upload::upload_raw_binary))
-                .route("/albums", get(routes::albums::get_folder_suggestions))
-                .layer(axum::middleware::from_fn_with_state(
-                    state.clone(),
-                    crate::middleware::api_key::require_api_key,
-                )),
+                .route("/albums", get(routes::albums::get_folder_suggestions)),
         )
+        .layer(Extension(pool))
         .layer(DefaultBodyLimit::max(100 * 1024 * 1024))
         .layer(TraceLayer::new_for_http())
         .with_state(state);

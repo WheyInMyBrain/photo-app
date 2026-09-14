@@ -1,5 +1,5 @@
 use axum::{
-    extract::{Path as AxumPath, Query, State},
+    extract::{Path as AxumPath, State},
     response::Json,
 };
 use serde::Deserialize;
@@ -7,21 +7,15 @@ use serde::Deserialize;
 use crate::db::{AssetRepo, PersonRepo};
 use crate::domain::person::{AssetFaceDetail, PersonCard};
 use crate::error::AppError;
+use crate::middleware::auth::AuthUser;
 use crate::AppState;
-
-#[derive(Deserialize)]
-pub struct PeopleQuery {
-    pub is_private: Option<bool>,
-}
 
 /// GET /api/smart-albums/people
 pub async fn get_people_overview(
     State(state): State<AppState>,
-    Query(params): Query<PeopleQuery>,
+    auth_user: AuthUser,
 ) -> Result<Json<Vec<PersonCard>>, AppError> {
-    let privacy_level = if params.is_private.unwrap_or(false) { 1 } else { 0 };
-
-    let people = PersonRepo::get_overview(&state.db, privacy_level)
+    let people = PersonRepo::get_overview(&state.db, &auth_user.id)
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?;
 
@@ -31,9 +25,10 @@ pub async fn get_people_overview(
 /// GET /api/assets/{id}/faces
 pub async fn get_asset_faces(
     State(state): State<AppState>,
+    auth_user: AuthUser,
     AxumPath(asset_id): AxumPath<String>,
 ) -> Result<Json<Vec<AssetFaceDetail>>, AppError> {
-    let faces = PersonRepo::get_faces_by_asset(&state.db, &asset_id)
+    let faces = PersonRepo::get_faces_by_asset(&state.db, &auth_user.id, &asset_id)
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?;
 
@@ -48,6 +43,7 @@ pub struct NamePersonPayload {
 /// POST /api/persons/{id}/name
 pub async fn name_person(
     State(state): State<AppState>,
+    auth_user: AuthUser,
     AxumPath(person_id): AxumPath<String>,
     Json(payload): Json<NamePersonPayload>,
 ) -> Result<Json<bool>, AppError> {
@@ -56,12 +52,12 @@ pub async fn name_person(
         return Err(AppError::BadRequest("Name cannot be empty".into()));
     }
 
-    let affected_assets = PersonRepo::rename_person(&state.db, &person_id, trimmed)
+    let affected_assets = PersonRepo::rename_person(&state.db, &auth_user.id, &person_id, trimmed)
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?;
 
     for aid in affected_assets {
-        let _ = AssetRepo::sync_search_index(&state.db, &aid).await;
+        let _ = AssetRepo::sync_search_index(&state.db, &auth_user.id, &aid).await;
     }
 
     Ok(Json(true))
@@ -75,14 +71,20 @@ pub struct ReassignFacePayload {
 /// POST /api/faces/{face_id}/reassign
 pub async fn reassign_face(
     State(state): State<AppState>,
+    auth_user: AuthUser,
     AxumPath(face_id): AxumPath<String>,
     Json(payload): Json<ReassignFacePayload>,
 ) -> Result<Json<bool>, AppError> {
-    let affected_asset_id = PersonRepo::reassign_face(&state.db, &face_id, &payload.target_person_id)
-        .await
-        .map_err(|e| AppError::Internal(e.to_string()))?;
+    let affected_asset_id = PersonRepo::reassign_face(
+        &state.db,
+        &auth_user.id,
+        &face_id,
+        &payload.target_person_id,
+    )
+    .await
+    .map_err(|e| AppError::Internal(e.to_string()))?;
 
-    let _ = AssetRepo::sync_search_index(&state.db, &affected_asset_id).await;
+    let _ = AssetRepo::sync_search_index(&state.db, &auth_user.id, &affected_asset_id).await;
 
     Ok(Json(true))
 }
@@ -90,9 +92,10 @@ pub async fn reassign_face(
 /// POST /api/faces/{face_id}/verify
 pub async fn verify_face(
     State(state): State<AppState>,
+    auth_user: AuthUser,
     AxumPath(face_id): AxumPath<String>,
 ) -> Result<Json<bool>, AppError> {
-    PersonRepo::verify_face(&state.db, &face_id)
+    PersonRepo::verify_face(&state.db, &auth_user.id, &face_id)
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?;
 
@@ -108,6 +111,7 @@ pub struct MergeRequest {
 /// POST /api/persons/merge
 pub async fn merge_persons(
     State(state): State<AppState>,
+    auth_user: AuthUser,
     Json(payload): Json<MergeRequest>,
 ) -> Result<Json<bool>, AppError> {
     if payload.source_person_id == payload.target_person_id {
@@ -116,6 +120,7 @@ pub async fn merge_persons(
 
     let affected_assets = PersonRepo::merge_persons(
         &state.db,
+        &auth_user.id,
         &payload.source_person_id,
         &payload.target_person_id,
     )
@@ -123,16 +128,18 @@ pub async fn merge_persons(
     .map_err(|e| AppError::Internal(e.to_string()))?;
 
     for aid in affected_assets {
-        let _ = AssetRepo::sync_search_index(&state.db, &aid).await;
+        let _ = AssetRepo::sync_search_index(&state.db, &auth_user.id, &aid).await;
     }
 
     Ok(Json(true))
 }
 
+/// GET /api/persons/names
 pub async fn get_names_directory(
     State(state): State<AppState>,
+    auth_user: AuthUser,
 ) -> Result<Json<Vec<PersonCard>>, AppError> {
-    let names = PersonRepo::get_name_directory(&state.db)
+    let names = PersonRepo::get_name_directory(&state.db, &auth_user.id)
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?;
     Ok(Json(names))

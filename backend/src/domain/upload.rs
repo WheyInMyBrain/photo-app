@@ -20,14 +20,12 @@ pub struct UploadItemResult {
 pub struct BatchUploadReceipt {
     pub total_uploaded: usize,
     pub folder: String,
-    pub is_private: bool,
     pub items: Vec<UploadItemResult>,
 }
 
 #[derive(Deserialize)]
 pub struct RawUploadQuery {
     pub folder: Option<String>,
-    pub is_private: Option<bool>,
     pub file_name: Option<String>,
     pub ext: Option<String>,
 }
@@ -65,16 +63,10 @@ pub struct InspectLinkResponse {
     pub items: Vec<CandidateItem>,
 }
 
-fn default_true() -> bool {
-    true
-}
-
 #[derive(Deserialize, Debug)]
 pub struct CommitLinkRequest {
     pub platform: String,
     pub folder: Option<String>,        // If omitted, defaults to "{platform}/{author}"
-    #[serde(default = "default_true")]
-    pub is_private: bool,
     pub selected_items: Vec<CandidateItem>,
 }
 
@@ -98,5 +90,4 @@ pub struct FinalizeChunkQuery {
     pub upload_id: String,
     pub file_name: String,
     pub folder: Option<String>,
-    pub is_private: Option<bool>,
 }

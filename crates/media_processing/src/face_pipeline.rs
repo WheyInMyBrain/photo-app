@@ -58,7 +58,8 @@ impl FacePipeline {
     /// 1. Synchronous CPU/ONNX & File I/O — executed inside `spawn_blocking`
     pub fn detect_and_extract_faces_sync(
         engine: &FaceEngine,
-        faces_dir: &Path,
+        user_id: &str,
+        user_faces_dir: &Path,
         img: &DynamicImage,
     ) -> Result<Vec<ExtractedFace>, Box<dyn std::error::Error + Send + Sync>> {
         let detections = engine.detect_faces(img, 0.50, 0.35)?;
@@ -66,7 +67,7 @@ impl FacePipeline {
             return Ok(Vec::new());
         }
 
-        std::fs::create_dir_all(faces_dir)?;
+        std::fs::create_dir_all(user_faces_dir)?;
 
         let mut results = Vec::with_capacity(detections.len());
 
@@ -76,8 +77,10 @@ impl FacePipeline {
 
             // Thumbnail encoding
             let avatar = chip.resize_to_fill(128, 128, FilterType::Triangle);
-            let avatar_rel_path = format!("thumbs/faces/{}.webp", face_id);
-            let avatar_abs_path = faces_dir.join(format!("{}.webp", face_id));
+            
+            // Standard relative path for DB & static router
+            let avatar_rel_path = format!("users/{}/thumbs/faces/{}.webp", user_id, face_id);
+            let avatar_abs_path = user_faces_dir.join(format!("{}.webp", face_id));
 
             let mut out = std::fs::File::create(&avatar_abs_path)?;
             avatar.write_to(&mut out, ImageFormat::WebP)?;
@@ -100,27 +103,32 @@ impl FacePipeline {
         Ok(results)
     }
 
-    /// 2. Fast Async Database Clustering & Persistence (Single Transaction)
+    /// 2. Fast Async Database Clustering & Persistence (Strictly Scoped to `user_id`)
     pub async fn persist_faces(
         pool: &SqlitePool,
+        user_id: &str,
         asset_id: &str,
         extracted: Vec<ExtractedFace>,
     ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
         let mut tx = pool.begin().await?;
 
         if extracted.is_empty() {
-            sqlx::query("UPDATE assets SET face_processed = 1 WHERE id = ?1")
+            sqlx::query("UPDATE assets SET face_processed = 1 WHERE id = ?1 AND user_id = ?2")
                 .bind(asset_id)
+                .bind(user_id)
                 .execute(&mut *tx)
                 .await?;
             tx.commit().await?;
             return Ok(0);
         }
 
-        // Fetch existing clusters
+        // Fetch existing clusters ONLY for this user
         let rows = sqlx::query(
-            "SELECT id, centroid_embedding, face_count, cover_face_id FROM persons"
+            "SELECT id, centroid_embedding, face_count, cover_face_id 
+             FROM persons 
+             WHERE user_id = ?1"
         )
+        .bind(user_id)
         .fetch_all(&mut *tx)
         .await?;
 
@@ -179,10 +187,12 @@ impl FacePipeline {
 
                 let mut should_update_cover = false;
                 if let Some(ref current_cover_id) = cluster.cover_face_id {
-                    let cover_row = sqlx::query("SELECT embedding FROM asset_faces WHERE id = ?1")
-                        .bind(current_cover_id)
-                        .fetch_optional(&mut *tx)
-                        .await?;
+                    let cover_row = sqlx::query(
+                        "SELECT embedding FROM asset_faces WHERE id = ?1"
+                    )
+                    .bind(current_cover_id)
+                    .fetch_optional(&mut *tx)
+                    .await?;
 
                     if let Some(cr) = cover_row {
                         let cur_blob: Vec<u8> = cr.try_get("embedding")?;
@@ -207,13 +217,14 @@ impl FacePipeline {
                         r#"
                         UPDATE persons 
                         SET centroid_embedding = ?1, face_count = ?2, cover_face_id = ?3, updated_at = CURRENT_TIMESTAMP
-                        WHERE id = ?4
+                        WHERE id = ?4 AND user_id = ?5
                         "#
                     )
                     .bind(new_centroid_bytes)
                     .bind(cluster.face_count)
                     .bind(&face.face_id)
                     .bind(&pid)
+                    .bind(user_id)
                     .execute(&mut *tx)
                     .await?;
                 } else {
@@ -221,12 +232,13 @@ impl FacePipeline {
                         r#"
                         UPDATE persons 
                         SET centroid_embedding = ?1, face_count = ?2, updated_at = CURRENT_TIMESTAMP
-                        WHERE id = ?3
+                        WHERE id = ?3 AND user_id = ?4
                         "#
                     )
                     .bind(new_centroid_bytes)
                     .bind(cluster.face_count)
                     .bind(&pid)
+                    .bind(user_id)
                     .execute(&mut *tx)
                     .await?;
                 }
@@ -237,11 +249,12 @@ impl FacePipeline {
 
                 sqlx::query(
                     r#"
-                    INSERT INTO persons (id, name, cover_face_id, face_count, centroid_embedding)
-                    VALUES (?1, NULL, ?2, 1, ?3)
+                    INSERT INTO persons (id, user_id, name, cover_face_id, face_count, centroid_embedding)
+                    VALUES (?1, ?2, NULL, ?3, 1, ?4)
                     "#
                 )
                 .bind(&new_pid)
+                .bind(user_id)
                 .bind(&face.face_id)
                 .bind(embedding_bytes)
                 .execute(&mut *tx)
@@ -282,8 +295,9 @@ impl FacePipeline {
             .await?;
         }
 
-        sqlx::query("UPDATE assets SET face_processed = 1 WHERE id = ?1")
+        sqlx::query("UPDATE assets SET face_processed = 1 WHERE id = ?1 AND user_id = ?2")
             .bind(asset_id)
+            .bind(user_id)
             .execute(&mut *tx)
             .await?;
 
@@ -291,24 +305,28 @@ impl FacePipeline {
         Ok(total_faces)
     }
 
-    /// Helper to run the entire face pipeline cleanly off-thread
     pub async fn process_asset_faces(
         engine: Arc<FaceEngine>,
         pool: &SqlitePool,
-        thumbs_root: &Path,
+        storage_root: &Path,
+        user_id: &str,
         asset_id: &str,
         img: Arc<DynamicImage>,
     ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
-        let faces_dir = thumbs_root.join("faces");
+        let faces_dir = storage_root
+            .join("users")
+            .join(user_id)
+            .join("thumbs")
+            .join("faces");
 
-        // Offload ONNX detection, chips, WebP writing, and embeddings to blocking pool
+        let user_id_owned = user_id.to_string();
+
         let extracted = tokio::task::spawn_blocking(move || {
-            Self::detect_and_extract_faces_sync(&engine, &faces_dir, &img)
+            Self::detect_and_extract_faces_sync(&engine, &user_id_owned, &faces_dir, &img)
         })
         .await??;
 
-        // Persist via async DB pool
-        let count = Self::persist_faces(pool, asset_id, extracted).await?;
+        let count = Self::persist_faces(pool, user_id, asset_id, extracted).await?;
         Ok(count)
     }
 }

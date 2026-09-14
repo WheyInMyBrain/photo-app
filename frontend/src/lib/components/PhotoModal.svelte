@@ -1,5 +1,6 @@
 <script lang="ts">
   import { onMount, onDestroy, createEventDispatcher } from 'svelte';
+  import { authStore } from '$lib/stores/authStore';
 
   export let asset: {
     id: string;
@@ -76,6 +77,13 @@
     return !item.mime_type.startsWith('video/');
   }
 
+  function resolveThumbUrl(path: string): string {
+    if (!path) return '';
+    if (path.startsWith('http') || path.startsWith('/thumbs/')) return path;
+    const clean = path.startsWith('/') ? path.slice(1) : path;
+    return `/thumbs/${clean}`;
+  }
+
   $: if (nextAsset && isImage(nextAsset)) {
     const img = new Image();
     img.src = `/api/assets/${nextAsset.id}/stream`;
@@ -97,7 +105,13 @@
     document.body.style.overflow = 'hidden';
 
     fetch('/api/persons/names')
-      .then((res) => (res.ok ? res.json() : []))
+      .then((res) => {
+        if (res.status === 401) {
+          authStore.checkStatus();
+          return [];
+        }
+        return res.ok ? res.json() : [];
+      })
       .then((data) => {
         knownPeople = data;
       })
@@ -126,6 +140,12 @@
         fetch(`/api/assets/${id}/tags`, { signal: detailAbortCtrl.signal }),
         fetch(`/api/assets/${id}/similar`, { signal: detailAbortCtrl.signal })
       ]);
+
+      if (fRes.status === 401 || tRes.status === 401 || sRes.status === 401) {
+        authStore.checkStatus();
+        return;
+      }
+
       faces = fRes.ok ? await fRes.json() : [];
       tags = tRes.ok ? await tRes.json() : [];
       similarItems = sRes.ok ? await sRes.json() : [];
@@ -146,6 +166,10 @@
     isFavorite = !isFavorite;
     try {
       const res = await fetch(`/api/assets/${asset.id}/favorite`, { method: 'POST' });
+      if (res.status === 401) {
+        authStore.checkStatus();
+        return;
+      }
       if (res.ok) {
         const data = await res.json();
         isFavorite = data.is_favorite;
@@ -333,7 +357,11 @@
             <div class="space-y-2">
               {#each faces as f (f.face_id)}
                 <div class="flex items-center gap-2.5 bg-neutral-900/60 border border-neutral-800/60 p-2 rounded-lg">
-                  <img src="/{f.face_thumb_path}" alt="" class="w-8 h-8 rounded-full object-cover border border-neutral-700" />
+                  <img
+                    src={resolveThumbUrl(f.face_thumb_path)}
+                    alt=""
+                    class="w-8 h-8 rounded-full object-cover border border-neutral-700 bg-neutral-800"
+                  />
                   <div class="flex-1 min-w-0">
                     {#if editingFaceId === f.face_id}
                       <input
@@ -409,7 +437,7 @@
                   title="Similarity: {Math.round(s.similarity * 100)}%"
                 >
                   <img
-                    src="/{s.thumb_path}"
+                    src={resolveThumbUrl(s.thumb_path)}
                     alt=""
                     loading="lazy"
                     class="w-full h-full object-cover group-hover:scale-105 transition-transform duration-200"

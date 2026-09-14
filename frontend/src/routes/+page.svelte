@@ -6,6 +6,7 @@
   import { cubicOut } from 'svelte/easing';
 
   import { filterStore, filterQueryString } from '$lib/stores/filterStore';
+  import { authStore } from '$lib/stores/authStore';
   import { createMediaSelection } from '$lib/stores/mediaSelection';
   import { buildGroupedSections, buildIndexMap } from '$lib/utils/mediaGrouper';
   import { initMediaEvents } from '$lib/utils/mediaEvents';
@@ -67,7 +68,7 @@
 
     if (reset) {
       if (pageAbortCtrl) pageAbortCtrl.abort();
-      // DO NOT reset items = [] here. Retaining the array allows Svelte to run FLIP transitions.
+      // Retaining array allows Svelte FLIP transitions on remaining items
       selection.clearSelection();
       nextCapturedAt = null;
       nextId = null;
@@ -89,12 +90,16 @@
       }
 
       const res = await fetch(`/api/media?${params.toString()}`, { signal: pageAbortCtrl.signal });
+
+      if (res.status === 401) {
+        authStore.checkStatus();
+        return;
+      }
+
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const data: MediaPageResponse = await res.json();
 
       albums = reset ? data.albums ?? [] : albums;
-
-      // In-place replacement triggers FLIP transitions for remaining items
       items = reset ? data.items : [...items, ...data.items];
 
       nextCapturedAt = data.next_cursor_captured_at;
@@ -201,14 +206,12 @@
       class="flex-1 flex flex-col items-center justify-center text-center py-16 text-neutral-500 text-xs"
     >
       <div class="text-2xl mb-1">
-        {$filterStore.show_trash ? '🗑️' : $filterStore.is_private ? '🔒' : '📷'}
+        {$filterStore.show_trash ? '🗑️' : '📷'}
       </div>
       {#if $filterStore.show_trash}
         Trash is empty.
-      {:else if $filterStore.is_private}
-        No private media in this location.
       {:else}
-        No media in this location.
+        No media found in this view.
       {/if}
     </div>
   {:else}
@@ -271,11 +274,6 @@
         const targetIdx = itemIndexMap.get(e.detail.id);
         if (targetIdx !== undefined) {
           selectedIndex = targetIdx;
-        } else {
-          fetch(`/api/media?limit=1`)
-            .then((r) => r.json())
-            .then(() => {
-            });
         }
       }}
       on:toggleFavorite={(e) => {

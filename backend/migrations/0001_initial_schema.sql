@@ -1,11 +1,38 @@
 -- ============================================================================
+-- 0. USERS & AUTHENTICATION
+-- ============================================================================
+CREATE TABLE IF NOT EXISTS users (
+    id TEXT PRIMARY KEY NOT NULL,
+    username TEXT NOT NULL UNIQUE COLLATE NOCASE,
+    password_hash TEXT NOT NULL,
+    display_name TEXT,
+    api_key TEXT UNIQUE,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS passkey_credentials (
+    id TEXT PRIMARY KEY NOT NULL,          -- base64url credential_id
+    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    public_key BLOB NOT NULL,
+    sign_count INTEGER NOT NULL DEFAULT 0,
+    name TEXT,                             -- e.g. "MacBook TouchID"
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_passkeys_user ON passkey_credentials(user_id);
+CREATE INDEX idx_users_api_key ON users(api_key);
+
+
+-- ============================================================================
 -- 1. CORE ASSETS TABLE
 -- ============================================================================
 CREATE TABLE IF NOT EXISTS assets (
     id TEXT PRIMARY KEY NOT NULL,
-    sha256 TEXT NOT NULL UNIQUE,
+    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    sha256 TEXT NOT NULL,
     file_name TEXT NOT NULL,
-    rel_path TEXT NOT NULL UNIQUE,
+    rel_path TEXT NOT NULL,
     folder_path TEXT NOT NULL,
     thumb_path TEXT NOT NULL,
     preview_path TEXT NOT NULL,
@@ -17,7 +44,6 @@ CREATE TABLE IF NOT EXISTS assets (
     duration_seconds REAL,
     fps REAL,
     video_codec TEXT,
-    is_private INTEGER NOT NULL DEFAULT 0 CHECK (is_private IN (0, 1)),
     is_favorite INTEGER NOT NULL DEFAULT 0 CHECK (is_favorite IN (0, 1)),
 
     -- CLIP BLOB
@@ -68,75 +94,82 @@ CREATE TABLE IF NOT EXISTS assets (
     raw_metadata JSON,
     
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+
+    -- Enforce uniqueness per user so two users can own the same file independently
+    UNIQUE(user_id, sha256),
+    UNIQUE(user_id, rel_path)
 );
 
--- 1. Main Feed & Pagination (Partial Index: excludes trash completely)
---    Keeps the main index compact and fast since deleted assets are skipped.
+-- 1. Main Feed & Pagination (Partial Index: per user, active only)
 CREATE INDEX IF NOT EXISTS idx_assets_cursor_pagination 
-    ON assets(is_private, captured_at DESC, id DESC)
+    ON assets(user_id, captured_at DESC, id DESC)
     WHERE deleted_at IS NULL;
 
--- 2. Trash View Index
---    Powers the trash view and the daily background 30-day auto-purge worker.
+-- 2. Trash View Index (Per user trash and background purge worker)
 CREATE INDEX IF NOT EXISTS idx_assets_trash
-    ON assets(is_private, deleted_at DESC, id DESC)
+    ON assets(user_id, deleted_at DESC, id DESC)
     WHERE deleted_at IS NOT NULL;
 
 -- 3. Geo Coordinate Bounding Box Index
---    Composite index on lat/long for map viewport lookups & spatial radius queries.
 CREATE INDEX IF NOT EXISTS idx_assets_lat_long
-    ON assets(latitude, longitude)
+    ON assets(user_id, latitude, longitude)
     WHERE latitude IS NOT NULL AND longitude IS NOT NULL AND deleted_at IS NULL;
 
 -- 4. Pipeline Queue Indexes (Active assets only)
 CREATE INDEX IF NOT EXISTS idx_assets_unprocessed_faces 
-    ON assets(id) 
+    ON assets(user_id, id) 
     WHERE face_processed = 0 AND deleted_at IS NULL;
 
 CREATE INDEX IF NOT EXISTS idx_assets_unprocessed_tags 
-    ON assets(id) 
+    ON assets(user_id, id) 
     WHERE tags_processed = 0 AND deleted_at IS NULL;
 
 CREATE INDEX IF NOT EXISTS idx_assets_clip 
-    ON assets(id) 
+    ON assets(user_id, id) 
     WHERE clip_embedding IS NOT NULL;
 
 CREATE INDEX IF NOT EXISTS idx_assets_unprocessed_clip
-    ON assets(id)
+    ON assets(user_id, id)
     WHERE clip_processed = 0 AND deleted_at IS NULL;
 
--- 5. Filtering & Aggregation Indexes (Active assets only)
+-- 5. Filtering & Aggregation Indexes (Per user, active assets only)
 CREATE INDEX IF NOT EXISTS idx_assets_folder_seek 
-    ON assets(is_private, folder_path)
+    ON assets(user_id, folder_path)
     WHERE deleted_at IS NULL;
 
 CREATE INDEX IF NOT EXISTS idx_assets_geo 
-    ON assets(is_private, city, country_code)
+    ON assets(user_id, city, country_code)
     WHERE deleted_at IS NULL;
 
 CREATE INDEX IF NOT EXISTS idx_assets_timeline 
-    ON assets(is_private, year DESC, month DESC)
+    ON assets(user_id, year DESC, month DESC)
     WHERE deleted_at IS NULL;
 
 CREATE INDEX IF NOT EXISTS idx_assets_camera 
-    ON assets(is_private, camera_model)
+    ON assets(user_id, camera_model)
     WHERE deleted_at IS NULL;
+
+CREATE INDEX IF NOT EXISTS idx_assets_favorites
+    ON assets(user_id, captured_at DESC)
+    WHERE is_favorite = 1 AND deleted_at IS NULL;
 
 
 -- ============================================================================
--- 2. TAGS & MULTI-LABEL TABLES
+-- 2. TAGS & MULTI-LABEL TABLES (USER-SCOPED)
 -- ============================================================================
 CREATE TABLE IF NOT EXISTS tags (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    name TEXT NOT NULL UNIQUE COLLATE NOCASE,
+    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    name TEXT NOT NULL COLLATE NOCASE,
     category INTEGER NOT NULL DEFAULT 0, -- 0=General, 4=Character, 9=Rating
     usage_count INTEGER NOT NULL DEFAULT 0,
-    source TEXT NOT NULL DEFAULT 'model' CHECK (source IN ('model', 'manual'))
+    source TEXT NOT NULL DEFAULT 'model' CHECK (source IN ('model', 'manual')),
+    UNIQUE(user_id, name COLLATE NOCASE)
 );
 
-CREATE INDEX IF NOT EXISTS idx_tags_search_autocomplete 
-    ON tags(name COLLATE NOCASE, usage_count DESC);
+CREATE INDEX IF NOT EXISTS idx_tags_user_autocomplete 
+    ON tags(user_id, name COLLATE NOCASE, usage_count DESC);
 
 CREATE TABLE IF NOT EXISTS asset_tags (
     asset_id TEXT NOT NULL REFERENCES assets(id) ON DELETE CASCADE,
@@ -155,10 +188,11 @@ CREATE INDEX IF NOT EXISTS idx_asset_tags_asset_id_confidence
 
 
 -- ============================================================================
--- 3. PEOPLE & FACES TABLES
+-- 3. PEOPLE & FACES TABLES (USER-SCOPED)
 -- ============================================================================
 CREATE TABLE IF NOT EXISTS persons (
     id TEXT PRIMARY KEY NOT NULL,
+    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     name TEXT,
     cover_face_id TEXT,
     face_count INTEGER NOT NULL DEFAULT 1,
@@ -168,11 +202,11 @@ CREATE TABLE IF NOT EXISTS persons (
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
-CREATE INDEX IF NOT EXISTS idx_persons_feed 
-    ON persons(is_hidden, face_count DESC);
+CREATE INDEX IF NOT EXISTS idx_persons_user_feed 
+    ON persons(user_id, is_hidden, face_count DESC);
 
-CREATE INDEX IF NOT EXISTS idx_persons_name 
-    ON persons(name COLLATE NOCASE);
+CREATE INDEX IF NOT EXISTS idx_persons_user_name 
+    ON persons(user_id, name COLLATE NOCASE);
 
 CREATE TABLE IF NOT EXISTS asset_faces (
     id TEXT PRIMARY KEY NOT NULL,
@@ -197,19 +231,21 @@ CREATE INDEX IF NOT EXISTS idx_asset_faces_asset_lookup
 
 
 -- ============================================================================
--- 4. ALBUMS TABLES
+-- 4. ALBUMS TABLES (USER-SCOPED)
 -- ============================================================================
 CREATE TABLE IF NOT EXISTS albums (
     id TEXT PRIMARY KEY NOT NULL,
+    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     title TEXT NOT NULL,
     description TEXT,
     album_type TEXT NOT NULL CHECK (album_type IN ('MANUAL', 'SMART')),
-    is_private INTEGER NOT NULL DEFAULT 0 CHECK (is_private IN (0, 1)),
     cover_asset_id TEXT REFERENCES assets(id) ON DELETE SET NULL,
     filter_criteria JSON,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
+
+CREATE INDEX IF NOT EXISTS idx_albums_user ON albums(user_id, created_at DESC);
 
 CREATE TABLE IF NOT EXISTS album_assets (
     album_id TEXT NOT NULL REFERENCES albums(id) ON DELETE CASCADE,
@@ -221,48 +257,33 @@ CREATE TABLE IF NOT EXISTS album_assets (
 
 
 -- ============================================================================
--- 5. OPTIMIZED FULL-TEXT SEARCH (FTS5) & TRIGGERS
+-- 5. FULL-TEXT SEARCH (FTS5) & AUTO-CLEANUP
 -- ============================================================================
--- External-content inverted search index with accent stripping and punctuation support
 CREATE VIRTUAL TABLE IF NOT EXISTS asset_search_index USING fts5(
     asset_id UNINDEXED,
-    is_private UNINDEXED,
+    user_id UNINDEXED,
     persons,       -- e.g., "ram sharma john"
     tags,          -- e.g., "hotel swimming pool indoor building"
     location,      -- e.g., "mumbai maharashtra india"
-    temporal,      -- e.g., "2024 2024-09 september sep thursday"
+    temporal,      -- e.g., "2026 2026-09 september sep monday"
     camera,        -- e.g., "sony ilce-7m4 a7iv 50mm"
     file_name,     -- e.g., "IMG_2041.jpg"
     tokenize = 'unicode61 remove_diacritics 2 tokenchars ''-._'''
 );
 
--- Automatically purge search index entries whenever an asset is deleted
 CREATE TRIGGER IF NOT EXISTS trg_assets_fts_cleanup
 AFTER DELETE ON assets
 BEGIN
     DELETE FROM asset_search_index WHERE asset_id = OLD.id;
 END;
 
--- Vault security state & passkey credentials
-CREATE TABLE IF NOT EXISTS vault_security (
-    id INTEGER PRIMARY KEY CHECK (id = 1), -- Single system master row
-    password_hash TEXT NOT NULL,
-    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-);
-
-CREATE TABLE IF NOT EXISTS passkey_credentials (
-    id TEXT PRIMARY KEY NOT NULL,          -- base64url credential_id
-    public_key BLOB NOT NULL,
-    sign_count INTEGER NOT NULL DEFAULT 0,
-    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-);
-
 
 -- ============================================================================
--- 6. Atomic DB-Backed Job Queue
+-- 6. ATOMIC DB-BACKED JOB QUEUE (USER-SCOPED)
 -- ============================================================================
 CREATE TABLE IF NOT EXISTS processing_jobs (
-    id TEXT PRIMARY KEY,
+    id TEXT PRIMARY KEY NOT NULL,
+    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     asset_id TEXT NOT NULL,
     file_name TEXT NOT NULL,
     rel_path TEXT NOT NULL,
@@ -270,12 +291,16 @@ CREATE TABLE IF NOT EXISTS processing_jobs (
     disk_path TEXT NOT NULL,
     sha256 TEXT NOT NULL,
     file_size_bytes INTEGER NOT NULL,
-    is_private INTEGER NOT NULL DEFAULT 0,
     status TEXT NOT NULL DEFAULT 'pending', -- 'pending', 'processing', 'completed', 'failed'
     attempts INTEGER NOT NULL DEFAULT 0,
     last_error TEXT,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
-CREATE INDEX IF NOT EXISTS idx_jobs_status_created ON processing_jobs(status, created_at);
+CREATE INDEX IF NOT EXISTS idx_jobs_user_status_created 
+    ON processing_jobs(user_id, status, created_at);
+
+CREATE INDEX IF NOT EXISTS idx_jobs_global_pending 
+    ON processing_jobs(status, created_at)
+    WHERE status = 'pending';
