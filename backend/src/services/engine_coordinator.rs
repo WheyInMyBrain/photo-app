@@ -28,7 +28,6 @@ extern "C" {
 }
 
 /// Returns current physical RAM usage (RSS) in Megabytes
-/// Returns current physical RAM usage (RSS) in Megabytes
 pub fn get_process_rss_mb() -> f64 {
     #[cfg(target_os = "macos")]
     unsafe {
