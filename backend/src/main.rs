@@ -15,7 +15,7 @@ use axum::{
 use config::Config;
 use std::net::SocketAddr;
 use std::sync::Arc;
-use tokio::sync::{Notify, broadcast};
+use tokio::sync::{broadcast, Notify};
 use tower_http::{
     services::ServeDir,
     set_header::SetResponseHeaderLayer,
@@ -24,9 +24,11 @@ use tower_http::{
 use tracing::info;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
-use media_processing::{FaceEngine, MediaEngine, TagEngine, ClipEngine};
-use services::cluster_cache::ClusterCacheManager;
-use services::clip_cache::ClipCacheManager;
+// Use mimalloc globally to guarantee OS pages are reclaimed on drop
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
+use services::engine_coordinator::EngineCoordinator;
 use services::queue::QueueService;
 use services::trash_purger::TrashPurgerService;
 
@@ -43,11 +45,10 @@ pub struct AppState {
     pub config: Config,
     pub queue_notify: Arc<Notify>,
     pub tx_events: broadcast::Sender<WsMediaEvent>,
-    pub clip_cache: ClipCacheManager,
-    pub clip_engine: Arc<ClipEngine>,
+    pub coordinator: EngineCoordinator,
 }
 
-#[tokio::main]
+#[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = Config::init();
 
@@ -68,30 +69,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     TrashPurgerService::start(pool.clone(), config.storage_root.clone());
 
-    // 1. Initialize ONNX models once inside the media_processing crate
+    // 1. Initialize coordinator (Zero ONNX models and zero vector caches loaded at boot)
     let models_dir = config.storage_root.join("models");
-    let face_engine = Arc::new(FaceEngine::init(&models_dir).map_err(|e| e.to_string())?);
-    let tag_engine = Arc::new(TagEngine::init(&models_dir).map_err(|e| e.to_string())?);
-    let clip_engine = Arc::new(ClipEngine::init(&models_dir).map_err(|e| e.to_string())?);
-
-    // 2. Wrap them into the unified MediaEngine
-    let media_engine = Arc::new(MediaEngine::new(face_engine, tag_engine, clip_engine.clone()));
-
-    // 3. Load cahches directly
-    let cluster_cache = ClusterCacheManager::load_initial(&pool).await?;
-    let clip_cache = ClipCacheManager::load_initial(&pool).await?;
+    let coordinator = EngineCoordinator::new(pool.clone(), models_dir);
 
     let queue_notify = Arc::new(Notify::new());
-
     let (tx_events, _) = broadcast::channel::<WsMediaEvent>(100);
 
-    // 4. Start worker with unified MediaEngine & the RAM cluster cache
+    // 2. Start worker with the coordinator (Idle worker consumes ~0 MB until a job arrives)
     QueueService::start_worker(
         pool.clone(),
         config.storage_root.join("thumbs"),
-        media_engine,
-        cluster_cache,
-        clip_cache.clone(),
+        coordinator.clone(),
         config.worker_concurrency,
         queue_notify.clone(),
         tx_events.clone(),
@@ -102,8 +91,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config: config.clone(),
         queue_notify,
         tx_events,
-        clip_cache: clip_cache.clone(),
-        clip_engine,
+        coordinator,
     };
 
     let thumbs_router = Router::new()
@@ -173,7 +161,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .parse()
         .expect("Invalid server address host/port configuration");
 
-    info!("Application running on http://{}", addr);
+    let initial_ram = services::engine_coordinator::get_process_rss_mb();
+    info!("------------------------------------------------------------");
+    info!("Server running on http://{} | Initial Idle RAM: {:.2} MB", addr, initial_ram);
+    info!("------------------------------------------------------------");
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app).await?;

@@ -21,6 +21,7 @@ pub async fn init_db_pool(db_url: &str) -> Result<SqlitePool, sqlx::Error> {
     // Allows concurrent readers without saturating the file descriptor lock.
     let pool = SqlitePoolOptions::new()
         .max_connections(5)
+        .min_connections(0)
         .acquire_timeout(Duration::from_secs(10))
         .connect_with(options)
         .await?;

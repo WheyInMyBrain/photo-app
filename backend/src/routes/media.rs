@@ -4,11 +4,12 @@ use axum::{
     response::{IntoResponse, Json, Response},
 };
 use tower_http::services::ServeFile;
+use tracing::error;
 
 use crate::db::AssetRepo;
 use crate::domain::media::{
-    DynamicFiltersResponse, FavoriteToggleResponse, MediaPageResponse, MediaQuery,
-    SoftDeleteResponse, BatchActionRequest, BatchActionResponse, SimilarMediaItem,
+    BatchActionRequest, BatchActionResponse, DynamicFiltersResponse, FavoriteToggleResponse,
+    MediaPageResponse, MediaQuery, SimilarMediaItem, SoftDeleteResponse,
 };
 use crate::error::AppError;
 use crate::AppState;
@@ -16,7 +17,7 @@ use crate::AppState;
 /// GET /api/media
 pub async fn list_media(
     State(state): State<AppState>,
-    Query(mut params): Query<MediaQuery>, // <-- Make params `mut`
+    Query(mut params): Query<MediaQuery>,
 ) -> Result<Json<MediaPageResponse>, AppError> {
     if params.cursor_captured_at.is_some() ^ params.cursor_id.is_some() {
         return Err(AppError::BadRequest(
@@ -24,7 +25,7 @@ pub async fn list_media(
         ));
     }
 
-    // Resolve Hybrid Search (Person entity extraction + CLIP text encoding)
+    // Resolve Hybrid Search (extract person names + on-demand CLIP text encoding)
     resolve_hybrid_query(&state, &mut params).await;
 
     let page = AssetRepo::query_media(&state.db, &params)
@@ -53,8 +54,6 @@ pub async fn toggle_favorite(
 }
 
 /// GET /api/assets/:id/stream
-/// Serves photos strictly from lightweight preview paths.
-/// Serves videos from originals with full zero-copy byte-range (HTTP 206) scrubbing via ServeFile.
 pub async fn stream_asset(
     State(state): State<AppState>,
     AxumPath(asset_id): AxumPath<String>,
@@ -66,16 +65,13 @@ pub async fn stream_asset(
         .ok_or_else(|| AppError::NotFound(format!("Asset {} not found", asset_id)))?;
 
     let file_to_serve = if info.is_video {
-        // Videos: stream the original via zero-copy range chunks
         let subfolder = if info.is_private { "originals/private" } else { "originals/public" };
         state.config.storage_root.join(subfolder).join(info.rel_path)
     } else {
-        // Photos: strictly serve the compressed WebP preview, never the original
         let preview = state.config.storage_root.join(&info.preview_path);
         if preview.exists() {
             preview
         } else {
-            // Fallback only if preview creation previously failed
             let subfolder = if info.is_private { "originals/private" } else { "originals/public" };
             state.config.storage_root.join(subfolder).join(info.rel_path)
         }
@@ -85,10 +81,6 @@ pub async fn stream_asset(
         return Err(AppError::NotFound("File not found on disk".into()));
     }
 
-    // ServeFile handles:
-    // - HTTP 206 Partial Content & Range header seeking
-    // - HTTP 304 Not Modified & ETag matching
-    // - Proper Content-Type & streaming without buffering into RAM
     let mut response = ServeFile::new(file_to_serve)
         .try_call(req)
         .await
@@ -100,7 +92,6 @@ pub async fn stream_asset(
         HeaderValue::from_static("public, max-age=2592000, immutable"),
     );
 
-    // Disable proxy buffering for instant byte-range scrubbing
     response.headers_mut().insert(
         HeaderName::from_static("x-accel-buffering"),
         HeaderValue::from_static("no"),
@@ -112,9 +103,8 @@ pub async fn stream_asset(
 /// GET /api/media/filters
 pub async fn get_available_filters(
     State(state): State<AppState>,
-    Query(mut params): Query<MediaQuery>, // <-- Make params `mut`
+    Query(mut params): Query<MediaQuery>,
 ) -> Result<Json<DynamicFiltersResponse>, AppError> {
-    // Resolve Hybrid Search so sidebar facet counts match the vector search results
     resolve_hybrid_query(&state, &mut params).await;
 
     let filters = AssetRepo::get_dynamic_filters(&state.db, &params)
@@ -196,7 +186,14 @@ pub async fn get_similar_assets(
     State(state): State<AppState>,
     AxumPath(id): AxumPath<String>,
 ) -> Result<Json<Vec<SimilarMediaItem>>, AppError> {
-    let similar = state.clip_cache.find_similar(&id, 0.55, 12).await;
+    // Lazily loads only the ~20 MB in-memory vector cache; does not load ONNX models
+    let clip_cache = state
+        .coordinator
+        .ensure_clip_cache()
+        .await
+        .map_err(AppError::Internal)?;
+
+    let similar = clip_cache.find_similar(&id, 0.55, 12).await;
     Ok(Json(similar))
 }
 
@@ -209,7 +206,7 @@ async fn resolve_hybrid_query(state: &AppState, q: &mut MediaQuery) {
     let is_private = q.is_private.unwrap_or(false);
     let mut words: Vec<String> = raw_q.split_whitespace().map(String::from).collect();
 
-    // 1. Check if any word matches an identified person's name in SQLite
+    // 1. Check if any query word matches a known person's name in SQLite
     let named_persons: Vec<(String, String)> = sqlx::query_as(
         "SELECT id, name FROM persons WHERE name IS NOT NULL"
     )
@@ -220,32 +217,43 @@ async fn resolve_hybrid_query(state: &AppState, q: &mut MediaQuery) {
     for (pid, name) in named_persons {
         let name_lower = name.to_lowercase();
         if let Some(pos) = words.iter().position(|w| w.to_lowercase() == name_lower) {
-            // Append to person_id filter
             q.person_id = match q.person_id.take() {
                 Some(existing) => Some(format!("{},{}", existing, pid)),
                 None => Some(pid),
             };
-            words.remove(pos); // Strip out name so it doesn't pollute CLIP text
+            words.remove(pos);
             break;
         }
     }
 
     let visual_prompt = words.join(" ");
 
-    // 2. If visual keywords remain, compute CLIP text embedding
+    // 2. If visual keywords remain, lazily acquire CLIP Text Engine (~150MB) and CLIP Vector Cache (~20MB)
     if !visual_prompt.is_empty() {
-        if let Ok(text_vector) = state.clip_engine.extract_text_embedding(&visual_prompt) {
-            // 0.24 threshold for text-to-image similarity
-            let matches = state.clip_cache.search_by_vector(&text_vector, is_private, 0.24, 200).await;
+        let clip_engine = match state.coordinator.ensure_search_engine().await {
+            Ok(engine) => engine,
+            Err(e) => {
+                error!("Failed to acquire CLIP search engine: {}", e);
+                return;
+            }
+        };
+
+        let clip_cache = match state.coordinator.ensure_clip_cache().await {
+            Ok(cache) => cache,
+            Err(e) => {
+                error!("Failed to acquire CLIP cache: {}", e);
+                return;
+            }
+        };
+
+        if let Ok(text_vector) = clip_engine.extract_text_embedding(&visual_prompt) {
+            let matches = clip_cache.search_by_vector(&text_vector, is_private, 0.24, 200).await;
             let matched_ids: Vec<String> = matches.into_iter().map(|(id, _)| id).collect();
 
             q.candidate_ids = Some(matched_ids);
-            
-            // Clear lexical fts query: visual concept search is handled by CLIP embeddings
             q.q = None;
         }
     } else {
-        // Only person names were in the search query, clear q.q so it only uses person_id filter
         q.q = None;
     }
 }

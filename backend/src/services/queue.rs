@@ -8,11 +8,11 @@ use tracing::{error, info};
 use crate::db::{AssetRepo, JobRepo};
 use crate::domain::job_repo::DbJob;
 use crate::domain::media::NewAssetRecord;
-use crate::services::clip_cache::{CachedEmbedding, ClipCacheManager};
-use crate::services::cluster_cache::SharedClusterCache;
+use crate::services::clip_cache::CachedEmbedding;
+use crate::services::engine_coordinator::EngineCoordinator;
 use crate::WsMediaEvent;
 
-use media_processing::{MediaEngine, ProcessedMediaResult};
+use media_processing::ProcessedMediaResult;
 
 pub type ProcessJob = DbJob;
 
@@ -32,15 +32,13 @@ impl QueueService {
     pub fn start_worker(
         pool: SqlitePool,
         thumbs_root: PathBuf,
-        media_engine: Arc<MediaEngine>,
-        cluster_cache: SharedClusterCache,
-        clip_cache: ClipCacheManager, // <-- Injected cache
+        coordinator: EngineCoordinator,
         concurrency: usize,
         notify: Arc<Notify>,
         tx_events: broadcast::Sender<WsMediaEvent>,
     ) {
         let semaphore = Arc::new(Semaphore::new(concurrency.max(1)));
-        info!(concurrency = concurrency, "Unified media queue worker active");
+        info!(concurrency = concurrency, "Unified media queue worker active (Idle-Evicting)");
 
         tokio::spawn(async move {
             let _ = JobRepo::reset_interrupted(&pool).await;
@@ -55,9 +53,7 @@ impl QueueService {
 
                         let pool = pool.clone();
                         let thumbs_root = thumbs_root.clone();
-                        let media_engine = media_engine.clone();
-                        let cluster_cache = cluster_cache.clone();
-                        let clip_cache = clip_cache.clone();
+                        let coordinator = coordinator.clone();
                         let tx_events = tx_events.clone();
 
                         tokio::spawn(async move {
@@ -65,7 +61,38 @@ impl QueueService {
                             let job_id = job.id.clone();
                             let asset_id = job.asset_id.clone();
 
-                            // 1. Read existing clusters from RAM
+                            // 1. Wake or acquire Tier 2 & Tier 3 resources on demand
+                            let media_engine = match coordinator.ensure_pipeline_engine().await {
+                                Ok(e) => e,
+                                Err(err) => {
+                                    error!("Failed to acquire MediaEngine for {}: {}", asset_id, err);
+                                    let _ = JobRepo::mark_failed(&pool, &job_id, &err).await;
+                                    return;
+                                }
+                            };
+
+                            let cluster_cache = match coordinator.ensure_cluster_cache().await {
+                                Ok(c) => c,
+                                Err(err) => {
+                                    error!("Failed to acquire ClusterCache for {}: {}", asset_id, err);
+                                    let _ = JobRepo::mark_failed(&pool, &job_id, &err).await;
+                                    return;
+                                }
+                            };
+
+                            let clip_cache = match coordinator.ensure_clip_cache().await {
+                                Ok(c) => c,
+                                Err(err) => {
+                                    error!("Failed to acquire ClipCache for {}: {}", asset_id, err);
+                                    let _ = JobRepo::mark_failed(&pool, &job_id, &err).await;
+                                    return;
+                                }
+                            };
+
+                            // Refresh the idle lease so resources do not evict mid-batch
+                            coordinator.keep_warm().await;
+
+                            // 2. Read existing clusters from RAM
                             let known_clusters = {
                                 let read_guard = cluster_cache.read().await;
                                 read_guard.clone()
@@ -75,7 +102,7 @@ impl QueueService {
                             let thumbs_dir = thumbs_root.clone();
                             let engine = media_engine.clone();
 
-                            // 2. Offload processing to CPU/ONNX via spawn_blocking
+                            // 3. Offload heavy CPU/ONNX inference via spawn_blocking
                             let process_res = tokio::task::spawn_blocking(move || {
                                 engine.process_asset_sync(
                                     &disk_path,
@@ -113,7 +140,7 @@ impl QueueService {
                                 }
                             };
 
-                            // 3. Atomically update in-memory face cache
+                            // 4. Update in-memory face cluster cache
                             if !processed.new_persons.is_empty() || !processed.updated_clusters.is_empty() {
                                 let mut write_guard = cluster_cache.write().await;
                                 for np in &processed.new_persons {
@@ -132,17 +159,16 @@ impl QueueService {
                                 }
                             }
 
-                            // Keep clone of embedding & metadata for in-memory CLIP cache
                             let clip_embedding = processed.clip_embedding.clone();
                             let mime_type = processed.mime_type.clone();
 
-                            // 4. Single database commit for asset, tags, and faces
+                            // 5. Atomic database transaction
                             match Self::commit_to_db(&pool, &job, processed).await {
                                 Ok(thumb_path) => {
                                     let _ = JobRepo::mark_completed(&pool, &job_id).await;
                                     info!(id = %job.asset_id, "Asset processed & indexed successfully");
 
-                                    // 5. Update in-memory CLIP cache
+                                    // 6. Update in-memory vector cache
                                     if let Some(embedding) = clip_embedding {
                                         clip_cache
                                             .insert(CachedEmbedding {
@@ -155,7 +181,6 @@ impl QueueService {
                                             .await;
                                     }
 
-                                    // Emit real-time completion event to frontends
                                     let _ = tx_events.send(WsMediaEvent {
                                         event_type: "asset_ready".to_string(),
                                         asset_id: job.asset_id.clone(),
