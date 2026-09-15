@@ -79,8 +79,17 @@
 
   function resolveThumbUrl(path: string): string {
     if (!path) return '';
-    if (path.startsWith('http') || path.startsWith('/thumbs/')) return path;
+    if (path.startsWith('http')) return path;
+
+    // Clean any leading slash first
     const clean = path.startsWith('/') ? path.slice(1) : path;
+
+    // If the path already has "users/", just add the root slash
+    if (clean.startsWith('users/')) {
+      return `/${clean}`;
+    }
+
+    // Legacy fallback if path is just "thumbs/..."
     return `/thumbs/${clean}`;
   }
 

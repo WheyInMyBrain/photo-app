@@ -1,9 +1,10 @@
 use crate::metadata::ExtractedMetadata;
+use crate::simd::EMBEDDING_DIM;
 
 #[derive(Clone, Debug)]
 pub struct KnownPersonCluster {
     pub person_id: String,
-    pub centroid: Vec<f32>,
+    pub centroid: [f32; EMBEDDING_DIM],
     pub face_count: i32,
     pub cover_face_id: Option<String>,
 }

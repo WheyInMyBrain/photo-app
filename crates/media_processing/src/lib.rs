@@ -9,6 +9,8 @@ pub mod models;
 pub mod storage;
 pub mod tag_engine;
 pub mod video_processor;
+pub mod clip_cache;
+pub mod simd;
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -20,6 +22,8 @@ pub use metadata::{ExtractedMetadata, MetadataService};
 pub use models::*;
 pub use storage::StorageService;
 pub use tag_engine::TagEngine;
+pub use simd::{dot_product_512, normalize_l2, EMBEDDING_DIM};
+pub use clip_cache::{ClipCacheManager, CachedEmbedding, VectorSearchResult};
 
 use clustering::FaceClusterer;
 

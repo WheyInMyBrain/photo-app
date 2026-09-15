@@ -6,6 +6,7 @@ use sqlx::{Row, SqlitePool};
 use uuid::Uuid;
 
 use super::face_engine::FaceEngine;
+use media_processing::{dot_product_512, normalize_l2, EMBEDDING_DIM};
 
 pub struct FacePipeline;
 
@@ -17,12 +18,12 @@ pub struct ExtractedFace {
     pub bbox_h: f32,
     pub detection_score: f32,
     pub avatar_rel_path: String,
-    pub embedding: Vec<f32>,
+    pub embedding: [f32; EMBEDDING_DIM],
 }
 
 struct ClusterCandidate {
     person_id: String,
-    centroid: Vec<f32>,
+    centroid: [f32; EMBEDDING_DIM],
     face_count: i32,
     cover_face_id: Option<String>,
 }
@@ -30,32 +31,6 @@ struct ClusterCandidate {
 impl FacePipeline {
     pub const MATCH_THRESHOLD: f32 = 0.40;
 
-    #[inline]
-    fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
-        if a.len() != 512 || b.len() != 512 {
-            return 0.0;
-        }
-        a.iter().zip(b.iter()).map(|(x, y)| x * y).sum()
-    }
-
-    fn crop_face_chip(img: &DynamicImage, x: f32, y: f32, w: f32, h: f32) -> DynamicImage {
-        let (img_w, img_h) = (img.width() as f32, img.height() as f32);
-        let bw = w * img_w;
-        let bh = h * img_h;
-
-        let cx = (x * img_w) + bw * 0.5;
-        let cy = (y * img_h) + bh * 0.43;
-
-        let side = (bw.max(bh) * 1.35).round();
-        let px = (cx - side * 0.5).round().max(0.0) as u32;
-        let py = (cy - side * 0.5).round().max(0.0) as u32;
-        let pw = (side as u32).min(img.width().saturating_sub(px)).max(1);
-        let ph = (side as u32).min(img.height().saturating_sub(py)).max(1);
-
-        img.crop_imm(px, py, pw, ph)
-    }
-
-    /// 1. Synchronous CPU/ONNX & File I/O — executed inside `spawn_blocking`
     pub fn detect_and_extract_faces_sync(
         engine: &FaceEngine,
         user_id: &str,
@@ -68,25 +43,35 @@ impl FacePipeline {
         }
 
         std::fs::create_dir_all(user_faces_dir)?;
-
         let mut results = Vec::with_capacity(detections.len());
 
         for det in detections {
             let face_id = Uuid::new_v4().to_string();
-            let chip = Self::crop_face_chip(img, det.x, det.y, det.w, det.h);
-
-            // Thumbnail encoding
-            let avatar = chip.resize_to_fill(128, 128, FilterType::Triangle);
             
-            // Standard relative path for DB & static router
+            let chip_view = media_processing::math::view_face_chip(img, det.x, det.y, det.w, det.h);
+            let chip_image = DynamicImage::ImageRgba8(image::imageops::crop_imm(
+                img,
+                chip_view.offsets().0,
+                chip_view.offsets().1,
+                chip_view.width(),
+                chip_view.height(),
+            ).to_image());
+
+            let avatar = image::imageops::resize(&chip_view, 128, 128, FilterType::Triangle);
             let avatar_rel_path = format!("users/{}/thumbs/faces/{}.webp", user_id, face_id);
             let avatar_abs_path = user_faces_dir.join(format!("{}.webp", face_id));
 
             let mut out = std::fs::File::create(&avatar_abs_path)?;
-            avatar.write_to(&mut out, ImageFormat::WebP)?;
+            DynamicImage::ImageRgba8(avatar).write_to(&mut out, ImageFormat::WebP)?;
 
-            // ONNX Feature Extraction
-            let embedding = engine.extract_embedding(&chip)?;
+            let raw_embedding = engine.extract_embedding(&chip_image)?;
+            if raw_embedding.len() != EMBEDDING_DIM {
+                continue;
+            }
+
+            let mut embedding = [0.0f32; EMBEDDING_DIM];
+            embedding.copy_from_slice(&raw_embedding);
+            normalize_l2(&mut embedding);
 
             results.push(ExtractedFace {
                 face_id,
@@ -103,7 +88,6 @@ impl FacePipeline {
         Ok(results)
     }
 
-    /// 2. Fast Async Database Clustering & Persistence (Strictly Scoped to `user_id`)
     pub async fn persist_faces(
         pool: &SqlitePool,
         user_id: &str,
@@ -122,24 +106,29 @@ impl FacePipeline {
             return Ok(0);
         }
 
-        // Fetch existing clusters ONLY for this user
         let rows = sqlx::query(
             "SELECT id, centroid_embedding, face_count, cover_face_id 
              FROM persons 
-             WHERE user_id = ?1"
+             WHERE user_id = ?1",
         )
         .bind(user_id)
         .fetch_all(&mut *tx)
         .await?;
 
+        let expected_bytes = EMBEDDING_DIM * std::mem::size_of::<f32>();
         let mut known_clusters: Vec<ClusterCandidate> = Vec::new();
+
         for row in rows {
             let blob: Vec<u8> = row.try_get("centroid_embedding")?;
-            if blob.len() == 2048 {
-                let centroid: &[f32] = bytemuck::cast_slice(&blob);
+            if blob.len() == expected_bytes {
+                let slice: &[f32] = bytemuck::cast_slice(&blob);
+                let mut centroid = [0.0f32; EMBEDDING_DIM];
+                centroid.copy_from_slice(slice);
+                normalize_l2(&mut centroid);
+
                 known_clusters.push(ClusterCandidate {
                     person_id: row.try_get("id")?,
-                    centroid: centroid.to_vec(),
+                    centroid,
                     face_count: row.try_get("face_count")?,
                     cover_face_id: row.try_get("cover_face_id")?,
                 });
@@ -159,7 +148,7 @@ impl FacePipeline {
                 if claimed_in_asset.contains(&cluster.person_id) {
                     continue;
                 }
-                let sim = Self::cosine_similarity(&face.embedding, &cluster.centroid);
+                let sim = dot_product_512(&face.embedding, &cluster.centroid);
                 if sim > highest_sim {
                     highest_sim = sim;
                     best_match_idx = Some(idx);
@@ -171,38 +160,38 @@ impl FacePipeline {
                 let cluster = &mut known_clusters[idx];
                 let pid = cluster.person_id.clone();
 
-                // Online Centroid Update
                 let n = cluster.face_count as f32;
-                let mut new_centroid = vec![0.0f32; 512];
-                for k in 0..512 {
+                let mut new_centroid = [0.0f32; EMBEDDING_DIM];
+                for k in 0..EMBEDDING_DIM {
                     new_centroid[k] = (cluster.centroid[k] * n) + face.embedding[k];
                 }
-                let norm: f32 = new_centroid.iter().map(|v| v * v).sum::<f32>().sqrt().max(1e-6);
-                for v in new_centroid.iter_mut() {
-                    *v /= norm;
-                }
+                normalize_l2(&mut new_centroid);
 
-                cluster.centroid = new_centroid.clone();
+                cluster.centroid = new_centroid;
                 cluster.face_count += 1;
 
                 let mut should_update_cover = false;
                 if let Some(ref current_cover_id) = cluster.cover_face_id {
-                    let cover_row = sqlx::query(
-                        "SELECT embedding FROM asset_faces WHERE id = ?1"
-                    )
-                    .bind(current_cover_id)
-                    .fetch_optional(&mut *tx)
-                    .await?;
+                    let cover_row = sqlx::query("SELECT embedding FROM asset_faces WHERE id = ?1")
+                        .bind(current_cover_id)
+                        .fetch_optional(&mut *tx)
+                        .await?;
 
                     if let Some(cr) = cover_row {
                         let cur_blob: Vec<u8> = cr.try_get("embedding")?;
-                        let cur_slice: &[f32] = bytemuck::cast_slice(&cur_blob);
-                        let cur_sim = Self::cosine_similarity(cur_slice, &cluster.centroid);
-                        let new_sim = Self::cosine_similarity(&face.embedding, &cluster.centroid);
+                        if cur_blob.len() == expected_bytes {
+                            let cur_slice: &[f32] = bytemuck::cast_slice(&cur_blob);
+                            let mut cur_arr = [0.0f32; EMBEDDING_DIM];
+                            cur_arr.copy_from_slice(cur_slice);
+                            normalize_l2(&mut cur_arr);
 
-                        if new_sim > cur_sim {
-                            should_update_cover = true;
-                            cluster.cover_face_id = Some(face.face_id.clone());
+                            let cur_sim = dot_product_512(&cur_arr, &cluster.centroid);
+                            let new_sim = dot_product_512(&face.embedding, &cluster.centroid);
+
+                            if new_sim > cur_sim {
+                                should_update_cover = true;
+                                cluster.cover_face_id = Some(face.face_id.clone());
+                            }
                         }
                     }
                 } else {
@@ -218,7 +207,7 @@ impl FacePipeline {
                         UPDATE persons 
                         SET centroid_embedding = ?1, face_count = ?2, cover_face_id = ?3, updated_at = CURRENT_TIMESTAMP
                         WHERE id = ?4 AND user_id = ?5
-                        "#
+                        "#,
                     )
                     .bind(new_centroid_bytes)
                     .bind(cluster.face_count)
@@ -233,7 +222,7 @@ impl FacePipeline {
                         UPDATE persons 
                         SET centroid_embedding = ?1, face_count = ?2, updated_at = CURRENT_TIMESTAMP
                         WHERE id = ?3 AND user_id = ?4
-                        "#
+                        "#,
                     )
                     .bind(new_centroid_bytes)
                     .bind(cluster.face_count)
@@ -251,7 +240,7 @@ impl FacePipeline {
                     r#"
                     INSERT INTO persons (id, user_id, name, cover_face_id, face_count, centroid_embedding)
                     VALUES (?1, ?2, NULL, ?3, 1, ?4)
-                    "#
+                    "#,
                 )
                 .bind(&new_pid)
                 .bind(user_id)
@@ -262,7 +251,7 @@ impl FacePipeline {
 
                 known_clusters.push(ClusterCandidate {
                     person_id: new_pid.clone(),
-                    centroid: face.embedding.clone(),
+                    centroid: face.embedding,
                     face_count: 1,
                     cover_face_id: Some(face.face_id.clone()),
                 });
@@ -279,7 +268,7 @@ impl FacePipeline {
                     detection_score, face_thumb_path, embedding, is_verified
                 )
                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 0)
-                "#
+                "#,
             )
             .bind(&face.face_id)
             .bind(asset_id)

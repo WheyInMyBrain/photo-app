@@ -27,7 +27,7 @@ pub async fn list_media(
         ));
     }
 
-    // Resolve Hybrid Search (person names + CLIP text search scoped to user)
+    // Resolve Hybrid Search (person names + SIMD CLIP text search scoped to user)
     resolve_hybrid_query(&state, &auth_user.id, &mut params).await;
 
     let page = AssetRepo::query_media(&state.db, &auth_user.id, &params)
@@ -63,7 +63,6 @@ pub async fn stream_asset(
     AxumPath(asset_id): AxumPath<String>,
     req: Request,
 ) -> Result<Response, AppError> {
-    // Only fetch storage info if owned by this user
     let info = AssetRepo::get_storage_info(&state.db, &auth_user.id, &asset_id)
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?
@@ -78,12 +77,8 @@ pub async fn stream_asset(
             .join("originals")
             .join(&info.rel_path)
     } else {
-        // preview_path is: "<user_id>/thumbs/<shard>/<id>_preview.webp"
-        let preview = state
-            .config
-            .storage_root
-            .join("users")
-            .join(&info.preview_path);
+        // info.preview_path is stored as "users/<user_id>/thumbs/<shard>/<id>_preview.webp"
+        let preview = state.config.storage_root.join(&info.preview_path);
 
         if preview.exists() {
             preview
@@ -170,6 +165,11 @@ pub async fn hard_delete_asset(
         return Err(AppError::NotFound(format!("Asset {} not found", id)));
     }
 
+    // Also remove from in-memory SIMD cache if present
+    if let Ok(clip_cache) = state.coordinator.ensure_clip_cache().await {
+        clip_cache.remove(&auth_user.id, &id).await;
+    }
+
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -204,6 +204,13 @@ pub async fn batch_purge_assets(
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?;
 
+    // Evict all purged items from SIMD vector cache
+    if let Ok(clip_cache) = state.coordinator.ensure_clip_cache().await {
+        for id in &payload.ids {
+            clip_cache.remove(&auth_user.id, id).await;
+        }
+    }
+
     Ok(Json(BatchActionResponse { affected_count }))
 }
 
@@ -219,9 +226,23 @@ pub async fn get_similar_assets(
         .await
         .map_err(AppError::Internal)?;
 
-    // find_similar filtered by user_id
-    let similar = clip_cache.find_similar_for_user(&auth_user.id, &id, 0.55, 12).await;
-    Ok(Json(similar))
+    // Hardware SIMD search via media_processing crate
+    let search_results = clip_cache
+        .find_similar_for_user(&auth_user.id, &id, 0.55, 12)
+        .await;
+
+    // Zero-overhead field projection into API model
+    let response: Vec<SimilarMediaItem> = search_results
+        .into_iter()
+        .map(|item| SimilarMediaItem {
+            id: item.id,
+            thumb_path: item.thumb_path,
+            mime_type: item.mime_type,
+            similarity: item.similarity,
+        })
+        .collect();
+
+    Ok(Json(response))
 }
 
 async fn resolve_hybrid_query(state: &AppState, user_id: &str, q: &mut MediaQuery) {
@@ -232,7 +253,7 @@ async fn resolve_hybrid_query(state: &AppState, user_id: &str, q: &mut MediaQuer
 
     let mut words: Vec<String> = raw_q.split_whitespace().map(String::from).collect();
 
-    // 1. Check named persons belonging exclusively to this user
+    // 1. Resolve matching person identities for this user
     let named_persons: Vec<(String, String)> = sqlx::query_as(
         "SELECT id, name FROM persons WHERE user_id = ? AND name IS NOT NULL"
     )
@@ -255,7 +276,7 @@ async fn resolve_hybrid_query(state: &AppState, user_id: &str, q: &mut MediaQuer
 
     let visual_prompt = words.join(" ");
 
-    // 2. If visual search tokens remain, extract text embedding and search the user's vectors
+    // 2. Run hardware SIMD search if tokens remain
     if !visual_prompt.is_empty() {
         let clip_engine = match state.coordinator.ensure_search_engine().await {
             Ok(engine) => engine,

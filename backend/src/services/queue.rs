@@ -1,14 +1,13 @@
-use sqlx::{Row, SqlitePool};
+use sqlx::{QueryBuilder, Row, Sqlite, SqlitePool};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{broadcast, Notify, Semaphore};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 use crate::db::{AssetRepo, JobRepo};
 use crate::domain::job_repo::DbJob;
 use crate::domain::media::NewAssetRecord;
-use crate::services::clip_cache::CachedEmbedding;
 use crate::services::engine_coordinator::EngineCoordinator;
 use crate::WsMediaEvent;
 
@@ -66,8 +65,9 @@ impl QueueService {
                             let media_engine = match coordinator.ensure_pipeline_engine().await {
                                 Ok(e) => e,
                                 Err(err) => {
-                                    error!("Failed to acquire MediaEngine for {}: {}", asset_id, err);
-                                    let _ = JobRepo::mark_failed(&pool, &job_id, &err).await;
+                                    let err_msg = err.to_string();
+                                    error!("Failed to acquire MediaEngine for {}: {}", asset_id, err_msg);
+                                    let _ = JobRepo::mark_failed(&pool, &job_id, &err_msg).await;
                                     return;
                                 }
                             };
@@ -75,8 +75,9 @@ impl QueueService {
                             let cluster_cache = match coordinator.ensure_cluster_cache().await {
                                 Ok(c) => c,
                                 Err(err) => {
-                                    error!("Failed to acquire ClusterCache for {}: {}", asset_id, err);
-                                    let _ = JobRepo::mark_failed(&pool, &job_id, &err).await;
+                                    let err_msg = err.to_string();
+                                    error!("Failed to acquire ClusterCache for {}: {}", asset_id, err_msg);
+                                    let _ = JobRepo::mark_failed(&pool, &job_id, &err_msg).await;
                                     return;
                                 }
                             };
@@ -84,8 +85,9 @@ impl QueueService {
                             let clip_cache = match coordinator.ensure_clip_cache().await {
                                 Ok(c) => c,
                                 Err(err) => {
-                                    error!("Failed to acquire ClipCache for {}: {}", asset_id, err);
-                                    let _ = JobRepo::mark_failed(&pool, &job_id, &err).await;
+                                    let err_msg = err.to_string();
+                                    error!("Failed to acquire ClipCache for {}: {}", asset_id, err_msg);
+                                    let _ = JobRepo::mark_failed(&pool, &job_id, &err_msg).await;
                                     return;
                                 }
                             };
@@ -158,17 +160,25 @@ impl QueueService {
                                 let user_bucket = write_guard.entry(user_id.clone()).or_default();
 
                                 for np in &processed.new_persons {
-                                    user_bucket.push(media_processing::KnownPersonCluster {
-                                        person_id: np.person_id.clone(),
-                                        centroid: np.centroid.clone(),
-                                        face_count: 1,
-                                        cover_face_id: Some(np.cover_face_id.clone()),
-                                    });
+                                    if np.centroid.len() == media_processing::EMBEDDING_DIM {
+                                        let mut centroid_arr = [0.0f32; media_processing::EMBEDDING_DIM];
+                                        centroid_arr.copy_from_slice(&np.centroid);
+
+                                        user_bucket.push(media_processing::KnownPersonCluster {
+                                            person_id: np.person_id.clone(),
+                                            centroid: centroid_arr,
+                                            face_count: 1,
+                                            cover_face_id: Some(np.cover_face_id.clone()),
+                                        });
+                                    }
                                 }
+
                                 for uc in &processed.updated_clusters {
-                                    if let Some(c) = user_bucket.iter_mut().find(|c| c.person_id == uc.person_id) {
-                                        c.centroid = uc.new_centroid.clone();
-                                        c.face_count = uc.new_face_count;
+                                    if uc.new_centroid.len() == media_processing::EMBEDDING_DIM {
+                                        if let Some(c) = user_bucket.iter_mut().find(|c| c.person_id == uc.person_id) {
+                                            c.centroid.copy_from_slice(&uc.new_centroid);
+                                            c.face_count = uc.new_face_count;
+                                        }
                                     }
                                 }
                             }
@@ -182,17 +192,29 @@ impl QueueService {
                                     let _ = JobRepo::mark_completed(&pool, &job_id).await;
                                     info!(id = %job.asset_id, user_id = %job.user_id, "Asset processed & indexed successfully");
 
-                                    // 6. Update in-memory vector cache
-                                    if let Some(embedding) = clip_embedding {
-                                        clip_cache
-                                            .insert(CachedEmbedding {
-                                                id: job.asset_id.clone(),
-                                                user_id: job.user_id.clone(),
-                                                thumb_path: thumb_path.clone(),
-                                                mime_type,
-                                                embedding,
-                                            })
-                                            .await;
+                                    // 6. Convert Vec<f32> to [f32; 512] and update SIMD cache
+                                    if let Some(embedding_vec) = clip_embedding {
+                                        if embedding_vec.len() == media_processing::EMBEDDING_DIM {
+                                            let mut emb_array = [0.0f32; media_processing::EMBEDDING_DIM];
+                                            emb_array.copy_from_slice(&embedding_vec);
+
+                                            clip_cache
+                                                .insert(media_processing::CachedEmbedding {
+                                                    id: job.asset_id.clone(),
+                                                    user_id: job.user_id.clone(),
+                                                    thumb_path: thumb_path.clone(),
+                                                    mime_type,
+                                                    embedding: emb_array,
+                                                })
+                                                .await;
+                                        } else {
+                                            warn!(
+                                                "Embedding dimension mismatch for {}: expected {}, got {}",
+                                                job.asset_id,
+                                                media_processing::EMBEDDING_DIM,
+                                                embedding_vec.len()
+                                            );
+                                        }
                                     }
 
                                     let _ = tx_events.send(WsMediaEvent {
@@ -235,7 +257,6 @@ impl QueueService {
     ) -> Result<String, String> {
         let mut tx = pool.begin().await.map_err(|e| e.to_string())?;
 
-        // Format stored path: users/<user_id>/thumbs/<shard>/<file>
         let db_thumb_path = format!("users/{}/thumbs/{}", job.user_id, res.thumb_path);
         let db_preview_path = format!("users/{}/thumbs/{}", job.user_id, res.preview_path);
 
@@ -243,8 +264,6 @@ impl QueueService {
             .clip_embedding
             .as_ref()
             .map(|emb| bytemuck::cast_slice(emb.as_slice()).to_vec());
-
-        let has_clip = clip_embedding_bytes.is_some();
 
         let record = NewAssetRecord {
             id: job.asset_id.clone(),
@@ -282,29 +301,42 @@ impl QueueService {
             .await
             .map_err(|e| e.to_string())?;
 
-        // 1. Insert new persons scoped strictly to user_id
-        for np in res.new_persons {
-            let embedding_bytes: &[u8] = bytemuck::cast_slice(&np.centroid);
-            sqlx::query(
-                "INSERT INTO persons (id, user_id, name, cover_face_id, face_count, centroid_embedding)
-                 VALUES (?1, ?2, NULL, ?3, 1, ?4)",
-            )
-            .bind(&np.person_id)
-            .bind(&job.user_id)
-            .bind(&np.cover_face_id)
-            .bind(embedding_bytes)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| e.to_string())?;
+        // 1. Batch insert new persons with cover_face_id = NULL to satisfy foreign keys
+        let new_covers: Vec<(String, String)> = res
+            .new_persons
+            .iter()
+            .filter(|np| !np.cover_face_id.is_empty())
+            .map(|np| (np.person_id.clone(), np.cover_face_id.clone()))
+            .collect();
+
+        if !res.new_persons.is_empty() {
+            let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new(
+                "INSERT INTO persons (id, user_id, name, cover_face_id, face_count, centroid_embedding) ",
+            );
+
+            qb.push_values(res.new_persons, |mut b, np| {
+                let embedding_bytes: &[u8] = bytemuck::cast_slice(&np.centroid);
+                b.push_bind(np.person_id)
+                    .push_bind(&job.user_id)
+                    .push_bind(None::<String>) // name is NULL initially
+                    .push_bind(None::<String>) // cover_face_id is NULL initially!
+                    .push_bind(1i32)
+                    .push_bind(embedding_bytes);
+            });
+
+            qb.build()
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| e.to_string())?;
         }
 
-        // 2. Update cluster centroids scoped strictly to user_id
+        // 2. Update existing cluster centroids
         for uc in res.updated_clusters {
             let embedding_bytes: &[u8] = bytemuck::cast_slice(&uc.new_centroid);
             sqlx::query(
                 "UPDATE persons 
-                 SET centroid_embedding = ?1, face_count = ?2, updated_at = CURRENT_TIMESTAMP
-                 WHERE id = ?3 AND user_id = ?4",
+                SET centroid_embedding = ?1, face_count = ?2, updated_at = CURRENT_TIMESTAMP
+                WHERE id = ?3 AND user_id = ?4",
             )
             .bind(embedding_bytes)
             .bind(uc.new_face_count)
@@ -315,90 +347,128 @@ impl QueueService {
             .map_err(|e| e.to_string())?;
         }
 
-        // 3. Insert detected faces for this asset (scoped face thumbnails)
-        for face in res.detected_faces {
-            let embedding_bytes: &[u8] = bytemuck::cast_slice(&face.embedding);
-            let face_thumb_db_path = format!("users/{}/thumbs/{}", job.user_id, face.face_thumb_rel_path);
-
-            sqlx::query(
+        // 3. Batch insert detected faces (now both asset_id and person_id exist!)
+        if !res.detected_faces.is_empty() {
+            let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new(
                 "INSERT INTO asset_faces (
                     id, asset_id, person_id, bbox_x, bbox_y, bbox_w, bbox_h,
                     detection_score, face_thumb_path, embedding, is_verified
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 0)",
+                ) ",
+            );
+
+            qb.push_values(res.detected_faces, |mut b, face| {
+                let embedding_bytes: &[u8] = bytemuck::cast_slice(&face.embedding);
+                let face_thumb_db_path = format!("users/{}/thumbs/{}", job.user_id, face.face_thumb_rel_path);
+
+                b.push_bind(face.face_id)
+                    .push_bind(&job.asset_id)
+                    .push_bind(face.person_id)
+                    .push_bind(face.bbox_x)
+                    .push_bind(face.bbox_y)
+                    .push_bind(face.bbox_w)
+                    .push_bind(face.bbox_h)
+                    .push_bind(face.score)
+                    .push_bind(face_thumb_db_path)
+                    .push_bind(embedding_bytes)
+                    .push_bind(0i32);
+            });
+
+            qb.build()
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| e.to_string())?;
+        }
+
+        // 3b. Backfill cover_face_id for new persons now that asset_faces exist
+        for (person_id, cover_face_id) in new_covers {
+            sqlx::query(
+                "UPDATE persons SET cover_face_id = ?1 WHERE id = ?2 AND user_id = ?3",
             )
-            .bind(&face.face_id)
-            .bind(&job.asset_id)
-            .bind(&face.person_id)
-            .bind(face.bbox_x)
-            .bind(face.bbox_y)
-            .bind(face.bbox_w)
-            .bind(face.bbox_h)
-            .bind(face.score)
-            .bind(&face_thumb_db_path)
-            .bind(embedding_bytes)
+            .bind(cover_face_id)
+            .bind(person_id)
+            .bind(&job.user_id)
             .execute(&mut *tx)
             .await
             .map_err(|e| e.to_string())?;
         }
 
-        // 4. Insert or fetch tags scoped strictly to user's personal tag dictionary
-        for tag in res.tags {
-            let tag_id: i64 = match sqlx::query(
-                "SELECT id FROM tags WHERE user_id = ?1 AND name = ?2 COLLATE NOCASE",
-            )
-            .bind(&job.user_id)
-            .bind(&tag.name)
-            .fetch_optional(&mut *tx)
-            .await
-            .map_err(|e| e.to_string())?
-            {
-                Some(row) => row.try_get("id").map_err(|e| e.to_string())?,
-                None => {
-                    let r = sqlx::query(
-                        "INSERT INTO tags (user_id, name, source) VALUES (?1, ?2, 'model')",
-                    )
-                    .bind(&job.user_id)
-                    .bind(&tag.name)
+        // 4. Batch insert/link tags
+        if !res.tags.is_empty() {
+            let mut tag_qb: QueryBuilder<Sqlite> =
+                QueryBuilder::new("INSERT INTO tags (user_id, name, source) ");
+
+            tag_qb.push_values(&res.tags, |mut b, tag| {
+                b.push_bind(&job.user_id)
+                    .push_bind(&tag.name)
+                    .push_bind("model");
+            });
+            tag_qb.push(" ON CONFLICT(user_id, name) DO NOTHING");
+
+            tag_qb
+                .build()
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| e.to_string())?;
+
+            let mut fetch_qb: QueryBuilder<Sqlite> =
+                QueryBuilder::new("SELECT id, name FROM tags WHERE user_id = ");
+            fetch_qb.push_bind(&job.user_id);
+            fetch_qb.push(" AND name IN (");
+
+            let mut separated = fetch_qb.separated(", ");
+            for tag in &res.tags {
+                separated.push_bind(&tag.name);
+            }
+            separated.push_unseparated(")");
+
+            let tag_rows = fetch_qb
+                .build()
+                .fetch_all(&mut *tx)
+                .await
+                .map_err(|e| e.to_string())?;
+
+            let tag_map: std::collections::HashMap<String, i64> = tag_rows
+                .into_iter()
+                .filter_map(|r| {
+                    let id: i64 = r.try_get("id").ok()?;
+                    let name: String = r.try_get("name").ok()?;
+                    Some((name.to_lowercase(), id))
+                })
+                .collect();
+
+            let valid_tags: Vec<(i64, f64)> = res
+                .tags
+                .iter()
+                .filter_map(|t| {
+                    tag_map
+                        .get(&t.name.to_lowercase())
+                        .map(|&id| (id, t.confidence as f64))
+                })
+                .collect();
+
+            if !valid_tags.is_empty() {
+                let mut link_qb: QueryBuilder<Sqlite> = QueryBuilder::new(
+                    "INSERT INTO asset_tags (asset_id, tag_id, confidence, source) ",
+                );
+
+                link_qb.push_values(valid_tags, |mut b, (tag_id, conf)| {
+                    b.push_bind(&job.asset_id)
+                        .push_bind(tag_id)
+                        .push_bind(conf)
+                        .push_bind("AI");
+                });
+
+                link_qb.push(" ON CONFLICT(asset_id, tag_id) DO UPDATE SET confidence = excluded.confidence");
+
+                link_qb
+                    .build()
                     .execute(&mut *tx)
                     .await
                     .map_err(|e| e.to_string())?;
-                    r.last_insert_rowid()
-                }
-            };
-
-            sqlx::query(
-                "INSERT INTO asset_tags (asset_id, tag_id, confidence, source)
-                 VALUES (?1, ?2, ?3, 'AI')
-                 ON CONFLICT(asset_id, tag_id) DO UPDATE SET confidence = excluded.confidence",
-            )
-            .bind(&job.asset_id)
-            .bind(tag_id)
-            .bind(tag.confidence as f64)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| e.to_string())?;
+            }
         }
 
-        // 5. Update pipeline completion flags
-        sqlx::query(
-            "UPDATE assets 
-             SET face_processed = 1, 
-                 tags_processed = 1,
-                 clip_processed = ?1 
-             WHERE id = ?2 AND user_id = ?3",
-        )
-        .bind(if has_clip { 1 } else { 0 })
-        .bind(&job.asset_id)
-        .bind(&job.user_id)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| e.to_string())?;
-
         tx.commit().await.map_err(|e| e.to_string())?;
-
-        // 6. Sync FTS search index with user_id attached
-        let _ = AssetRepo::sync_search_index(pool, &job.user_id, &job.asset_id).await;
-
         Ok(db_thumb_path)
     }
 }

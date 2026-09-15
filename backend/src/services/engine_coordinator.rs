@@ -5,10 +5,10 @@ use sqlx::SqlitePool;
 use tokio::sync::{Mutex, RwLock};
 use tracing::info;
 
-use crate::services::clip_cache::ClipCacheManager;
+use crate::services::clip_cache::load_clip_cache;
 use crate::services::cluster_cache::{ClusterCacheManager, SharedClusterCache};
 
-use media_processing::{ClipEngine, FaceEngine, MediaEngine, TagEngine};
+use media_processing::{ClipCacheManager, ClipEngine, FaceEngine, MediaEngine, TagEngine};
 
 /// Generic container that manages a resource's lazy loading and idle eviction.
 struct ManagedResource<T> {
@@ -238,15 +238,18 @@ impl EngineCoordinator {
     // -------------------------------------------------------------------------
 
     /// Ensures the CLIP vector embedding cache is ready in RAM (for similarity lookups)
-    pub async fn ensure_clip_cache(&self) -> Result<Arc<ClipCacheManager>, String> {
+    pub async fn ensure_clip_cache(&self) -> Result<ClipCacheManager, String> {
         let pool = self.pool.clone();
-        self.clip_cache
+        let arc_cache = self
+            .clip_cache
             .get_or_load(|| async move {
-                ClipCacheManager::load_initial(&pool)
+                load_clip_cache(&pool)
                     .await
                     .map_err(|e| e.to_string())
             })
-            .await
+            .await?;
+
+        Ok((*arc_cache).clone())
     }
 
     /// Ensures the Face Cluster centroids are ready in RAM
@@ -261,7 +264,7 @@ impl EngineCoordinator {
             })
             .await?;
 
-        // SharedClusterCache is already Arc<RwLock<Vec<KnownPersonCluster>>>
+        // SharedClusterCache is already Arc<RwLock<HashMap<String, Vec<KnownPersonCluster>>>>
         Ok((*arc_shared).clone())
     }
 

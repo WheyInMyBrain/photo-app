@@ -1,6 +1,9 @@
 use crate::face_engine::FaceEngine;
-use crate::math::{cosine_similarity, crop_face_chip, update_centroid};
-use crate::models::{ClusteredFacesResult, KnownPersonCluster, NewFaceRecord, NewPersonRecord, ClusterUpdate};
+use crate::math::compute_face_chip_bounds;
+use crate::models::{
+    ClusterUpdate, ClusteredFacesResult, KnownPersonCluster, NewFaceRecord, NewPersonRecord,
+};
+use crate::simd::{dot_product_512, normalize_l2, EMBEDDING_DIM};
 use image::{imageops::FilterType, DynamicImage, ImageFormat};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -9,7 +12,6 @@ use uuid::Uuid;
 pub struct FaceClusterer;
 
 impl FaceClusterer {
-    /// Clusters faces from a single photo
     pub fn cluster_single_image(
         img: &DynamicImage,
         face_engine: &FaceEngine,
@@ -21,7 +23,6 @@ impl FaceClusterer {
             _ => return Ok(ClusteredFacesResult::default()),
         };
 
-        // Absolute target: storage_root/users/<user_id>/thumbs/faces/
         let faces_dir = thumbs_root.join("faces");
         std::fs::create_dir_all(&faces_dir)?;
 
@@ -31,14 +32,24 @@ impl FaceClusterer {
         let mut new_persons = Vec::new();
 
         for det in detections {
-            let chip = crop_face_chip(img, det.x, det.y, det.w, det.h);
-            let embedding = match face_engine.extract_embedding(&chip) {
-                Ok(emb) => emb,
-                Err(_) => continue,
+            let bounds = compute_face_chip_bounds(img.width(), img.height(), det.x, det.y, det.w, det.h);
+
+            // Single cropped buffer extraction directly from the immutable image view
+            let chip_image = DynamicImage::ImageRgba8(
+                image::imageops::crop_imm(img, bounds.px, bounds.py, bounds.pw, bounds.ph).to_image(),
+            );
+
+            let embedding_vec = match face_engine.extract_embedding(&chip_image) {
+                Ok(emb) if emb.len() == EMBEDDING_DIM => emb,
+                _ => continue,
             };
 
+            let mut normalized_emb = [0.0f32; EMBEDDING_DIM];
+            normalized_emb.copy_from_slice(&embedding_vec);
+            normalize_l2(&mut normalized_emb);
+
             let (target_pid, is_new) = Self::find_or_create_match(
-                &embedding,
+                &normalized_emb,
                 &mut existing_clusters,
                 &claimed_persons,
                 &mut updated_clusters,
@@ -46,7 +57,7 @@ impl FaceClusterer {
             );
 
             let face_id = Uuid::new_v4().to_string();
-            let avatar_rel = Self::save_face_thumb(&chip, &faces_dir, &face_id)?;
+            let avatar_rel = Self::save_face_thumb(&chip_image, &faces_dir, &face_id)?;
 
             if is_new {
                 if let Some(np) = new_persons.iter_mut().find(|p| p.person_id == target_pid) {
@@ -64,7 +75,7 @@ impl FaceClusterer {
                 bbox_h: det.h,
                 score: det.score,
                 face_thumb_rel_path: avatar_rel,
-                embedding,
+                embedding: embedding_vec,
             });
         }
 
@@ -75,7 +86,6 @@ impl FaceClusterer {
         })
     }
 
-    /// Clusters faces sampled across video frames with intra-video deduplication
     pub fn cluster_video_frames(
         frames: &[DynamicImage],
         face_engine: &FaceEngine,
@@ -100,15 +110,24 @@ impl FaceClusterer {
             };
 
             for det in detections {
-                let chip = crop_face_chip(frame, det.x, det.y, det.w, det.h);
-                let embedding = match face_engine.extract_embedding(&chip) {
-                    Ok(emb) => emb,
-                    Err(_) => continue,
+                let bounds = compute_face_chip_bounds(frame.width(), frame.height(), det.x, det.y, det.w, det.h);
+
+                let chip_image = DynamicImage::ImageRgba8(
+                    image::imageops::crop_imm(frame, bounds.px, bounds.py, bounds.pw, bounds.ph).to_image(),
+                );
+
+                let embedding_vec = match face_engine.extract_embedding(&chip_image) {
+                    Ok(emb) if emb.len() == EMBEDDING_DIM => emb,
+                    _ => continue,
                 };
+
+                let mut normalized_emb = [0.0f32; EMBEDDING_DIM];
+                normalized_emb.copy_from_slice(&embedding_vec);
+                normalize_l2(&mut normalized_emb);
 
                 let empty_claimed = HashSet::new();
                 let (target_pid, _) = Self::find_or_create_match(
-                    &embedding,
+                    &normalized_emb,
                     &mut existing_clusters,
                     &empty_claimed,
                     &mut updated_clusters,
@@ -122,7 +141,7 @@ impl FaceClusterer {
 
                 if is_better {
                     let face_id = Uuid::new_v4().to_string();
-                    let avatar_rel = Self::save_face_thumb(&chip, &faces_dir, &face_id)?;
+                    let avatar_rel = Self::save_face_thumb(&chip_image, &faces_dir, &face_id)?;
 
                     if let Some(np) = new_persons.iter_mut().find(|p| p.person_id == target_pid) {
                         np.cover_face_id = face_id.clone();
@@ -139,7 +158,7 @@ impl FaceClusterer {
                             bbox_h: det.h,
                             score: det.score,
                             face_thumb_rel_path: avatar_rel,
-                            embedding,
+                            embedding: embedding_vec,
                         },
                     );
                 }
@@ -154,18 +173,20 @@ impl FaceClusterer {
     }
 
     fn find_or_create_match(
-        embedding: &[f32],
+        normalized_embedding: &[f32; EMBEDDING_DIM],
         existing_clusters: &mut Vec<KnownPersonCluster>,
         claimed_persons: &HashSet<String>,
         updated_clusters: &mut Vec<ClusterUpdate>,
         new_persons: &mut Vec<NewPersonRecord>,
     ) -> (String, bool) {
         let mut best_match: Option<(usize, f32)> = None;
+
         for (idx, cluster) in existing_clusters.iter().enumerate() {
             if claimed_persons.contains(&cluster.person_id) {
                 continue;
             }
-            let sim = cosine_similarity(embedding, &cluster.centroid);
+
+            let sim = dot_product_512(normalized_embedding, &cluster.centroid);
             if sim > best_match.map(|(_, s)| s).unwrap_or(-1.0) {
                 best_match = Some((idx, sim));
             }
@@ -176,13 +197,19 @@ impl FaceClusterer {
                 let cluster = &mut existing_clusters[idx];
                 let pid = cluster.person_id.clone();
 
-                let new_centroid = update_centroid(&cluster.centroid, cluster.face_count, embedding);
-                cluster.centroid = new_centroid.clone();
+                let n = cluster.face_count as f32;
+                let mut new_centroid = [0.0f32; EMBEDDING_DIM];
+                for k in 0..EMBEDDING_DIM {
+                    new_centroid[k] = (cluster.centroid[k] * n) + normalized_embedding[k];
+                }
+                normalize_l2(&mut new_centroid);
+
+                cluster.centroid = new_centroid;
                 cluster.face_count += 1;
 
                 updated_clusters.push(ClusterUpdate {
                     person_id: pid.clone(),
-                    new_centroid,
+                    new_centroid: new_centroid.to_vec(),
                     new_face_count: cluster.face_count,
                     new_cover_face_id: None,
                 });
@@ -191,11 +218,10 @@ impl FaceClusterer {
             }
         }
 
-        // Under threshold -> New Person
         let new_pid = Uuid::new_v4().to_string();
         existing_clusters.push(KnownPersonCluster {
             person_id: new_pid.clone(),
-            centroid: embedding.to_vec(),
+            centroid: *normalized_embedding,
             face_count: 1,
             cover_face_id: None,
         });
@@ -203,26 +229,25 @@ impl FaceClusterer {
         new_persons.push(NewPersonRecord {
             person_id: new_pid.clone(),
             cover_face_id: String::new(),
-            centroid: embedding.to_vec(),
+            centroid: normalized_embedding.to_vec(),
         });
 
         (new_pid, true)
     }
 
     fn save_face_thumb(
-        chip: &DynamicImage,
+        chip_image: &DynamicImage,
         faces_dir: &Path,
         face_id: &str,
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-        let avatar = chip.resize_to_fill(128, 128, FilterType::Triangle);
         let avatar_filename = format!("{}.webp", face_id);
         let avatar_abs = faces_dir.join(&avatar_filename);
 
-        if let Ok(mut out) = std::fs::File::create(&avatar_abs) {
-            let _ = avatar.write_to(&mut out, ImageFormat::WebP);
-        }
+        let avatar = chip_image.resize_to_fill(128, 128, FilterType::Triangle);
 
-        // Returns "faces/<face_id>.webp" (QueueService prefixes users/<user_id>/thumbs/)
+        let mut out = std::fs::File::create(&avatar_abs)?;
+        avatar.write_to(&mut out, ImageFormat::WebP)?;
+
         Ok(format!("faces/{}", avatar_filename))
     }
 }
