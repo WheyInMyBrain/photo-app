@@ -6,7 +6,7 @@ use axum::{
 use sha2::{Digest, Sha256};
 use std::path::Path;
 use std::io::SeekFrom;
-use tokio::fs::{self, create_dir_all, File, OpenOptions};
+use tokio::fs::{self, create_dir_all, File, OpenOptions, metadata};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use uuid::Uuid;
 
@@ -225,7 +225,7 @@ pub async fn upload_photo(
     Query(query): Query<RawUploadQuery>,
     mut multipart: Multipart,
 ) -> Result<Json<BatchUploadReceipt>, AppError> {
-    // 1. Initialize from URL query parameter (?folder=weapons), fallback to "root"
+    // 1. Initialize from URL query parameter fallback to "root"
     let mut raw_folder = query
         .folder
         .filter(|s| !s.trim().is_empty())
@@ -418,7 +418,20 @@ pub async fn inspect_link(
                 media_downloader::MediaType::Image => "image".to_string(),
             };
 
-            let ext = if media_type_str == "video" { "mp4" } else { "jpg" };
+            // Detect actual extension (handles animated GIFs and WebP links)
+            let lower_url = item.high_res_url.to_lowercase();
+            let ext = if media_type_str == "video" {
+                "mp4"
+            } else if lower_url.contains(".gif") {
+                "gif"
+            } else if lower_url.contains(".webp") {
+                "webp"
+            } else if lower_url.contains(".png") {
+                "png"
+            } else {
+                "jpg"
+            };
+
             let suggested_filename = if total > 1 {
                 format!("{prefix}_{}.{ext}", idx + 1)
             } else {
@@ -437,11 +450,14 @@ pub async fn inspect_link(
         })
         .collect();
 
+    let clean_author = StorageService::sanitize_folder_path(&meta.author);
+    let target_folder = format!("{}/{}", meta.platform, clean_author);
+
     // Single item downloads and enqueues immediately
     if total == 1 {
         let commit_req = CommitLinkRequest {
             platform: meta.platform.clone(),
-            folder: Some(format!("{}/{}", meta.platform, meta.author)),
+            folder: Some(target_folder),
             selected_items: candidate_items,
         };
 
@@ -450,7 +466,7 @@ pub async fn inspect_link(
     }
 
     Ok(Json(InspectResult::Preview(InspectLinkResponse {
-        suggested_folder: format!("{}/{}", meta.platform, meta.author),
+        suggested_folder: target_folder,
         platform: meta.platform,
         author: meta.author,
         caption: meta.caption,
@@ -460,7 +476,6 @@ pub async fn inspect_link(
 }
 
 /// POST /api/media/commit-link
-/// Fetches user-selected items from CDN and enqueues them for processing
 pub async fn commit_link_download(
     State(state): State<AppState>,
     auth_user: AuthUser,
@@ -471,6 +486,7 @@ pub async fn commit_link_download(
     }
 
     let raw_folder = payload.folder.unwrap_or(payload.platform);
+    let sanitized_folder = StorageService::sanitize_folder_path(&raw_folder);
     let mut results = Vec::new();
 
     for item in payload.selected_items {
@@ -499,7 +515,7 @@ pub async fn commit_link_download(
             &auth_user.id,
             &item.suggested_filename,
             &bytes,
-            &raw_folder,
+            &sanitized_folder,
         )
         .await;
 
@@ -510,16 +526,15 @@ pub async fn commit_link_download(
 
     Ok(Json(BatchUploadReceipt {
         total_uploaded: success_count,
-        folder: StorageService::sanitize_folder_path(&raw_folder),
+        folder: sanitized_folder,
         items: results,
     }))
 }
 
 /// POST /api/upload/chunk
-/// Writes a chunk directly to its byte offset in staging
 pub async fn upload_chunk(
     State(state): State<AppState>,
-    _auth_user: AuthUser, // Validates authenticated session or API key
+    auth_user: AuthUser,
     Query(query): Query<ChunkUploadQuery>,
     body: Bytes,
 ) -> Result<Json<ChunkUploadResponse>, AppError> {
@@ -527,38 +542,51 @@ pub async fn upload_chunk(
         return Err(AppError::BadRequest("Chunk payload is empty".into()));
     }
 
-    let temp_dir = state.config.storage_root.join("temp_chunks");
+    if query.total_chunks == 0 {
+        return Err(AppError::BadRequest("total_chunks must be greater than 0".into()));
+    }
+
+    if query.chunk_index >= query.total_chunks {
+        return Err(AppError::BadRequest(format!(
+            "chunk_index {} out of bounds for total_chunks {}",
+            query.chunk_index, query.total_chunks
+        )));
+    }
+
+    // Tenant-isolated staging directory
+    let temp_dir = state
+        .config
+        .storage_root
+        .join("temp_chunks")
+        .join(&auth_user.id);
+
     create_dir_all(&temp_dir)
         .await
-        .map_err(|e| AppError::Internal(format!("Failed to create temp chunk dir: {}", e)))?;
+        .map_err(|e| AppError::Internal(format!("Failed to create temp chunk dir: {e}")))?;
 
     let part_path = temp_dir.join(format!("{}.part", query.upload_id));
 
     let mut file = OpenOptions::new()
         .create(true)
         .write(true)
+        .truncate(false)
         .open(&part_path)
         .await
-        .map_err(|e| AppError::Internal(format!("Failed to open chunk file: {}", e)))?;
+        .map_err(|e| AppError::Internal(format!("Failed to open chunk file: {e}")))?;
 
     let offset = (query.chunk_index as u64) * query.chunk_size;
     file.seek(SeekFrom::Start(offset))
         .await
-        .map_err(|e| AppError::Internal(format!("Failed to seek to byte offset {}: {}", offset, e)))?;
+        .map_err(|e| AppError::Internal(format!("Failed to seek to byte offset {offset}: {e}")))?;
 
     file.write_all(&body)
         .await
-        .map_err(|e| AppError::Internal(format!("Failed writing chunk bytes at offset {}: {}", offset, e)))?;
+        .map_err(|e| AppError::Internal(format!("Failed writing chunk bytes at offset {offset}: {e}")))?;
 
-    file.sync_all().await?;
-
-    tracing::debug!(
-        upload_id = %query.upload_id,
-        part = query.chunk_index + 1,
-        total = query.total_chunks,
-        offset = offset,
-        "Received and aligned chunk"
-    );
+    // Flush memory buffers without forcing a full physical drive barrier sync on every chunk
+    file.flush()
+        .await
+        .map_err(|e| AppError::Internal(format!("Failed flushing chunk buffer: {e}")))?;
 
     Ok(Json(ChunkUploadResponse {
         upload_id: query.upload_id,
@@ -568,14 +596,28 @@ pub async fn upload_chunk(
 }
 
 /// POST /api/upload/chunk/finalize
-/// Stitches and commits chunked uploads into user storage
 pub async fn finalize_chunk(
     State(state): State<AppState>,
     auth_user: AuthUser,
     Query(query): Query<FinalizeChunkQuery>,
 ) -> Result<Json<UploadItemResult>, AppError> {
-    let temp_dir = state.config.storage_root.join("temp_chunks");
+    let temp_dir = state
+        .config
+        .storage_root
+        .join("temp_chunks")
+        .join(&auth_user.id);
+
     let part_path = temp_dir.join(format!("{}.part", query.upload_id));
+
+    // Validate that file actually exists and contains data before moving to queue
+    let meta = metadata(&part_path).await.map_err(|_| {
+        AppError::NotFound("Upload session not found or chunks missing".to_string())
+    })?;
+
+    if meta.len() == 0 {
+        return Err(AppError::BadRequest("Finalized file cannot be empty".to_string()));
+    }
+
     let raw_folder = query.folder.unwrap_or_else(|| "root".to_string());
 
     let result = persist_and_enqueue_staged_file(

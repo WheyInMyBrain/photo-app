@@ -24,6 +24,7 @@ pub use storage::StorageService;
 pub use tag_engine::TagEngine;
 pub use simd::{dot_product_512, normalize_l2, EMBEDDING_DIM};
 pub use clip_cache::{ClipCacheManager, CachedEmbedding, VectorSearchResult};
+pub use video_processor::{VideoProcessor, VideoDerivatives, VideoMetadata};
 
 use clustering::FaceClusterer;
 
@@ -65,7 +66,8 @@ impl MediaEngine {
         let shard_dir = thumbs_root.join(shard);
         std::fs::create_dir_all(&shard_dir)?;
 
-        if video_processor::VideoProcessor::is_video(&ext) {
+        // Route both videos and animated GIFs through the motion/video pipeline
+        if video_processor::VideoProcessor::is_video_or_anim(&ext) {
             self.process_video(disk_path, asset_id, thumbs_root, &shard_dir, &ext, existing_clusters, run_ai)
         } else {
             self.process_image(disk_path, asset_id, thumbs_root, &shard_dir, &ext, existing_clusters, run_ai)
@@ -162,8 +164,17 @@ impl MediaEngine {
         run_ai: bool,
     ) -> Result<ProcessedMediaResult, Box<dyn std::error::Error + Send + Sync>> {
         let v_meta = video_processor::VideoProcessor::extract_metadata(disk_path)?;
-        let (thumb_path, preview_path) =
-            video_processor::VideoProcessor::generate_poster(disk_path, asset_id, shard_dir)?;
+
+        // Generates:
+        // 1. _thumb.webp (Static WebP)
+        // 2. _motion.mp4 (480p silent 3-second loop)
+        // 3. _preview.mp4 (720p H.264 FastStart stream)
+        let derivatives = video_processor::VideoProcessor::generate_all_derivatives(
+            disk_path,
+            asset_id,
+            shard_dir,
+            v_meta.duration_seconds,
+        )?;
 
         let aspect_ratio = if v_meta.height > 0 {
             v_meta.width as f64 / v_meta.height as f64
@@ -186,7 +197,16 @@ impl MediaEngine {
             }
         }
 
-        let mime_type = if ext == "mp4" { "video/mp4" } else { "video/quicktime" }.to_string();
+        let mime_type = match ext {
+            "gif" => "image/gif",
+            "mp4" => "video/mp4",
+            "mov" => "video/quicktime",
+            "webm" => "video/webm",
+            _ => "video/mp4",
+        }.to_string();
+
+        let thumb_path = derivatives.thumb_rel;
+        let preview_path = derivatives.preview_rel;
 
         if !run_ai {
             return Ok(ProcessedMediaResult {
@@ -206,7 +226,14 @@ impl MediaEngine {
             });
         }
 
-        let sample_count = if v_meta.duration_seconds > 60.0 { 4 } else { 3 };
+        let sample_count = if v_meta.duration_seconds > 60.0 {
+            4
+        } else if v_meta.duration_seconds > 1.0 {
+            3
+        } else {
+            1
+        };
+
         let sampled_frames = video_processor::VideoProcessor::sample_frames(
             disk_path,
             v_meta.duration_seconds,

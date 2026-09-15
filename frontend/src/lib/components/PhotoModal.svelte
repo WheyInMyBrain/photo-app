@@ -72,24 +72,23 @@
     node.focus();
   }
 
+  $: isMotionMedia =
+    Boolean(asset?.mime_type?.startsWith('video/')) || asset?.mime_type === 'image/gif';
+
   function isImage(item: { mime_type?: string } | null): boolean {
     if (!item?.mime_type) return false;
-    return !item.mime_type.startsWith('video/');
+    return !item.mime_type.startsWith('video/') && item.mime_type !== 'image/gif';
   }
 
   function resolveThumbUrl(path: string): string {
     if (!path) return '';
     if (path.startsWith('http')) return path;
 
-    // Clean any leading slash first
     const clean = path.startsWith('/') ? path.slice(1) : path;
-
-    // If the path already has "users/", just add the root slash
     if (clean.startsWith('users/')) {
       return `/${clean}`;
     }
 
-    // Legacy fallback if path is just "thumbs/..."
     return `/thumbs/${clean}`;
   }
 
@@ -226,7 +225,9 @@
   }
 
   function handleKeydown(e: KeyboardEvent) {
-    if (editingFaceId) return;
+    // Ignore global keyboard triggers if user is actively naming a person
+    if (editingFaceId || (e.target as HTMLElement)?.tagName === 'INPUT') return;
+
     if (e.key === 'Escape') dispatch('close');
     else if (e.key === 'ArrowLeft' && hasPrev) dispatch('prev');
     else if (e.key === 'ArrowRight' && hasNext) dispatch('next');
@@ -282,13 +283,18 @@
 
       <div class="relative max-h-full max-w-full flex items-center justify-center">
         {#key asset.id}
-          {#if asset.mime_type.startsWith('video/')}
+          {#if isMotionMedia}
+            <!-- Uses generated 720p H.264 FastStart preview MP4 with WebP poster -->
             <video
-              src="/api/assets/{asset.id}/stream"
-              controls
+              src={resolveThumbUrl(asset.preview_path)}
+              poster={resolveThumbUrl(asset.thumb_path)}
+              controls={asset.mime_type !== 'image/gif'}
               autoplay
+              loop={asset.mime_type === 'image/gif'}
+              muted={asset.mime_type === 'image/gif'}
               playsinline
-              class="max-h-[90vh] max-w-[75vw] rounded-lg shadow-2xl"
+              preload="metadata"
+              class="max-h-[90vh] max-w-[75vw] rounded-lg shadow-2xl object-contain bg-black"
             >
               <track kind="captions" />
             </video>
@@ -451,7 +457,7 @@
                     loading="lazy"
                     class="w-full h-full object-cover group-hover:scale-105 transition-transform duration-200"
                   />
-                  {#if s.mime_type.startsWith('video/')}
+                  {#if s.mime_type.startsWith('video/') || s.mime_type === 'image/gif'}
                     <div class="absolute top-1 left-1 bg-black/60 backdrop-blur-xs px-1 py-0.5 rounded text-[8px] text-white">
                       ▶
                     </div>

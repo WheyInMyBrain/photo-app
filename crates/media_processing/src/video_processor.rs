@@ -1,4 +1,4 @@
-use image::{imageops::FilterType, ImageFormat, DynamicImage};
+use image::{DynamicImage, ImageFormat};
 use serde::Deserialize;
 use std::fs::File;
 use std::io::Cursor;
@@ -40,13 +40,21 @@ pub struct VideoMetadata {
     pub camera_model: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+pub struct VideoDerivatives {
+    pub thumb_rel: String,    // Static WebP
+    pub motion_rel: String,   // 480p silent 3-second MP4 loop
+    pub preview_rel: String,  // 720p H.264 FastStart MP4
+}
+
 pub struct VideoProcessor;
 
 impl VideoProcessor {
-    pub fn is_video(ext: &str) -> bool {
+    /// Determines whether the file should be routed through the video/motion pipeline
+    pub fn is_video_or_anim(ext: &str) -> bool {
         matches!(
             ext.to_lowercase().as_str(),
-            "mp4" | "mov" | "m4v" | "webm" | "mkv" | "avi"
+            "mp4" | "mov" | "m4v" | "webm" | "mkv" | "avi" | "gif"
         )
     }
 
@@ -62,13 +70,12 @@ impl VideoProcessor {
             .output()?;
 
         if !output.status.success() {
-            return Err("ffprobe failed to read video metadata".into());
+            return Err("ffprobe failed to read video/gif metadata".into());
         }
 
         let parsed: ProbeOutput = serde_json::from_slice(&output.stdout)?;
         let mut meta = VideoMetadata::default();
 
-        // 1. Resolution & Rotation Handling
         if let Some(streams) = parsed.streams {
             if let Some(video_stream) = streams.iter().find(|s| s.width.is_some() && s.height.is_some()) {
                 let mut w = video_stream.width.unwrap_or(0);
@@ -98,14 +105,14 @@ impl VideoProcessor {
             }
         }
 
-        // 2. Duration & Metadata (with Apple QuickTime fallbacks)
         if let Some(format) = parsed.format {
             if let Some(dur_str) = format.duration {
                 meta.duration_seconds = dur_str.parse::<f64>().unwrap_or(0.0);
             }
 
             if let Some(tags) = format.tags {
-                let creation = tags.get("creation_time")
+                let creation = tags
+                    .get("creation_time")
                     .or_else(|| tags.get("com.apple.quicktime.creationdate"))
                     .and_then(|v| v.as_str());
 
@@ -130,13 +137,13 @@ impl VideoProcessor {
         duration_seconds: f64,
         sample_count: usize,
     ) -> Vec<DynamicImage> {
-        if duration_seconds < 0.5 || sample_count == 0 {
+        let dur = if duration_seconds <= 0.0 { 1.0 } else { duration_seconds };
+        if sample_count == 0 {
             return Vec::new();
         }
 
         let mut frames = Vec::with_capacity(sample_count);
-        // Distribute timestamps cleanly (e.g., 25%, 50%, 75% for 3 samples)
-        let interval = duration_seconds / (sample_count + 1) as f64;
+        let interval = dur / (sample_count + 1) as f64;
 
         for i in 1..=sample_count {
             let timestamp = interval * i as f64;
@@ -168,21 +175,34 @@ impl VideoProcessor {
         frames
     }
 
-    pub fn generate_poster(
-        video_path: &Path,
+    /// Generates the complete 3-tier delivery payload: Static WebP, Motion MP4, and 720p H.264 FastStart proxy
+    pub fn generate_all_derivatives(
+        input_path: &Path,
         asset_id: &str,
         target_shard_dir: &Path,
-    ) -> Result<(String, String), Box<dyn std::error::Error + Send + Sync>> {
-        let thumb_filename = format!("{}_thumb.webp", asset_id);
-        let preview_filename = format!("{}_preview.webp", asset_id);
+        duration_seconds: f64,
+    ) -> Result<VideoDerivatives, Box<dyn std::error::Error + Send + Sync>> {
+        let path_str = input_path.to_str().ok_or("Invalid path string")?;
 
-        let thumb_dest = target_shard_dir.join(&thumb_filename);
-        let preview_dest = target_shard_dir.join(&preview_filename);
+        let thumb_name = format!("{}_thumb.webp", asset_id);
+        let motion_name = format!("{}_motion.mp4", asset_id);
+        let preview_name = format!("{}_preview.mp4", asset_id);
 
-        let output = Command::new("ffmpeg")
+        let thumb_dest = target_shard_dir.join(&thumb_name);
+        let motion_dest = target_shard_dir.join(&motion_name);
+        let preview_dest = target_shard_dir.join(&preview_name);
+
+        let shard = target_shard_dir
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("00");
+
+        // 1. Static Thumbnail Poster (Extract single keyframe at 0.5s or start)
+        let seek_time = if duration_seconds > 1.0 { "00:00:00.500" } else { "00:00:00.000" };
+        let thumb_output = Command::new("ffmpeg")
             .args([
-                "-ss", "00:00:00.500",
-                "-i", video_path.to_str().ok_or("Invalid path string")?,
+                "-ss", seek_time,
+                "-i", path_str,
                 "-vframes", "1",
                 "-f", "image2pipe",
                 "-vcodec", "mjpeg",
@@ -190,73 +210,53 @@ impl VideoProcessor {
             ])
             .output()?;
 
-        if !output.status.success() || output.stdout.is_empty() {
-            let fallback_output = Command::new("ffmpeg")
-                .args([
-                    "-i", video_path.to_str().ok_or("Invalid path string")?,
-                    "-vframes", "1",
-                    "-f", "image2pipe",
-                    "-vcodec", "mjpeg",
-                    "-",
-                ])
-                .output()?;
-
-            if !fallback_output.status.success() || fallback_output.stdout.is_empty() {
-                return Err("ffmpeg failed to extract video frame".into());
-            }
-
-            return Self::write_derivatives_from_jpeg_bytes(
-                &fallback_output.stdout,
-                &thumb_dest,
-                &preview_dest,
-                target_shard_dir,
-                &thumb_filename,
-                &preview_filename,
-            );
+        if thumb_output.status.success() && !thumb_output.stdout.is_empty() {
+            let img = image::load(Cursor::new(&thumb_output.stdout), ImageFormat::Jpeg)?;
+            let thumb = img.thumbnail(320, 320);
+            let mut f = File::create(&thumb_dest)?;
+            thumb.write_to(&mut f, ImageFormat::WebP)?;
         }
 
-        Self::write_derivatives_from_jpeg_bytes(
-            &output.stdout,
-            &thumb_dest,
-            &preview_dest,
-            target_shard_dir,
-            &thumb_filename,
-            &preview_filename,
-        )
-    }
+        // 2. Motion Hover Clip: 480p silent loop, max 5 seconds, -movflags +faststart
+        let motion_dur = if duration_seconds > 0.0 { duration_seconds.min(5.0) } else { 5.0 };
+        let _ = Command::new("ffmpeg")
+            .args([
+                "-y",
+                "-ss", seek_time,
+                "-t", &format!("{:.2}", motion_dur),
+                "-i", path_str,
+                "-an", // Strip audio
+                "-vf", "scale='min(480,iw)':-2", // Keep aspect ratio, force even dimensions
+                "-c:v", "libx264",
+                "-preset", "veryfast",
+                "-crf", "28",
+                "-pix_fmt", "yuv420p",
+                "-movflags", "+faststart",
+                motion_dest.to_str().ok_or("Invalid motion path")?,
+            ])
+            .output();
 
-    fn write_derivatives_from_jpeg_bytes(
-        bytes: &[u8],
-        thumb_dest: &Path,
-        preview_dest: &Path,
-        target_shard_dir: &Path,
-        thumb_filename: &str,
-        preview_filename: &str,
-    ) -> Result<(String, String), Box<dyn std::error::Error + Send + Sync>> {
-        let img = image::load(Cursor::new(bytes), ImageFormat::Jpeg)?;
+        // 3. Web-Streamable Preview Video: 720p max, H.264 + AAC audio, -movflags +faststart
+        let _ = Command::new("ffmpeg")
+            .args([
+                "-y",
+                "-i", path_str,
+                "-vf", "scale='min(1280,iw)':-2",
+                "-c:v", "libx264",
+                "-preset", "veryfast",
+                "-crf", "23",
+                "-c:a", "aac",
+                "-b:a", "128k",
+                "-pix_fmt", "yuv420p",
+                "-movflags", "+faststart",
+                preview_dest.to_str().ok_or("Invalid preview path")?,
+            ])
+            .output();
 
-        // 1. Grid Thumbnail (320px WebP)
-        let thumb = img.thumbnail(320, 320);
-        let mut thumb_file = File::create(thumb_dest)?;
-        thumb.write_to(&mut thumb_file, ImageFormat::WebP)?;
-        thumb_file.sync_all().ok();
-        drop(thumb_file);
-
-        // 2. Preview Poster (1600px WebP)
-        let preview = img.resize(1600, 1600, FilterType::Triangle);
-        let mut preview_file = File::create(preview_dest)?;
-        preview.write_to(&mut preview_file, ImageFormat::WebP)?;
-        preview_file.sync_all().ok();
-        drop(preview_file);
-
-        let shard = target_shard_dir
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("00");
-
-        Ok((
-            format!("thumbs/{}/{}", shard, thumb_filename),
-            format!("thumbs/{}/{}", shard, preview_filename),
-        ))
+        Ok(VideoDerivatives {
+            thumb_rel: format!("{}/{}", shard, thumb_name),
+            motion_rel: format!("{}/{}", shard, motion_name),
+            preview_rel: format!("{}/{}", shard, preview_name),
+        })
     }
 }
