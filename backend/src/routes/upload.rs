@@ -95,6 +95,7 @@ async fn persist_and_enqueue_bytes(
         folder_path: sanitized_folder,
         disk_path,
         sha256,
+        job_type: "thumbnail".to_string(),
         file_size_bytes: bytes.len() as i64,
     };
 
@@ -197,7 +198,7 @@ async fn persist_and_enqueue_staged_file(
         format!("{}/{}", sanitized_folder, disk_file_name)
     };
 
-    // 4. Enqueue into DB with user_id
+    // 4. Enqueue into DB as a "thumbnail" job
     let job = ProcessJob {
         id: Uuid::new_v4().to_string(),
         user_id: user_id.to_string(),
@@ -207,6 +208,7 @@ async fn persist_and_enqueue_staged_file(
         folder_path: sanitized_folder,
         disk_path: destination_path,
         sha256: sha256_hash,
+        job_type: "thumbnail".to_string(),
         file_size_bytes: bytes_len,
     };
 
