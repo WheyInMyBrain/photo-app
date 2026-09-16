@@ -79,6 +79,7 @@ impl ScrapesRepo {
     ) -> Result<(), sqlx::Error> {
         let mut tx = pool.begin().await?;
 
+        // 1. Upsert post record, resolving the true active post_id
         let mut post_qb: QueryBuilder<Sqlite> = QueryBuilder::new(
             "INSERT INTO scraped_posts (id, user_id, platform, external_post_id, author, caption) ",
         );
@@ -93,9 +94,20 @@ impl ScrapesRepo {
                     .push_bind(cap);
             },
         );
-        post_qb.push(" ON CONFLICT(user_id, platform, external_post_id) DO NOTHING");
-        post_qb.build().execute(&mut *tx).await?;
+        post_qb.push(
+            " ON CONFLICT(user_id, platform, external_post_id) DO UPDATE SET \
+             author = excluded.author, \
+             caption = excluded.caption \
+             RETURNING id",
+        );
 
+        let resolved_post_id: String = post_qb
+            .build()
+            .fetch_one(&mut *tx)
+            .await?
+            .get("id");
+
+        // 2. Upsert items keyed on primary key `id`
         if !items.is_empty() {
             let indexed_items: Vec<(i64, &ScrapedMediaItemRecord)> = items
                 .iter()
@@ -110,7 +122,7 @@ impl ScrapesRepo {
 
             items_qb.push_values(indexed_items, |mut b, (idx, item)| {
                 b.push_bind(&item.id)
-                    .push_bind(post_id)
+                    .push_bind(&resolved_post_id)
                     .push_bind(idx)
                     .push_bind(&item.media_type)
                     .push_bind(&item.cdn_url)
@@ -119,7 +131,19 @@ impl ScrapesRepo {
                     .push_bind(&item.suggested_filename)
                     .push_bind("pending");
             });
-            items_qb.push(" ON CONFLICT(scraped_post_id, item_index) DO NOTHING");
+
+            // Target PK conflict so repeat inspections refresh URLs instead of failing
+            items_qb.push(
+                " ON CONFLICT(id) DO UPDATE SET \
+                 scraped_post_id = excluded.scraped_post_id, \
+                 item_index = excluded.item_index, \
+                 media_type = excluded.media_type, \
+                 cdn_url = excluded.cdn_url, \
+                 audio_url = excluded.audio_url, \
+                 thumbnail_url = excluded.thumbnail_url, \
+                 suggested_filename = excluded.suggested_filename",
+            );
+
             items_qb.build().execute(&mut *tx).await?;
         }
 

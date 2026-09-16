@@ -1,4 +1,4 @@
-use image::{imageops::FilterType, DynamicImage, ImageFormat, ImageReader, RgbImage};
+use image::{DynamicImage, ImageFormat, ImageReader, RgbImage};
 use libheif_rs::{ColorSpace, HeifContext, ItemId, LibHeif, RgbChroma};
 use std::fs::File;
 use std::path::Path;
@@ -184,9 +184,9 @@ impl ImageProcessor {
         drop(thumb_file);
         let t_thumb_write = t_thumb_write_start.elapsed();
 
-        // 2. High-res Preview (1600px Triangle filter)
+        // 2. High-res Preview
         let t_preview_resize_start = Instant::now();
-        let preview = img.resize(1600, 1600, FilterType::Triangle);
+        let preview = img.thumbnail(1600, 1600);
         let t_preview_resize = t_preview_resize_start.elapsed();
 
         let t_preview_write_start = Instant::now();

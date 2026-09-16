@@ -70,7 +70,18 @@ pub async fn extract_links(input_url: &str) -> Result<ExtractedMediaMetadata> {
         }
     }
 
-    // 2. Galleries (media_metadata)
+    // 2. Animated GIF / Video Preview (preview.reddit_video_preview or preview.images.variants)
+    if let Some(gif_item) = parse_reddit_gif_or_preview(post_data) {
+        items.push(gif_item);
+        return Ok(ExtractedMediaMetadata {
+            platform: "reddit".to_string(),
+            author,
+            caption,
+            items,
+        });
+    }
+
+    // 3. Galleries (media_metadata)
     if let Some(gallery_items) = post_data
         .get("gallery_data")
         .and_then(|g| g.get("items"))
@@ -89,7 +100,7 @@ pub async fn extract_links(input_url: &str) -> Result<ExtractedMediaMetadata> {
         }
     }
 
-    // 3. Fallback direct image / video links
+    // 4. Fallback direct image / video links
     if items.is_empty() {
         if let Some(url) = post_data.get("url_overridden_by_dest").and_then(|u| u.as_str()) {
             let is_video = url.ends_with(".mp4") || url.ends_with(".gif");
@@ -118,6 +129,50 @@ pub async fn extract_links(input_url: &str) -> Result<ExtractedMediaMetadata> {
     })
 }
 
+fn parse_reddit_gif_or_preview(post_data: &Value) -> Option<MediaItem> {
+    let thumbnail_url = extract_preview_thumbnail(post_data);
+
+    // Check preview.reddit_video_preview (Used by Reddit for converted GIFs)
+    if let Some(rvp) = post_data.get("preview").and_then(|p| p.get("reddit_video_preview")) {
+        if let Some(fallback_url) = rvp.get("fallback_url").and_then(|u| u.as_str()) {
+            return Some(MediaItem::new(
+                MediaType::Video,
+                clean_url_str(fallback_url),
+                None,
+                clean_url_str(thumbnail_url.as_deref().unwrap_or(fallback_url)),
+            ));
+        }
+    }
+
+    // Check preview.images[0].variants.mp4 or preview.images[0].variants.gif
+    if let Some(images) = post_data.get("preview").and_then(|p| p.get("images")).and_then(|i| i.as_array()) {
+        if let Some(first_img) = images.first() {
+            if let Some(variants) = first_img.get("variants") {
+                // Prefer MP4 variant if available
+                if let Some(mp4_url) = variants.get("mp4").and_then(|m| m.get("source")).and_then(|s| s.get("url")).and_then(|u| u.as_str()) {
+                    return Some(MediaItem::new(
+                        MediaType::Video,
+                        clean_url_str(mp4_url),
+                        None,
+                        clean_url_str(thumbnail_url.as_deref().unwrap_or(mp4_url)),
+                    ));
+                }
+                // Fallback to GIF variant
+                if let Some(gif_url) = variants.get("gif").and_then(|g| g.get("source")).and_then(|s| s.get("url")).and_then(|u| u.as_str()) {
+                    return Some(MediaItem::new(
+                        MediaType::Image,
+                        clean_url_str(gif_url),
+                        None,
+                        clean_url_str(thumbnail_url.as_deref().unwrap_or(gif_url)),
+                    ));
+                }
+            }
+        }
+    }
+
+    None
+}
+
 fn parse_reddit_video(vid: &Value, post_data: &Value) -> Option<MediaItem> {
     let has_audio = vid.get("has_audio").and_then(|b| b.as_bool()).unwrap_or(true);
     let fallback_url = vid.get("fallback_url").and_then(|u| u.as_str())?;
@@ -129,7 +184,6 @@ fn parse_reddit_video(vid: &Value, post_data: &Value) -> Option<MediaItem> {
 
     let audio_url = if has_audio {
         url_path.rsplit_once('/').map(|(base, filename)| {
-            // Detect if video is CMAF or DASH
             let audio_file = if filename.starts_with("CMAF_") {
                 "CMAF_AUDIO_128.mp4"
             } else {
