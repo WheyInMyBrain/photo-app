@@ -6,12 +6,18 @@ pub struct JobRepo;
 
 impl JobRepo {
     pub async fn enqueue(pool: &SqlitePool, job: &DbJob) -> Result<(), sqlx::Error> {
+        let job_type = if job.job_type.trim().is_empty() {
+            "thumbnail"
+        } else {
+            &job.job_type
+        };
+
         sqlx::query(
             r#"
             INSERT INTO processing_jobs (
                 id, user_id, asset_id, file_name, rel_path, folder_path,
-                disk_path, sha256, file_size_bytes, status
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')
+                disk_path, sha256, file_size_bytes, job_type, status
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')
             "#,
         )
         .bind(&job.id)
@@ -23,6 +29,7 @@ impl JobRepo {
         .bind(job.disk_path.to_string_lossy().to_string())
         .bind(&job.sha256)
         .bind(job.file_size_bytes)
+        .bind(job_type)
         .execute(pool)
         .await?;
 
@@ -39,19 +46,24 @@ impl JobRepo {
         Ok(res.rows_affected())
     }
 
-    pub async fn fetch_next_job(pool: &SqlitePool) -> Result<Option<DbJob>, sqlx::Error> {
+    /// Fetches the next available pending job for a specific pipeline phase ('thumbnail' or 'ai_enrichment').
+    pub async fn fetch_next_job(
+        pool: &SqlitePool,
+        job_type: &str,
+    ) -> Result<Option<DbJob>, sqlx::Error> {
         let mut tx = pool.begin().await?;
 
         let row = sqlx::query(
             r#"
             SELECT id, user_id, asset_id, file_name, rel_path, folder_path,
-                   disk_path, sha256, file_size_bytes
+                   disk_path, sha256, file_size_bytes, job_type
             FROM processing_jobs
-            WHERE status = 'pending' AND attempts < 3
+            WHERE status = 'pending' AND job_type = ? AND attempts < 3
             ORDER BY created_at ASC
             LIMIT 1
             "#,
         )
+        .bind(job_type)
         .fetch_optional(&mut *tx)
         .await?;
 
@@ -65,6 +77,7 @@ impl JobRepo {
                 folder_path: r.get("folder_path"),
                 disk_path: PathBuf::from(r.get::<String, _>("disk_path")),
                 sha256: r.get("sha256"),
+                job_type: r.get("job_type"),
                 file_size_bytes: r.get("file_size_bytes"),
             };
 

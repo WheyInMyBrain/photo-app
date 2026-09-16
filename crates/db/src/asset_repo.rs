@@ -3,7 +3,7 @@ use std::path::Path;
 
 use crate::domain::media::{
     AssetStorageInfo, MediaPageResponse, MediaQuery, MediaSummary, SubAlbum,
-    NewAssetRecord, DynamicFiltersResponse, FilterOption
+    NewAssetRecord, DynamicFiltersResponse, FilterOption, AssetCacheMetadata,
 };
 
 pub struct AssetRepo;
@@ -947,5 +947,24 @@ impl AssetRepo {
         .await?;
 
         Ok(row)
+    }
+
+    pub async fn get_cache_metadata(
+        pool: &SqlitePool,
+        asset_id: &str,
+        user_id: &str,
+    ) -> Result<Option<AssetCacheMetadata>, sqlx::Error> {
+        let row = sqlx::query(
+            "SELECT thumb_path, mime_type FROM assets WHERE id = ? AND user_id = ?"
+        )
+        .bind(asset_id)
+        .bind(user_id)
+        .fetch_optional(pool)
+        .await?;
+
+        Ok(row.map(|r| AssetCacheMetadata {
+            thumb_path: r.get("thumb_path"),
+            mime_type: r.get("mime_type"),
+        }))
     }
 }

@@ -3,7 +3,7 @@ use libheif_rs::{ColorSpace, HeifContext, ItemId, LibHeif, RgbChroma};
 use std::fs::File;
 use std::path::Path;
 use std::time::Instant;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 pub struct ImageProcessor;
 
@@ -19,7 +19,7 @@ impl ImageProcessor {
         let img = if ext == "heic" || ext == "heif" {
             Self::load_heic(path)?
         } else {
-            Self::load_raster(path)?
+            Self::load_raster(path, &ext)?
         };
 
         info!(
@@ -34,21 +34,21 @@ impl ImageProcessor {
         Ok(img)
     }
 
-    /// Loads JPEG, WebP, PNG, etc., reads EXIF orientation, and rotates the pixel buffer
-    fn load_raster(path: &Path) -> Result<DynamicImage, Box<dyn std::error::Error + Send + Sync>> {
+    /// Loads JPEG, WebP, PNG, etc. Reads EXIF orientation ONLY for formats that carry it (e.g., JPEG).
+    fn load_raster(path: &Path, ext: &str) -> Result<DynamicImage, Box<dyn std::error::Error + Send + Sync>> {
         let t_decode_start = Instant::now();
         let decoded = ImageReader::open(path)?.with_guessed_format()?.decode()?;
         let t_decode = t_decode_start.elapsed();
 
-        let t_exif_start = Instant::now();
-        let oriented = Self::apply_exif_fallback(path, decoded);
-        let t_exif = t_exif_start.elapsed();
-
-        debug!(
-            target: "perf",
-            "[LOAD_RASTER] Decode: {:.2?} | Exif: {:.2?}",
-            t_decode, t_exif
-        );
+        // Skip EXIF extraction for WebP previews or PNGs to prevent spurious warning logs
+        let oriented = if ext == "jpg" || ext == "jpeg" {
+            let t_exif_start = Instant::now();
+            let res = Self::apply_exif_fallback(path, decoded);
+            debug!(target: "perf", "[LOAD_RASTER] Decode: {:.2?} | Exif: {:.2?}", t_decode, t_exif_start.elapsed());
+            res
+        } else {
+            decoded
+        };
 
         Ok(oriented)
     }
@@ -68,15 +68,21 @@ impl ImageProcessor {
         let plane = planes.interleaved.ok_or("Missing interleaved RGB plane in HEIC")?;
 
         let row_bytes = (width * 3) as usize;
-        let mut rgb_buffer = vec![0u8; (width * height * 3) as usize];
+        let total_bytes = (width * height * 3) as usize;
+        let mut rgb_buffer = vec![0u8; total_bytes];
 
-        for row in 0..height as usize {
-            let src_start = row * plane.stride;
-            let src_end = src_start + row_bytes;
-            let dst_start = row * row_bytes;
-            let dst_end = dst_start + row_bytes;
+        if plane.stride == row_bytes {
+            // Contiguous slice fast-path: single memcpy
+            rgb_buffer.copy_from_slice(&plane.data[..total_bytes]);
+        } else {
+            for row in 0..height as usize {
+                let src_start = row * plane.stride;
+                let src_end = src_start + row_bytes;
+                let dst_start = row * row_bytes;
+                let dst_end = dst_start + row_bytes;
 
-            rgb_buffer[dst_start..dst_end].copy_from_slice(&plane.data[src_start..src_end]);
+                rgb_buffer[dst_start..dst_end].copy_from_slice(&plane.data[src_start..src_end]);
+            }
         }
 
         let rgb_img = RgbImage::from_raw(width, height, rgb_buffer)
@@ -131,7 +137,8 @@ impl ImageProcessor {
         let exif = match exif::Reader::new().read_from_container(&mut bufreader) {
             Ok(e) => e,
             Err(e) => {
-                warn!("EXIF parse error on {:?}: {e}", path);
+                // Lowered from warn! to debug! so missing EXIF headers do not spam stderr
+                debug!("No EXIF metadata found on {:?}: {e}", path);
                 return img;
             }
         };
@@ -172,19 +179,7 @@ impl ImageProcessor {
         let thumb_file_path = target_shard_dir.join(&thumb_name);
         let preview_file_path = target_shard_dir.join(&preview_name);
 
-        // 1. Grid Thumbnail (320px)
-        let t_thumb_resize_start = Instant::now();
-        let thumb = img.thumbnail(320, 320);
-        let t_thumb_resize = t_thumb_resize_start.elapsed();
-
-        let t_thumb_write_start = Instant::now();
-        let mut thumb_file = File::create(&thumb_file_path)?;
-        thumb.write_to(&mut thumb_file, ImageFormat::WebP)?;
-        thumb_file.sync_all().ok();
-        drop(thumb_file);
-        let t_thumb_write = t_thumb_write_start.elapsed();
-
-        // 2. High-res Preview
+        // 1. Generate High-Res Preview first (1600px max edge)
         let t_preview_resize_start = Instant::now();
         let preview = img.thumbnail(1600, 1600);
         let t_preview_resize = t_preview_resize_start.elapsed();
@@ -196,6 +191,19 @@ impl ImageProcessor {
         drop(preview_file);
         let t_preview_write = t_preview_write_start.elapsed();
 
+        // 2. Generate Grid Thumbnail FROM THE PREVIEW (320px)
+        // Downscaling 1600 -> 320 is ~5-10x faster than downscaling 8000 -> 320
+        let t_thumb_resize_start = Instant::now();
+        let thumb = preview.thumbnail(320, 320);
+        let t_thumb_resize = t_thumb_resize_start.elapsed();
+
+        let t_thumb_write_start = Instant::now();
+        let mut thumb_file = File::create(&thumb_file_path)?;
+        thumb.write_to(&mut thumb_file, ImageFormat::WebP)?;
+        thumb_file.sync_all().ok();
+        drop(thumb_file);
+        let t_thumb_write = t_thumb_write_start.elapsed();
+
         let shard = target_shard_dir
             .file_name()
             .and_then(|s| s.to_str())
@@ -203,13 +211,13 @@ impl ImageProcessor {
 
         info!(
             target: "perf",
-            "[DERIVATIVES] [{}] Total: {:.2?} | Thumb(scale: {:.2?}, enc: {:.2?}) | Preview(scale: {:.2?}, enc: {:.2?})",
+            "[DERIVATIVES] [{}] Total: {:.2?} | Preview(scale: {:.2?}, enc: {:.2?}) | Thumb(scale: {:.2?}, enc: {:.2?})",
             asset_id,
             total_start.elapsed(),
-            t_thumb_resize,
-            t_thumb_write,
             t_preview_resize,
-            t_preview_write
+            t_preview_write,
+            t_thumb_resize,
+            t_thumb_write
         );
 
         Ok((

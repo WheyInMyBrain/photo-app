@@ -21,7 +21,7 @@ pub use scrapes_repo::{ScrapedMediaItemRecord, ScrapedPostRecord, ScrapesRepo};
 pub use tag_repo::TagRepo;
 pub use ingestion_repo::{
     IngestionDetectedFace, IngestionNewPerson, IngestionPayload, IngestionRepo,
-    IngestionUpdatedCluster,
+    IngestionUpdatedCluster, AiEnrichmentPayload,
 };
 
 pub use domain::*;

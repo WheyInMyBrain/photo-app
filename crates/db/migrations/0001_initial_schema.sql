@@ -291,6 +291,7 @@ CREATE TABLE IF NOT EXISTS processing_jobs (
     disk_path TEXT NOT NULL,
     sha256 TEXT NOT NULL,
     file_size_bytes INTEGER NOT NULL,
+    job_type TEXT NOT NULL DEFAULT 'thumbnail',
     status TEXT NOT NULL DEFAULT 'pending', -- 'pending', 'processing', 'completed', 'failed'
     attempts INTEGER NOT NULL DEFAULT 0,
     last_error TEXT,
@@ -304,6 +305,12 @@ CREATE INDEX IF NOT EXISTS idx_jobs_user_status_created
 CREATE INDEX IF NOT EXISTS idx_jobs_global_pending 
     ON processing_jobs(status, created_at)
     WHERE status = 'pending';
+
+CREATE INDEX IF NOT EXISTS idx_jobs_type_status 
+    ON processing_jobs(job_type, status);
+
+CREATE INDEX IF NOT EXISTS idx_processing_jobs_queue 
+    ON processing_jobs (job_type, status, attempts, created_at);
 
 -- ============================================================================
 -- 7. SCRAPED POSTS & MEDIA STAGING (USER-SCOPED)

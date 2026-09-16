@@ -34,7 +34,6 @@ impl FaceClusterer {
         for det in detections {
             let bounds = compute_face_chip_bounds(img.width(), img.height(), det.x, det.y, det.w, det.h);
 
-            // Single cropped buffer extraction directly from the immutable image view
             let chip_image = DynamicImage::ImageRgba8(
                 image::imageops::crop_imm(img, bounds.px, bounds.py, bounds.pw, bounds.ph).to_image(),
             );
@@ -99,7 +98,17 @@ impl FaceClusterer {
         let faces_dir = thumbs_root.join("faces");
         std::fs::create_dir_all(&faces_dir)?;
 
-        let mut best_faces: HashMap<String, NewFaceRecord> = HashMap::new();
+        // Internal struct to hold best candidate before writing to disk
+        struct BestCandidate {
+            score: f32,
+            chip_image: DynamicImage,
+            embedding_vec: Vec<f32>,
+            normalized_emb: [f32; EMBEDDING_DIM],
+            bbox: (f32, f32, f32, f32),
+        }
+
+        // Map: person_id -> BestCandidate
+        let mut best_candidates: HashMap<String, BestCandidate> = HashMap::new();
         let mut updated_clusters = Vec::new();
         let mut new_persons = Vec::new();
 
@@ -108,6 +117,9 @@ impl FaceClusterer {
                 Ok(dets) if !dets.is_empty() => dets,
                 _ => continue,
             };
+
+            // Enforce that two faces in the SAME frame cannot claim the same identity
+            let mut frame_claimed = HashSet::new();
 
             for det in detections {
                 let bounds = compute_face_chip_bounds(frame.width(), frame.height(), det.x, det.y, det.w, det.h);
@@ -125,48 +137,79 @@ impl FaceClusterer {
                 normalized_emb.copy_from_slice(&embedding_vec);
                 normalize_l2(&mut normalized_emb);
 
-                let empty_claimed = HashSet::new();
-                let (target_pid, _) = Self::find_or_create_match(
-                    &normalized_emb,
-                    &mut existing_clusters,
-                    &empty_claimed,
-                    &mut updated_clusters,
-                    &mut new_persons,
-                );
+                // Check if this detection matches an already-identified person in this video
+                let mut matched_existing_candidate = None;
+                for (pid, cand) in &best_candidates {
+                    if frame_claimed.contains(pid) {
+                        continue;
+                    }
+                    if dot_product_512(&normalized_emb, &cand.normalized_emb) >= 0.40 {
+                        matched_existing_candidate = Some(pid.clone());
+                        break;
+                    }
+                }
 
-                let is_better = match best_faces.get(&target_pid) {
+                let target_pid = if let Some(pid) = matched_existing_candidate {
+                    pid
+                } else {
+                    // Match against global clusters (or create a new person)
+                    let (pid, _) = Self::find_or_create_match(
+                        &normalized_emb,
+                        &mut existing_clusters,
+                        &frame_claimed,
+                        &mut updated_clusters,
+                        &mut new_persons,
+                    );
+                    pid
+                };
+
+                frame_claimed.insert(target_pid.clone());
+
+                let is_better = match best_candidates.get(&target_pid) {
                     Some(prev) => det.score > prev.score,
                     None => true,
                 };
 
                 if is_better {
-                    let face_id = Uuid::new_v4().to_string();
-                    let avatar_rel = Self::save_face_thumb(&chip_image, &faces_dir, &face_id)?;
-
-                    if let Some(np) = new_persons.iter_mut().find(|p| p.person_id == target_pid) {
-                        np.cover_face_id = face_id.clone();
-                    }
-
-                    best_faces.insert(
-                        target_pid.clone(),
-                        NewFaceRecord {
-                            face_id,
-                            person_id: target_pid,
-                            bbox_x: det.x,
-                            bbox_y: det.y,
-                            bbox_w: det.w,
-                            bbox_h: det.h,
+                    best_candidates.insert(
+                        target_pid,
+                        BestCandidate {
                             score: det.score,
-                            face_thumb_rel_path: avatar_rel,
-                            embedding: embedding_vec,
+                            chip_image,
+                            embedding_vec,
+                            normalized_emb,
+                            bbox: (det.x, det.y, det.w, det.h),
                         },
                     );
                 }
             }
         }
 
+        // Write ONLY the winning face thumbnail per person to disk
+        let mut detected_faces = Vec::with_capacity(best_candidates.len());
+        for (person_id, cand) in best_candidates {
+            let face_id = Uuid::new_v4().to_string();
+            let avatar_rel = Self::save_face_thumb(&cand.chip_image, &faces_dir, &face_id)?;
+
+            if let Some(np) = new_persons.iter_mut().find(|p| p.person_id == person_id) {
+                np.cover_face_id = face_id.clone();
+            }
+
+            detected_faces.push(NewFaceRecord {
+                face_id,
+                person_id,
+                bbox_x: cand.bbox.0,
+                bbox_y: cand.bbox.1,
+                bbox_w: cand.bbox.2,
+                bbox_h: cand.bbox.3,
+                score: cand.score,
+                face_thumb_rel_path: avatar_rel,
+                embedding: cand.embedding_vec,
+            });
+        }
+
         Ok(ClusteredFacesResult {
-            detected_faces: best_faces.into_values().collect(),
+            detected_faces,
             updated_clusters,
             new_persons,
         })
@@ -179,51 +222,59 @@ impl FaceClusterer {
         updated_clusters: &mut Vec<ClusterUpdate>,
         new_persons: &mut Vec<NewPersonRecord>,
     ) -> (String, bool) {
-        let mut best_match: Option<(usize, f32)> = None;
+        let mut best_person_idx: Option<usize> = None;
+        let mut highest_sim: f32 = -1.0;
 
         for (idx, cluster) in existing_clusters.iter().enumerate() {
             if claimed_persons.contains(&cluster.person_id) {
                 continue;
             }
 
-            let sim = dot_product_512(normalized_embedding, &cluster.centroid);
-            if sim > best_match.map(|(_, s)| s).unwrap_or(-1.0) {
-                best_match = Some((idx, sim));
+            // Find the best matching exemplar for this person
+            for exemplar in &cluster.exemplars {
+                let sim = dot_product_512(normalized_embedding, exemplar);
+                if sim > highest_sim {
+                    highest_sim = sim;
+                    best_person_idx = Some(idx);
+                }
             }
         }
 
-        if let Some((idx, sim)) = best_match {
-            if sim >= 0.40 {
+        // Match threshold (0.42 - 0.45 works best with InsightFace / ArcFace embeddings)
+        if let Some(idx) = best_person_idx {
+            if highest_sim >= 0.42 {
                 let cluster = &mut existing_clusters[idx];
                 let pid = cluster.person_id.clone();
-
-                let n = cluster.face_count as f32;
-                let mut new_centroid = [0.0f32; EMBEDDING_DIM];
-                for k in 0..EMBEDDING_DIM {
-                    new_centroid[k] = (cluster.centroid[k] * n) + normalized_embedding[k];
-                }
-                normalize_l2(&mut new_centroid);
-
-                cluster.centroid = new_centroid;
                 cluster.face_count += 1;
 
-                updated_clusters.push(ClusterUpdate {
-                    person_id: pid.clone(),
-                    new_centroid: new_centroid.to_vec(),
-                    new_face_count: cluster.face_count,
-                    new_cover_face_id: None,
-                });
+                // If this face captures a noticeably different look (e.g., sim between 0.42 and 0.65)
+                // and we have fewer than 5 exemplars, store it as an additional representative angle
+                if highest_sim < 0.65 && cluster.exemplars.len() < 5 {
+                    cluster.exemplars.push(*normalized_embedding);
+                }
+
+                if let Some(existing_update) = updated_clusters.iter_mut().find(|u| u.person_id == pid) {
+                    existing_update.new_face_count = cluster.face_count;
+                } else if !new_persons.iter().any(|np| np.person_id == pid) {
+                    updated_clusters.push(ClusterUpdate {
+                        person_id: pid.clone(),
+                        new_centroid: normalized_embedding.to_vec(),
+                        new_face_count: cluster.face_count,
+                        new_cover_face_id: None,
+                    });
+                }
 
                 return (pid, false);
             }
         }
 
+        // No match found -> create a new identity with this face as its first exemplar
         let new_pid = Uuid::new_v4().to_string();
         existing_clusters.push(KnownPersonCluster {
             person_id: new_pid.clone(),
-            centroid: *normalized_embedding,
             face_count: 1,
             cover_face_id: None,
+            exemplars: vec![*normalized_embedding],
         });
 
         new_persons.push(NewPersonRecord {

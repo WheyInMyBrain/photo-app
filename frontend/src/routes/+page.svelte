@@ -1,9 +1,7 @@
 <script lang="ts">
   import { browser } from '$app/environment';
   import { onMount, onDestroy } from 'svelte';
-  import { flip } from 'svelte/animate';
-  import { scale, fade } from 'svelte/transition';
-  import { cubicOut } from 'svelte/easing';
+  import { fade } from 'svelte/transition';
 
   import { filterStore, filterQueryString } from '$lib/stores/filterStore';
   import { authStore } from '$lib/stores/authStore';
@@ -12,15 +10,15 @@
   import { initMediaEvents } from '$lib/utils/mediaEvents';
   import type { SubAlbum, MediaItem, MediaPageResponse } from '$lib/types/media';
 
-  import VirtualSection from '$lib/components/VirtualSection.svelte';
   import FolderGrid from '$lib/components/FolderGrid.svelte';
   import MediaCard from '$lib/components/MediaCard.svelte';
   import BatchActionBar from '$lib/components/BatchActionBar.svelte';
   import PhotoModal from '$lib/components/PhotoModal.svelte';
 
-  // Core media state
   let albums: SubAlbum[] = [];
   let items: MediaItem[] = [];
+
+  // Reactive projections
   $: itemIndexMap = buildIndexMap(items);
   $: groupedSections = buildGroupedSections(items);
 
@@ -34,19 +32,19 @@
   let filterDebounceTimer: ReturnType<typeof setTimeout> | null = null;
   let pageAbortCtrl: AbortController | null = null;
 
-  // Real-time animation tracking
+  // Real-time animation & batching
   let recentAssetIds = new Set<string>();
   let sseSubscription: { close: () => void } | null = null;
+  let incomingQueue: string[] = [];
+  let batchFlushTimer: ReturnType<typeof setTimeout> | null = null;
 
   // Selection domain
   const selection = createMediaSelection(() => fetchMedia(true));
   const { selectedMap, selectedCount, isActionLoading } = selection;
 
-  // Modal inspection
-  // Track the asset by unique ID:
+  // Modal inspection by stable ID
   let selectedAssetId: string | null = null;
 
-  // Reactively resolve index & asset via the index map:
   $: selectedIndex = selectedAssetId !== null && itemIndexMap.has(selectedAssetId)
     ? itemIndexMap.get(selectedAssetId)!
     : null;
@@ -58,51 +56,76 @@
     : [];
 
   function compareItems(a: MediaItem, b: MediaItem): number {
-    // 1. Primary sort: captured_at descending (nulls placed at the very bottom)
     const timeA = a.captured_at ? new Date(a.captured_at).getTime() : -Infinity;
     const timeB = b.captured_at ? new Date(b.captured_at).getTime() : -Infinity;
 
-    if (timeA !== timeB) {
-      return timeB - timeA; // Descending (newer dates first)
-    }
-
-    // 2. Secondary sort tie-breaker matching backend cursor: id descending
+    if (timeA !== timeB) return timeB - timeA;
     return b.id.localeCompare(a.id);
   }
 
-  function insertItemSorted(item: MediaItem) {
-    if (itemIndexMap.has(item.id)) return;
+  // Batch insert multiple incoming items at once to avoid layout thrashing
+  function insertBatchSorted(newItems: MediaItem[]) {
+    if (newItems.length === 0) return;
 
-    // Track ID for highlight animation
-    recentAssetIds.add(item.id);
+    const filtered = newItems.filter(item => !itemIndexMap.has(item.id));
+    if (filtered.length === 0) return;
+
+    for (const item of filtered) {
+      recentAssetIds.add(item.id);
+    }
     recentAssetIds = new Set(recentAssetIds);
+
     setTimeout(() => {
-      recentAssetIds.delete(item.id);
-      recentAssetIds = new Set(recentAssetIds);
-    }, 2000);
-
-    // Binary search insertion (O(log n) location search, O(n) array splice)
-    let low = 0;
-    let high = items.length;
-
-    while (low < high) {
-      const mid = (low + high) >>> 1;
-      if (compareItems(item, items[mid]) < 0) {
-        high = mid;
-      } else {
-        low = mid + 1;
+      for (const item of filtered) {
+        recentAssetIds.delete(item.id);
       }
-    }
+      recentAssetIds = new Set(recentAssetIds);
+    }, 2500);
 
-    // If the item belongs past the currently loaded cursor and more pages exist,
-    // do not splice it into the view (it will naturally appear when scrolling down).
-    if (low === items.length && hasMore) {
-      return;
-    }
+    // Merge and sort once instead of running multiple splices
+    const combined = [...items, ...filtered];
+    combined.sort(compareItems);
+    items = combined;
+  }
 
-    const updated = [...items];
-    updated.splice(low, 0, item);
-    items = updated;
+  // Optimized SSE handler: Batches requests into a single tick
+  function handleAssetReady(assetId: string) {
+    if (itemIndexMap.has(assetId) || incomingQueue.includes(assetId)) return;
+
+    incomingQueue.push(assetId);
+
+    if (!batchFlushTimer) {
+      batchFlushTimer = setTimeout(async () => {
+        const batch = [...incomingQueue];
+        incomingQueue = [];
+        batchFlushTimer = null;
+
+        const fetchedItems: MediaItem[] = [];
+        await Promise.allSettled(
+          batch.map(async (id) => {
+            try {
+              const res = await fetch(`/api/media/${id}`);
+              if (res.ok) {
+                const payload = await res.json();
+                const single: MediaItem = payload.asset || payload.item || payload;
+                if (single && single.id) {
+                  if (!$filterStore.folder_path || single.folder_path === $filterStore.folder_path) {
+                    fetchedItems.push(single);
+                  }
+                }
+              }
+            } catch {}
+          })
+        );
+
+        if (fetchedItems.length > 0) {
+          insertBatchSorted(fetchedItems);
+        } else {
+          // Fallback if individual fetches failed
+          fetchMedia(true);
+        }
+      }, 300);
+    }
   }
 
   async function fetchMedia(reset = false) {
@@ -110,7 +133,6 @@
 
     if (reset) {
       if (pageAbortCtrl) pageAbortCtrl.abort();
-      // Retaining array allows Svelte FLIP transitions on remaining items
       selection.clearSelection();
       nextCapturedAt = null;
       nextId = null;
@@ -154,29 +176,6 @@
     }
   }
 
-  async function handleAssetReady(assetId: string) {
-    try {
-      const params = new URLSearchParams($filterQueryString.replace(/^\?/, ''));
-      params.set('limit', '50');
-      params.delete('cursor_id');
-      params.delete('cursor_captured_at');
-
-      const res = await fetch(`/api/media?${params.toString()}`);
-      if (!res.ok) return;
-
-      const data: MediaPageResponse = await res.json();
-      const match = data.items.find((i) => i.id === assetId);
-
-      if (match) {
-        insertItemSorted(match);
-      } else {
-        fetchMedia(true);
-      }
-    } catch (err) {
-      fetchMedia(true);
-    }
-  }
-
   $: if (browser && $filterQueryString !== undefined) {
     if (filterDebounceTimer) clearTimeout(filterDebounceTimer);
     filterDebounceTimer = setTimeout(() => fetchMedia(true), 200);
@@ -188,13 +187,16 @@
 
     sseSubscription = initMediaEvents(handleAssetReady);
 
-    const scrollContainer = document.querySelector('main');
+    // Large rootMargin to prefetch before reaching viewport bottom
     observer = new IntersectionObserver(
       (entries) => {
-        if (entries[0].isIntersecting && hasMore && !isLoading) fetchMedia();
+        if (entries[0].isIntersecting && hasMore && !isLoading) {
+          fetchMedia();
+        }
       },
-      { root: scrollContainer ?? null, rootMargin: '600px' }
+      { root: null, rootMargin: '800px 0px' }
     );
+
     if (scrollTrigger) observer.observe(scrollTrigger);
 
     return () => {
@@ -205,6 +207,7 @@
   onDestroy(() => {
     if (pageAbortCtrl) pageAbortCtrl.abort();
     if (filterDebounceTimer) clearTimeout(filterDebounceTimer);
+    if (batchFlushTimer) clearTimeout(batchFlushTimer);
     if (observer) observer.disconnect();
     if (sseSubscription) sseSubscription.close();
   });
@@ -244,7 +247,7 @@
 
   {#if items.length === 0 && albums.length === 0 && !isLoading}
     <div
-      in:fade={{ duration: 250 }}
+      in:fade={{ duration: 150 }}
       class="flex-1 flex flex-col items-center justify-center text-center py-16 text-neutral-500 text-xs"
     >
       <div class="text-2xl mb-1">
@@ -259,37 +262,33 @@
   {:else}
     <div class="space-y-6">
       {#each groupedSections as [groupName, groupList] (groupName)}
-        <VirtualSection itemCount={groupList.length} minHeight={240}>
-          <h2 class="text-xs font-semibold text-neutral-400 uppercase tracking-wider mb-2 sticky top-0 bg-neutral-950/80 backdrop-blur-md py-1 z-10">
+        <!-- Replaced conflicting virtualizer with pure browser content-visibility -->
+        <section class="section-container">
+          <h2 class="text-xs font-semibold text-neutral-400 uppercase tracking-wider mb-2 sticky top-0 bg-neutral-950/90 py-1.5 z-10">
             {groupName}
           </h2>
           <div class="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 gap-2.5">
             {#each groupList as asset (asset.id)}
               <div
-                animate:flip={{ duration: 380, easing: cubicOut }}
-                in:scale={{ start: 0.88, duration: 300, opacity: 0, easing: cubicOut }}
-                out:scale={{ start: 0.88, duration: 220, opacity: 0, easing: cubicOut }}
-                class="relative will-change-transform rounded-lg overflow-hidden transition-shadow duration-500 {recentAssetIds.has(asset.id) ? 'animate-incoming ring-2 ring-blue-500/60' : ''}"
+                class="relative rounded-lg overflow-hidden bg-neutral-900 aspect-square contain-paint {recentAssetIds.has(asset.id) ? 'animate-incoming ring-2 ring-blue-500/60' : ''}"
               >
                 <MediaCard
                   {asset}
                   isSelected={Boolean($selectedMap[asset.id])}
-                  on:open={() => {
-                    selectedAssetId = asset.id;
-                  }}
+                  on:open={() => (selectedAssetId = asset.id)}
                   on:select={(e) => selection.toggleSelect(asset.id, e.detail, items, itemIndexMap)}
                 />
               </div>
             {/each}
           </div>
-        </VirtualSection>
+        </section>
       {/each}
     </div>
   {/if}
 
   <div bind:this={scrollTrigger} class="py-6 text-center text-xs text-neutral-600 min-h-[2rem]">
     {#if isLoading}
-      <span in:fade={{ duration: 150 }}>Loading more...</span>
+      <span>Loading more...</span>
     {/if}
   </div>
 
@@ -301,7 +300,6 @@
     on:clear={selection.clearSelection}
   />
 
-  <!-- In PhotoModal: -->
   {#if selectedAsset && selectedIndex !== null}
     <PhotoModal
       asset={selectedAsset}
@@ -327,7 +325,8 @@
         const item = items.find((i) => i.id === e.detail.id);
         if (item) {
           item.is_favorite = e.detail.is_favorite ? 1 : 0;
-          items = [...items];
+          // Trigger local update on card without reassigning full array
+          items = items;
         }
       }}
     />
@@ -335,6 +334,17 @@
 </div>
 
 <style>
+  /* Native browser-level rendering virtualization */
+  .section-container {
+    content-visibility: auto;
+    contain-intrinsic-size: auto 320px;
+  }
+
+  /* Isolates box painting for grid cards to prevent global repaints */
+  .contain-paint {
+    contain: paint;
+  }
+
   @keyframes incoming-fade {
     0% {
       box-shadow: 0 0 0 2px rgba(59, 130, 246, 0.7), 0 8px 24px rgba(59, 130, 246, 0.25);

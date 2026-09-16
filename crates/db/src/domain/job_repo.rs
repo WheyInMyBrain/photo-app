@@ -10,5 +10,6 @@ pub struct DbJob {
     pub folder_path: String,
     pub disk_path: PathBuf,
     pub sha256: String,
+    pub job_type: String,
     pub file_size_bytes: i64,
 }

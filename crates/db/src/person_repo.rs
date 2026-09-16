@@ -255,14 +255,17 @@ impl PersonRepo {
         .fetch_all(&mut *tx)
         .await?;
 
+        // Reassign faces to the target identity
         sqlx::query("UPDATE asset_faces SET person_id = ?1 WHERE person_id = ?2")
             .bind(target_person_id)
             .bind(source_person_id)
             .execute(&mut *tx)
             .await?;
 
+        // Recalculate target centroid
         Self::recompute_cluster_centroid(&mut tx, user_id, target_person_id).await?;
 
+        // Delete the source person
         sqlx::query("DELETE FROM persons WHERE id = ?1 AND user_id = ?2")
             .bind(source_person_id)
             .bind(user_id)

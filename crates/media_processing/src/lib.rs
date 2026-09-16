@@ -48,14 +48,15 @@ impl MediaEngine {
         }
     }
 
-    pub fn process_asset_sync(
-        &self,
+    // =========================================================================
+    // PHASE 1: Fast Derivatives & Metadata Extraction (Runs in milliseconds)
+    // =========================================================================
+
+    pub fn process_derivatives_sync(
         disk_path: &Path,
         asset_id: &str,
         thumbs_root: &Path,
-        existing_clusters: Vec<KnownPersonCluster>,
-        run_ai: bool,
-    ) -> Result<ProcessedMediaResult, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<DerivativeResult, Box<dyn std::error::Error + Send + Sync>> {
         let ext = disk_path
             .extension()
             .and_then(|s| s.to_str())
@@ -66,24 +67,19 @@ impl MediaEngine {
         let shard_dir = thumbs_root.join(shard);
         std::fs::create_dir_all(&shard_dir)?;
 
-        // Route both videos and animated GIFs through the motion/video pipeline
         if video_processor::VideoProcessor::is_video_or_anim(&ext) {
-            self.process_video(disk_path, asset_id, thumbs_root, &shard_dir, &ext, existing_clusters, run_ai)
+            Self::generate_video_derivatives(disk_path, asset_id, &shard_dir, &ext)
         } else {
-            self.process_image(disk_path, asset_id, thumbs_root, &shard_dir, &ext, existing_clusters, run_ai)
+            Self::generate_image_derivatives(disk_path, asset_id, &shard_dir, &ext)
         }
     }
 
-    fn process_image(
-        &self,
+    fn generate_image_derivatives(
         disk_path: &Path,
         asset_id: &str,
-        thumbs_root: &Path,
         shard_dir: &Path,
         ext: &str,
-        existing_clusters: Vec<KnownPersonCluster>,
-        run_ai: bool,
-    ) -> Result<ProcessedMediaResult, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<DerivativeResult, Box<dyn std::error::Error + Send + Sync>> {
         let meta = metadata::MetadataService::extract(disk_path);
         let img = image_processor::ImageProcessor::load_image(disk_path)?;
         let width = img.width() as i64;
@@ -100,43 +96,7 @@ impl MediaEngine {
             _ => "image/jpeg",
         }.to_string();
 
-        if !run_ai {
-            return Ok(ProcessedMediaResult {
-                mime_type,
-                width,
-                height,
-                aspect_ratio,
-                duration_seconds: None,
-                thumb_path,
-                preview_path,
-                meta,
-                detected_faces: Vec::new(),
-                updated_clusters: Vec::new(),
-                new_persons: Vec::new(),
-                tags: Vec::new(),
-                clip_embedding: None,
-            });
-        }
-
-        // 1. Tags
-        let tags = self.tag_engine.tag_image(&img, 0.35)
-            .unwrap_or_default()
-            .into_iter()
-            .map(|(name, confidence)| TagPrediction { name, confidence })
-            .collect();
-
-        // 2. Faces
-        let faces_res = FaceClusterer::cluster_single_image(
-            &img,
-            &self.face_engine,
-            thumbs_root,
-            existing_clusters,
-        )?;
-
-        // 3. Visual CLIP Embedding
-        let clip_embedding = self.clip_engine.extract_image_embedding(&img).ok();
-
-        Ok(ProcessedMediaResult {
+        Ok(DerivativeResult {
             mime_type,
             width,
             height,
@@ -145,30 +105,17 @@ impl MediaEngine {
             thumb_path,
             preview_path,
             meta,
-            detected_faces: faces_res.detected_faces,
-            updated_clusters: faces_res.updated_clusters,
-            new_persons: faces_res.new_persons,
-            tags,
-            clip_embedding,
         })
     }
 
-    fn process_video(
-        &self,
+    fn generate_video_derivatives(
         disk_path: &Path,
         asset_id: &str,
-        thumbs_root: &Path,
         shard_dir: &Path,
         ext: &str,
-        existing_clusters: Vec<KnownPersonCluster>,
-        run_ai: bool,
-    ) -> Result<ProcessedMediaResult, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<DerivativeResult, Box<dyn std::error::Error + Send + Sync>> {
         let v_meta = video_processor::VideoProcessor::extract_metadata(disk_path)?;
 
-        // Generates:
-        // 1. _thumb.webp (Static WebP)
-        // 2. _motion.mp4 (480p silent 3-second loop)
-        // 3. _preview.mp4 (720p H.264 FastStart stream)
         let derivatives = video_processor::VideoProcessor::generate_all_derivatives(
             disk_path,
             asset_id,
@@ -205,26 +152,115 @@ impl MediaEngine {
             _ => "video/mp4",
         }.to_string();
 
-        let thumb_path = derivatives.thumb_rel;
-        let preview_path = derivatives.preview_rel;
+        Ok(DerivativeResult {
+            mime_type,
+            width: v_meta.width,
+            height: v_meta.height,
+            aspect_ratio,
+            duration_seconds: Some(v_meta.duration_seconds),
+            thumb_path: derivatives.thumb_rel,
+            preview_path: derivatives.preview_rel,
+            meta,
+        })
+    }
 
-        if !run_ai {
-            return Ok(ProcessedMediaResult {
-                mime_type,
-                width: v_meta.width,
-                height: v_meta.height,
-                aspect_ratio,
-                duration_seconds: Some(v_meta.duration_seconds),
-                thumb_path,
-                preview_path,
-                meta,
-                detected_faces: Vec::new(),
-                updated_clusters: Vec::new(),
-                new_persons: Vec::new(),
-                tags: Vec::new(),
-                clip_embedding: None,
-            });
+    // =========================================================================
+    // PHASE 2: Background AI Pipeline (Runs completely independently)
+    // =========================================================================
+
+    pub fn process_ai_sync(
+        &self,
+        disk_path: &Path,
+        asset_id: &str,
+        thumbs_root: &Path,
+        existing_clusters: Vec<KnownPersonCluster>,
+    ) -> Result<AiEnrichmentResult, Box<dyn std::error::Error + Send + Sync>> {
+        let ext = disk_path
+            .extension()
+            .and_then(|s| s.to_str())
+            .unwrap_or("")
+            .to_lowercase();
+
+        let shard = if asset_id.len() >= 2 { &asset_id[0..2] } else { "misc" };
+        let shard_dir = thumbs_root.join(shard);
+
+        if video_processor::VideoProcessor::is_video_or_anim(&ext) {
+            self.process_video_ai(disk_path, asset_id, &shard_dir, thumbs_root, existing_clusters)
+        } else {
+            self.process_image_ai(disk_path, asset_id, &shard_dir, thumbs_root, existing_clusters)
         }
+    }
+
+    fn process_image_ai(
+        &self,
+        disk_path: &Path,
+        asset_id: &str,
+        shard_dir: &Path,
+        thumbs_root: &Path,
+        existing_clusters: Vec<KnownPersonCluster>,
+    ) -> Result<AiEnrichmentResult, Box<dyn std::error::Error + Send + Sync>> {
+        // Look for the preview generated in Phase 1 (e.g. {shard}/{asset_id}_preview.webp or .jpg)
+        let candidate_preview = shard_dir.join(format!("{}_preview.webp", asset_id));
+        let candidate_preview_jpg = shard_dir.join(format!("{}_preview.jpg", asset_id));
+
+        // Use the lightweight preview if present; otherwise fall back to the original file
+        let source_path = if candidate_preview.exists() {
+            &candidate_preview
+        } else if candidate_preview_jpg.exists() {
+            &candidate_preview_jpg
+        } else {
+            disk_path
+        };
+
+        // Decodes a small ~1080p preview in ~5ms instead of a 48MP raw image
+        let img = image_processor::ImageProcessor::load_image(source_path)?;
+
+        // 1. Tags
+        let tags = self.tag_engine.tag_image(&img, 0.35)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|(name, confidence)| TagPrediction { name, confidence })
+            .collect();
+
+        // 2. Face Detection & Clustering
+        let faces_res = FaceClusterer::cluster_single_image(
+            &img,
+            &self.face_engine,
+            thumbs_root,
+            existing_clusters,
+        )?;
+
+        // 3. Visual CLIP Embedding
+        let clip_embedding = self.clip_engine.extract_image_embedding(&img).ok();
+
+        Ok(AiEnrichmentResult {
+            detected_faces: faces_res.detected_faces,
+            updated_clusters: faces_res.updated_clusters,
+            new_persons: faces_res.new_persons,
+            tags,
+            clip_embedding,
+        })
+    }
+
+    fn process_video_ai(
+        &self,
+        disk_path: &Path,
+        asset_id: &str,
+        shard_dir: &Path,
+        thumbs_root: &Path,
+        existing_clusters: Vec<KnownPersonCluster>,
+    ) -> Result<AiEnrichmentResult, Box<dyn std::error::Error + Send + Sync>> {
+        // Determine whether to sample from the lightweight 720p H.264 preview or the original
+        let candidate_preview_mp4 = shard_dir.join(format!("{}_preview.mp4", asset_id));
+        let video_source = if candidate_preview_mp4.exists() {
+            &candidate_preview_mp4
+        } else {
+            disk_path
+        };
+
+        // Extract metadata for duration
+        let v_meta = video_processor::VideoProcessor::extract_metadata(video_source)
+            .or_else(|_| video_processor::VideoProcessor::extract_metadata(disk_path))?;
 
         let sample_count = if v_meta.duration_seconds > 60.0 {
             4
@@ -234,8 +270,9 @@ impl MediaEngine {
             1
         };
 
+        // Samples 720p frames rapidly from the preview mp4
         let sampled_frames = video_processor::VideoProcessor::sample_frames(
-            disk_path,
+            video_source,
             v_meta.duration_seconds,
             sample_count,
         );
@@ -265,18 +302,10 @@ impl MediaEngine {
             existing_clusters,
         )?;
 
-        // 3. Pool CLIP embeddings across all sampled video frames
+        // 3. Pooled CLIP embedding
         let clip_embedding = self.clip_engine.extract_video_embedding(&sampled_frames).ok();
 
-        Ok(ProcessedMediaResult {
-            mime_type,
-            width: v_meta.width,
-            height: v_meta.height,
-            aspect_ratio,
-            duration_seconds: Some(v_meta.duration_seconds),
-            thumb_path,
-            preview_path,
-            meta,
+        Ok(AiEnrichmentResult {
             detected_faces: faces_res.detected_faces,
             updated_clusters: faces_res.updated_clusters,
             new_persons: faces_res.new_persons,

@@ -164,3 +164,8 @@ pub struct SimilarMediaItem {
     pub mime_type: String,
     pub similarity: f32,
 }
+
+pub struct AssetCacheMetadata {
+    pub thumb_path: String,
+    pub mime_type: String,
+}
