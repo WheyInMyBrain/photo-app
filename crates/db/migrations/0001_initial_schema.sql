@@ -304,3 +304,51 @@ CREATE INDEX IF NOT EXISTS idx_jobs_user_status_created
 CREATE INDEX IF NOT EXISTS idx_jobs_global_pending 
     ON processing_jobs(status, created_at)
     WHERE status = 'pending';
+
+-- ============================================================================
+-- 7. SCRAPED POSTS & MEDIA STAGING (USER-SCOPED)
+-- ============================================================================
+CREATE TABLE IF NOT EXISTS scraped_posts (
+    id TEXT PRIMARY KEY NOT NULL,
+    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    platform TEXT NOT NULL,                     -- 'direct', 'instagram', 'reddit', 'tiktok'
+    external_post_id TEXT NOT NULL,             -- URL hash, IG shortcode, or Reddit ID
+    author TEXT NOT NULL,                       -- 'natgeo', 'web', 'r/rust'
+    caption TEXT,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(user_id, platform, external_post_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_scraped_posts_lookup 
+    ON scraped_posts(user_id, platform, external_post_id);
+
+CREATE TABLE IF NOT EXISTS scraped_media_items (
+    id TEXT PRIMARY KEY NOT NULL,
+    scraped_post_id TEXT NOT NULL REFERENCES scraped_posts(id) ON DELETE CASCADE,
+    item_index INTEGER NOT NULL,
+    media_type TEXT NOT NULL CHECK (media_type IN ('image', 'video')),
+    cdn_url TEXT NOT NULL,
+    audio_url TEXT,
+    thumbnail_url TEXT,
+    suggested_filename TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'downloaded', 'skipped')),
+    asset_id TEXT REFERENCES assets(id) ON DELETE SET NULL,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(scraped_post_id, item_index)
+);
+
+CREATE INDEX IF NOT EXISTS idx_scraped_items_post 
+    ON scraped_media_items(scraped_post_id, item_index);
+
+CREATE INDEX IF NOT EXISTS idx_scraped_items_asset 
+    ON scraped_media_items(asset_id) 
+    WHERE asset_id IS NOT NULL;
+
+-- Trigger: When an asset is purged from `assets`, detach and reset scraped item to 'skipped'
+CREATE TRIGGER IF NOT EXISTS trg_scraped_items_on_asset_delete
+AFTER DELETE ON assets
+BEGIN
+    UPDATE scraped_media_items 
+    SET asset_id = NULL, status = 'skipped' 
+    WHERE asset_id = OLD.id;
+END;

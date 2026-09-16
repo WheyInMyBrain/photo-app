@@ -1,12 +1,13 @@
 #[derive(Clone, Debug)]
 pub struct RawDetection {
-    /// Normalized bounding box coordinates [0.0..1.0] relative to original image dimensions
+    /// Normalized bounding box coordinates [0.0..1.0]
     pub x: f32,
     pub y: f32,
     pub w: f32,
     pub h: f32,
     pub score: f32,
-    #[allow(dead_code)]
+    /// Absolute coordinates on the original image: [(x, y); 5]
+    /// Order: [Left Eye, Right Eye, Nose Tip, Left Mouth Corner, Right Mouth Corner]
     pub landmarks: Vec<(f32, f32)>,
 }
 
@@ -28,11 +29,7 @@ impl ScrfdPostProcessor {
         let area_b = b.w * b.h;
         let union_area = area_a + area_b - inter_area;
 
-        if union_area <= 0.0 {
-            0.0
-        } else {
-            inter_area / union_area
-        }
+        if union_area <= 0.0 { 0.0 } else { inter_area / union_area }
     }
 
     pub fn nms(mut detections: Vec<RawDetection>, iou_threshold: f32) -> Vec<RawDetection> {
@@ -42,9 +39,7 @@ impl ScrfdPostProcessor {
         let mut suppressed = vec![false; detections.len()];
 
         for i in 0..detections.len() {
-            if suppressed[i] {
-                continue;
-            }
+            if suppressed[i] { continue; }
             picked.push(detections[i].clone());
 
             for j in (i + 1)..detections.len() {
@@ -53,16 +48,13 @@ impl ScrfdPostProcessor {
                 }
             }
         }
-
         picked
     }
 
-    /// Decodes SCRFD 10G tensors for a given stride level (8, 16, or 32).
-    /// Uses anchor grid offsets to compute normalized bounding boxes.
     pub fn decode_stride(
         score_slice: &[f32],
         bbox_slice: &[f32],
-        _kps_slice: Option<&[f32]>,
+        kps_slice: Option<&[f32]>,
         stride: usize,
         score_threshold: f32,
         scale: f32,
@@ -73,7 +65,7 @@ impl ScrfdPostProcessor {
     ) -> Vec<RawDetection> {
         let feat_h = 640 / stride;
         let feat_w = 640 / stride;
-        let num_anchors = 2; // SCRFD-10G has 2 anchors per spatial location
+        let num_anchors = 2;
 
         let mut detections = Vec::new();
         let mut idx = 0;
@@ -81,9 +73,7 @@ impl ScrfdPostProcessor {
         for y in 0..feat_h {
             for x in 0..feat_w {
                 for _a in 0..num_anchors {
-                    if idx >= score_slice.len() {
-                        break;
-                    }
+                    if idx >= score_slice.len() { break; }
 
                     let score = score_slice[idx];
 
@@ -98,33 +88,45 @@ impl ScrfdPostProcessor {
                             let r = bbox_slice[bbox_idx + 2] * stride as f32;
                             let b = bbox_slice[bbox_idx + 3] * stride as f32;
 
-                            let x1 = ((anchor_x - l - pad_x) / scale).max(0.0).min(orig_w as f32);
-                            let y1 = ((anchor_y - t - pad_y) / scale).max(0.0).min(orig_h as f32);
-                            let x2 = ((anchor_x + r - pad_x) / scale).max(0.0).min(orig_w as f32);
-                            let y2 = ((anchor_y + b - pad_y) / scale).max(0.0).min(orig_h as f32);
+                            let x1 = ((anchor_x - l - pad_x) / scale).clamp(0.0, orig_w as f32);
+                            let y1 = ((anchor_y - t - pad_y) / scale).clamp(0.0, orig_h as f32);
+                            let x2 = ((anchor_x + r - pad_x) / scale).clamp(0.0, orig_w as f32);
+                            let y2 = ((anchor_y + b - pad_y) / scale).clamp(0.0, orig_h as f32);
 
                             let box_w = x2 - x1;
                             let box_h = y2 - y1;
 
-                            // Filter out degenerate micro-boxes (< 12px)
                             if box_w >= 12.0 && box_h >= 12.0 {
+                                // Decode 5 landmark keypoints (x, y)
+                                let mut landmarks = Vec::with_capacity(5);
+                                if let Some(kps) = kps_slice {
+                                    let kps_idx = idx * 10;
+                                    if kps_idx + 9 < kps.len() {
+                                        for k in 0..5 {
+                                            let kpx = ((anchor_x + kps[kps_idx + k * 2] * stride as f32 - pad_x) / scale)
+                                                .clamp(0.0, orig_w as f32);
+                                            let kpy = ((anchor_y + kps[kps_idx + k * 2 + 1] * stride as f32 - pad_y) / scale)
+                                                .clamp(0.0, orig_h as f32);
+                                            landmarks.push((kpx, kpy));
+                                        }
+                                    }
+                                }
+
                                 detections.push(RawDetection {
                                     x: x1 / orig_w as f32,
                                     y: y1 / orig_h as f32,
                                     w: box_w / orig_w as f32,
                                     h: box_h / orig_h as f32,
                                     score,
-                                    landmarks: Vec::new(),
+                                    landmarks,
                                 });
                             }
                         }
                     }
-
                     idx += 1;
                 }
             }
         }
-
         detections
     }
 }

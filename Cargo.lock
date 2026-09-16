@@ -294,6 +294,7 @@ dependencies = [
  "base64 0.23.1",
  "bytemuck",
  "chrono",
+ "db",
  "dotenvy",
  "futures-util",
  "hex",
@@ -775,6 +776,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8b1e3a325bc115f096c8b77bbf027a7c2592230e70be2d985be950d3d5e60ebe"
 dependencies = [
  "serde",
+]
+
+[[package]]
+name = "db"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "bytemuck",
+ "serde",
+ "sqlx",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

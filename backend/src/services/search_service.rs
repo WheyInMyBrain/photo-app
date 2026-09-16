@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use sqlx::SqlitePool;
 use media_processing::ClipEngine;
-use crate::domain::media::MediaQuery;
+use db::domain::media::MediaQuery;
 use crate::services::clip_cache::ClipCacheManager;
 
 pub struct ParsedSearchQuery {

@@ -1,6 +1,4 @@
 mod config;
-mod db;
-mod domain;
 mod error;
 mod middleware;
 mod routes;

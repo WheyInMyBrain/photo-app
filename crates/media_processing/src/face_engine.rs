@@ -1,6 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use image::{imageops::FilterType, DynamicImage, GenericImageView};
+use image::{imageops::FilterType, DynamicImage, GenericImageView, RgbImage};
 use ndarray::Array4;
 use ort::{
     session::{builder::GraphOptimizationLevel, Session},
@@ -27,7 +27,6 @@ pub struct FaceEngine {
 }
 
 impl FaceEngine {
-    /// Initializes both ONNX models with CPU-optimized multithreading
     pub fn init(model_dir: &Path) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let detector_path = model_dir.join("10g_bnkps.onnx");
         let recognizer_path = model_dir.join("w600k_r50.onnx");
@@ -52,7 +51,6 @@ impl FaceEngine {
                 .map_err(|e| e.to_string())?
                 .commit_from_file(path)
                 .map_err(|e| e.to_string())?;
-
             Ok(session)
         };
 
@@ -66,8 +64,6 @@ impl FaceEngine {
         })
     }
 
-    /// Prepares an image for SCRFD (640x640 letterbox)
-    /// SCRFD expects BGR format normalized with (x - 127.5) / 128.0
     pub fn preprocess_scrfd(&self, img: &DynamicImage) -> PreprocessedLetterbox {
         let (orig_w, orig_h) = img.dimensions();
         let target_size = 640.0f32;
@@ -87,7 +83,6 @@ impl FaceEngine {
 
         let mut tensor = Array4::<f32>::zeros((1, 3, 640, 640));
 
-        // SCRFD expects BGR format (channel 0 = Blue, 1 = Green, 2 = Red)
         for (x, y, pixel) in rgb_resized.enumerate_pixels() {
             let target_x = pad_x_int + x as usize;
             let target_y = pad_y_int + y as usize;
@@ -113,27 +108,143 @@ impl FaceEngine {
         }
     }
 
-    /// Prepares a 112x112 cropped face chip for w600k_r50.onnx.
-    /// InsightFace expects RGB normalized with (x - 127.5) / 127.5
-    pub fn preprocess_arcface(&self, face_chip: &DynamicImage) -> Array4<f32> {
-        let resized = face_chip.resize_exact(112, 112, FilterType::Triangle);
-        let rgb = resized.to_rgb8();
+    /// Aligns face using 5 landmarks to canonical 112x112 ArcFace template
+    pub fn align_face_112(
+        img: &DynamicImage,
+        landmarks: &[(f32, f32)],
+    ) -> DynamicImage {
+        const TEMPLATE: [(f32, f32); 5] = [
+            (38.2946, 51.6963), // Left eye
+            (73.5318, 51.5014), // Right eye
+            (56.0252, 71.7366), // Nose tip
+            (41.5493, 92.3655), // Left mouth
+            (70.7299, 92.2041), // Right mouth
+        ];
 
+        // Fallback: If not enough landmarks, return an explicit 112x112 buffer
+        if landmarks.len() < 5 {
+            let resized = img.resize_exact(112, 112, FilterType::Triangle);
+            return DynamicImage::ImageRgb8(resized.to_rgb8());
+        }
+
+        // 1. Compute means
+        let (mut mean_src_x, mut mean_src_y) = (0.0f32, 0.0f32);
+        let (mut mean_dst_x, mut mean_dst_y) = (0.0f32, 0.0f32);
+
+        for i in 0..5 {
+            mean_src_x += landmarks[i].0;
+            mean_src_y += landmarks[i].1;
+            mean_dst_x += TEMPLATE[i].0;
+            mean_dst_y += TEMPLATE[i].1;
+        }
+        mean_src_x /= 5.0; mean_src_y /= 5.0;
+        mean_dst_x /= 5.0; mean_dst_y /= 5.0;
+
+        // 2. Umeyama estimation for similarity transform
+        let (mut var_src, mut cov_xx, mut cov_xy, mut cov_yx, mut cov_yy) = 
+            (0.0f32, 0.0f32, 0.0f32, 0.0f32, 0.0f32);
+            
+        for i in 0..5 {
+            let sx = landmarks[i].0 - mean_src_x;
+            let sy = landmarks[i].1 - mean_src_y;
+            let dx = TEMPLATE[i].0 - mean_dst_x;
+            let dy = TEMPLATE[i].1 - mean_dst_y;
+
+            var_src += sx * sx + sy * sy;
+            cov_xx += dx * sx;
+            cov_xy += dx * sy;
+            cov_yx += dy * sx;
+            cov_yy += dy * sy;
+        }
+
+        if var_src < 1e-6 {
+            let resized = img.resize_exact(112, 112, FilterType::Triangle);
+            return DynamicImage::ImageRgb8(resized.to_rgb8());
+        }
+
+        let a = (cov_xx + cov_yy) / var_src;
+        let b = (cov_xy - cov_yx) / var_src;
+
+        let tx = mean_dst_x - (a * mean_src_x - b * mean_src_y);
+        let ty = mean_dst_y - (b * mean_src_x + a * mean_src_y);
+
+        let det = a * a + b * b;
+        if det < 1e-6 {
+            let resized = img.resize_exact(112, 112, FilterType::Triangle);
+            return DynamicImage::ImageRgb8(resized.to_rgb8());
+        }
+
+        let inv_a = a / det;
+        let inv_b = -b / det;
+
+        let (orig_w, orig_h) = img.dimensions();
+        let rgb = img.to_rgb8();
+        let mut aligned = RgbImage::new(112, 112);
+
+        // 3. Bilinear backward warp (Strictly 0..112)
+        for out_y in 0..112 {
+            for out_x in 0..112 {
+                let shifted_x = out_x as f32 - tx;
+                let shifted_y = out_y as f32 - ty;
+
+                let src_x = inv_a * shifted_x - inv_b * shifted_y;
+                let src_y = inv_b * shifted_x + inv_a * shifted_y;
+
+                if src_x >= 0.0 && src_x < (orig_w - 1) as f32 && src_y >= 0.0 && src_y < (orig_h - 1) as f32 {
+                    let x0 = src_x.floor() as u32;
+                    let y0 = src_y.floor() as u32;
+                    let x1 = x0 + 1;
+                    let y1 = y0 + 1;
+
+                    let dx = src_x - x0 as f32;
+                    let dy = src_y - y0 as f32;
+
+                    let p00 = rgb.get_pixel(x0, y0);
+                    let p10 = rgb.get_pixel(x1, y0);
+                    let p01 = rgb.get_pixel(x0, y1);
+                    let p11 = rgb.get_pixel(x1, y1);
+
+                    let mut pixel = [0u8; 3];
+                    for c in 0..3 {
+                        let top = (1.0 - dx) * p00[c] as f32 + dx * p10[c] as f32;
+                        let bottom = (1.0 - dx) * p01[c] as f32 + dx * p11[c] as f32;
+                        pixel[c] = ((1.0 - dy) * top + dy * bottom).clamp(0.0, 255.0) as u8;
+                    }
+                    aligned.put_pixel(out_x, out_y, image::Rgb(pixel));
+                }
+            }
+        }
+
+        DynamicImage::ImageRgb8(aligned)
+    }
+
+    /// Prepares a 112x112 aligned face chip for w600k_r50.onnx
+    pub fn preprocess_arcface(&self, aligned_face: &DynamicImage) -> Array4<f32> {
+        // Enforce exact 112x112 constraint regardless of input variant
+        let resized = if aligned_face.width() != 112 || aligned_face.height() != 112 {
+            aligned_face.resize_exact(112, 112, FilterType::Nearest)
+        } else {
+            aligned_face.clone()
+        };
+
+        let rgb = resized.to_rgb8();
         let mut tensor = Array4::<f32>::zeros((1, 3, 112, 112));
 
         for (x, y, pixel) in rgb.enumerate_pixels() {
             let px = x as usize;
             let py = y as usize;
 
-            tensor[[0, 0, py, px]] = (pixel[0] as f32 - 127.5) / 127.5;
-            tensor[[0, 1, py, px]] = (pixel[1] as f32 - 127.5) / 127.5;
-            tensor[[0, 2, py, px]] = (pixel[2] as f32 - 127.5) / 127.5;
+            // Guard against out-of-bounds indexing
+            if px < 112 && py < 112 {
+                tensor[[0, 0, py, px]] = (pixel[0] as f32 - 127.5) / 127.5;
+                tensor[[0, 1, py, px]] = (pixel[1] as f32 - 127.5) / 127.5;
+                tensor[[0, 2, py, px]] = (pixel[2] as f32 - 127.5) / 127.5;
+            }
         }
 
         tensor
     }
 
-    /// Runs inference with SCRFD, decodes output strides (8, 16, 32), and applies NMS
     pub fn detect_faces(
         &self,
         img: &DynamicImage,
@@ -142,21 +253,16 @@ impl FaceEngine {
     ) -> Result<Vec<RawDetection>, Box<dyn std::error::Error + Send + Sync>> {
         let prep = self.preprocess_scrfd(img);
 
-        let input_tensor = Tensor::from_array(prep.tensor)
-            .map_err(|e| e.to_string())?;
-
+        let input_tensor = Tensor::from_array(prep.tensor).map_err(|e| e.to_string())?;
         let mut detector = self.detector.lock().map_err(|e| e.to_string())?;
-        let outputs = detector.run(ort::inputs![input_tensor])
-            .map_err(|e| e.to_string())?;
+        let outputs = detector.run(ort::inputs![input_tensor]).map_err(|e| e.to_string())?;
 
         let mut all_detections = Vec::new();
         let strides = [8, 16, 32];
 
         for (i, &stride) in strides.iter().enumerate() {
-            let (_, score_slice) = outputs[i].try_extract_tensor::<f32>()
-                .map_err(|e| e.to_string())?;
-            let (_, bbox_slice) = outputs[i + 3].try_extract_tensor::<f32>()
-                .map_err(|e| e.to_string())?;
+            let (_, score_slice) = outputs[i].try_extract_tensor::<f32>().map_err(|e| e.to_string())?;
+            let (_, bbox_slice) = outputs[i + 3].try_extract_tensor::<f32>().map_err(|e| e.to_string())?;
 
             let kps_slice = if (i + 6) < outputs.len() {
                 outputs[i + 6].try_extract_tensor::<f32>().ok().map(|(_, s)| s)
@@ -192,13 +298,12 @@ impl FaceEngine {
         Ok(slice.to_vec())
     }
 
-    /// Extracts an L2-normalized 512-dim embedding with horizontal flip augmentation
     pub fn extract_embedding(
         &self,
-        face_chip: &DynamicImage,
+        aligned_face: &DynamicImage,
     ) -> Result<Vec<f32>, Box<dyn std::error::Error + Send + Sync>> {
-        let tensor_orig = self.preprocess_arcface(face_chip);
-        let tensor_flip = self.preprocess_arcface(&face_chip.fliph());
+        let tensor_orig = self.preprocess_arcface(aligned_face);
+        let tensor_flip = self.preprocess_arcface(&aligned_face.fliph());
 
         let raw_orig = self.run_raw_inference(tensor_orig)?;
         let raw_flip = self.run_raw_inference(tensor_flip)?;
@@ -208,7 +313,6 @@ impl FaceEngine {
             aggregated[k] = raw_orig[k] + raw_flip[k];
         }
 
-        // L2 normalization: v = v / ||v||
         let norm: f32 = aggregated.iter().map(|x| x * x).sum::<f32>().sqrt().max(1e-6);
         for v in aggregated.iter_mut() {
             *v /= norm;

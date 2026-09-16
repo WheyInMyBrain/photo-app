@@ -2,7 +2,7 @@ use sqlx::SqlitePool;
 use std::path::PathBuf;
 use std::time::Duration;
 use tracing::{error, info};
-use crate::db::AssetRepo;
+use db::asset_repo::AssetRepo;
 
 pub struct TrashPurgerService;
 

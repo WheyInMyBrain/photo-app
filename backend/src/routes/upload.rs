@@ -10,15 +10,23 @@ use tokio::fs::{self, create_dir_all, File, OpenOptions, metadata};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use uuid::Uuid;
 
-use crate::db::AssetRepo;
-use crate::domain::upload::{StagedFile, BatchUploadReceipt, UploadItemResult, InspectLinkRequest, InspectResult, InspectLinkResponse, CandidateItem, CommitLinkRequest, RawUploadQuery, ChunkUploadQuery, ChunkUploadResponse, FinalizeChunkQuery}; 
 use crate::error::AppError;
 use crate::services::queue::{ProcessJob, QueueService};
 use crate::middleware::auth::AuthUser;
 use crate::AppState;
 
 use media_processing::StorageService;
-use crate::domain::job_repo::DbJob;
+
+use db::domain::{
+    BatchUploadReceipt, CandidateItem, ChunkUploadQuery, ChunkUploadResponse,
+    CommitLinkRequest, FinalizeChunkQuery, InspectLinkRequest,
+    InspectLinkResponse, InspectResult, RawUploadQuery, StagedFile, UploadItemResult,
+};
+use db::domain::job_repo::DbJob;
+use db::AssetRepo;
+
+use db::{ScrapedMediaItemRecord, ScrapesRepo};
+use media_downloader::{download_asset, extract_manifest};
 
 async fn persist_and_enqueue_bytes(
     state: &AppState,
@@ -392,90 +400,113 @@ pub async fn inspect_link(
     auth_user: AuthUser,
     Json(payload): Json<InspectLinkRequest>,
 ) -> Result<Json<InspectResult>, AppError> {
-    let meta = media_downloader::extract_links(&payload.url)
+    // 1. Check if post already exists in SQLite via db crate
+    let manifest = if let Some(post) =
+        ScrapesRepo::find_post_by_external_id(&state.db, &auth_user.id, &payload.url)
+            .await
+            .map_err(|e| AppError::Internal(e.to_string()))?
+    {
+        let items = ScrapesRepo::fetch_items_for_post(&state.db, &post.id)
+            .await
+            .map_err(|e| AppError::Internal(e.to_string()))?;
+
+        CandidateManifest {
+            platform: post.platform.clone(),
+            author: post.author.clone(),
+            caption: post.caption.unwrap_or_default(),
+            suggested_folder: format!("{}/{}", post.platform, post.author),
+            items: items
+                .into_iter()
+                .map(|i| CandidateItem {
+                    id: i.id,
+                    media_type: i.media_type,
+                    thumbnail_url: i.thumbnail_url.unwrap_or_default(),
+                    thumbnail_base64: None,
+                    high_res_url: i.cdn_url,
+                    audio_url: i.audio_url,
+                    suggested_filename: i.suggested_filename,
+                })
+                .collect(),
+        }
+    } else {
+        // 2. Not cached: extract upstream through media_downloader
+        let extracted = extract_manifest(&payload.url)
+            .await
+            .map_err(|e| AppError::BadRequest(format!("Link extraction failed: {e}")))?;
+
+        // 3. Persist to DB using ScrapesRepo
+        let db_items: Vec<ScrapedMediaItemRecord> = extracted
+            .items
+            .iter()
+            .map(|i| ScrapedMediaItemRecord {
+                id: i.id.clone(),
+                media_type: i.media_type.clone(),
+                cdn_url: i.high_res_url.clone(),
+                audio_url: i.audio_url.clone(),
+                thumbnail_url: Some(i.thumbnail_url.clone()),
+                suggested_filename: i.suggested_filename.clone(),
+            })
+            .collect();
+
+        ScrapesRepo::save_scraped_post_and_items(
+            &state.db,
+            &extracted.post_id,
+            &auth_user.id,
+            &extracted.platform,
+            &payload.url,
+            &extracted.author,
+            &extracted.caption,
+            &db_items,
+        )
         .await
-        .map_err(|e| AppError::BadRequest(format!("Link inspection failed: {e}")))?;
+        .map_err(|e| AppError::Internal(e.to_string()))?;
 
-    let clean_caption: String = meta
-        .caption
-        .chars()
-        .take(30)
-        .map(|c| if c.is_alphanumeric() { c } else { '_' })
-        .collect::<String>()
-        .trim_matches('_')
-        .to_lowercase();
+        CandidateManifest {
+            platform: extracted.platform,
+            author: extracted.author,
+            caption: extracted.caption,
+            suggested_folder: extracted.suggested_folder,
+            items: extracted
+                .items
+                .into_iter()
+                .map(|i| CandidateItem {
+                    id: i.id,
+                    media_type: i.media_type,
+                    thumbnail_url: i.thumbnail_url,
+                    thumbnail_base64: i.thumbnail_base64,
+                    high_res_url: i.high_res_url,
+                    audio_url: i.audio_url,
+                    suggested_filename: i.suggested_filename,
+                })
+                .collect(),
+        }
+    };
 
-    let prefix = if clean_caption.is_empty() { "post" } else { &clean_caption };
-    let total = meta.items.len();
+    let target_folder = StorageService::sanitize_folder_path(&manifest.suggested_folder);
 
-    let candidate_items: Vec<CandidateItem> = meta
-        .items
-        .into_iter()
-        .enumerate()
-        .map(|(idx, item)| {
-            let media_type_str = match item.media_type {
-                media_downloader::MediaType::Video => "video".to_string(),
-                media_downloader::MediaType::Image => "image".to_string(),
-            };
-
-            // Detect actual extension (handles animated GIFs and WebP links)
-            let lower_url = item.high_res_url.to_lowercase();
-            let ext = if media_type_str == "video" {
-                "mp4"
-            } else if lower_url.contains(".gif") {
-                "gif"
-            } else if lower_url.contains(".webp") {
-                "webp"
-            } else if lower_url.contains(".png") {
-                "png"
-            } else {
-                "jpg"
-            };
-
-            let suggested_filename = if total > 1 {
-                format!("{prefix}_{}.{ext}", idx + 1)
-            } else {
-                format!("{prefix}.{ext}")
-            };
-
-            CandidateItem {
-                id: format!("item_{idx}"),
-                media_type: media_type_str,
-                thumbnail_url: item.thumbnail_url,
-                thumbnail_base64: item.thumbnail_base64,
-                high_res_url: item.high_res_url,
-                audio_url: item.audio_url,
-                suggested_filename,
-            }
-        })
-        .collect();
-
-    let clean_author = StorageService::sanitize_folder_path(&meta.author);
-    let target_folder = format!("{}/{}", meta.platform, clean_author);
-
-    // Single item downloads and enqueues immediately
-    if total == 1 {
+    // Single item fast-path
+    if manifest.items.len() == 1 {
         let commit_req = CommitLinkRequest {
-            platform: meta.platform.clone(),
+            platform: manifest.platform,
             folder: Some(target_folder),
-            selected_items: candidate_items,
+            selected_items: manifest.items,
         };
 
         let Json(receipt) = commit_link_download(State(state), auth_user, Json(commit_req)).await?;
         return Ok(Json(InspectResult::Committed(receipt)));
     }
 
+    // Multi-item preview
     Ok(Json(InspectResult::Preview(InspectLinkResponse {
         suggested_folder: target_folder,
-        platform: meta.platform,
-        author: meta.author,
-        caption: meta.caption,
-        total_items: total,
-        items: candidate_items,
+        platform: manifest.platform,
+        author: manifest.author,
+        caption: manifest.caption,
+        total_items: manifest.items.len(),
+        items: manifest.items,
     })))
 }
 
-/// POST /api/media/commit-link
 pub async fn commit_link_download(
     State(state): State<AppState>,
     auth_user: AuthUser,
@@ -490,14 +521,18 @@ pub async fn commit_link_download(
     let mut results = Vec::new();
 
     for item in payload.selected_items {
-        let bytes = match media_downloader::download_asset(
+        let bytes = match download_asset(
             &item.high_res_url,
             item.audio_url.as_deref(),
             &item.media_type,
         )
         .await
         {
-            Ok(b) => b,
+            Ok(b) => {
+                // Update SQLite status via ScrapesRepo
+                let _ = ScrapesRepo::mark_item_downloaded(&state.db, &item.id).await;
+                b
+            }
             Err(e) => {
                 results.push(UploadItemResult {
                     file_name: item.suggested_filename,
@@ -529,6 +564,14 @@ pub async fn commit_link_download(
         folder: sanitized_folder,
         items: results,
     }))
+}
+
+struct CandidateManifest {
+    pub platform: String,
+    pub author: String,
+    pub caption: String,
+    pub suggested_folder: String,
+    pub items: Vec<CandidateItem>,
 }
 
 /// POST /api/upload/chunk

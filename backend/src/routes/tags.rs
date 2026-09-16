@@ -3,8 +3,8 @@ use axum::{
     response::Json,
 };
 
-use crate::db::TagRepo;
-use crate::domain::tag::AssetTagItem;
+use db::TagRepo;
+use db::domain::tag::AssetTagItem;
 use crate::error::AppError;
 use crate::AppState;
 

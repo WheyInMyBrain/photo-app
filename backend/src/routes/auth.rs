@@ -1,8 +1,5 @@
 use argon2::{
-    password_hash::{
-        phc::PasswordHash,
-        PasswordHasher, PasswordVerifier,
-    },
+    password_hash::{phc::PasswordHash, PasswordHasher, PasswordVerifier},
     Argon2,
 };
 use axum::{
@@ -12,17 +9,18 @@ use axum::{
     routing::{get, post},
     Router,
 };
-use sqlx::Row;
 use uuid::Uuid;
 
 use crate::{
-    domain::auth::{
-        ApiKeyResponse, AuthStatusResponse, AuthSuccessResponse, LoginPayload,
-        RegisterBiometricPayload, RegisterPayload,
-    },
     error::AppError,
     middleware::auth::AuthUser,
     AppState,
+};
+
+use db::AuthRepo;
+use db::domain::auth::{
+    ApiKeyResponse, AuthStatusResponse, AuthSuccessResponse, LoginPayload,
+    RegisterBiometricPayload, RegisterPayload,
 };
 
 pub fn auth_routes() -> Router<AppState> {
@@ -87,21 +85,9 @@ async fn get_status(
         }
     };
 
-    let display_name: Option<String> = sqlx::query_scalar(
-        "SELECT display_name FROM users WHERE id = ?1",
-    )
-    .bind(&user.id)
-    .fetch_optional(&state.db)
-    .await
-    .unwrap_or_default();
-
-    let has_passkey: bool = sqlx::query_scalar(
-        "SELECT COUNT(*) > 0 FROM passkey_credentials WHERE user_id = ?1",
-    )
-    .bind(&user.id)
-    .fetch_one(&state.db)
-    .await
-    .unwrap_or(false);
+    let (display_name, has_passkey) = AuthRepo::get_user_status(&state.db, &user.id)
+        .await
+        .unwrap_or_default();
 
     Ok(Json(AuthStatusResponse {
         is_authenticated: true,
@@ -125,15 +111,11 @@ async fn register(
         return Err(AppError::BadRequest("Password must be at least 6 characters".into()));
     }
 
-    let existing: bool = sqlx::query_scalar(
-        "SELECT COUNT(*) > 0 FROM users WHERE username = ?1 COLLATE NOCASE",
-    )
-    .bind(username)
-    .fetch_one(&state.db)
-    .await
-    .unwrap_or(false);
+    let exists = AuthRepo::username_exists(&state.db, username)
+        .await
+        .unwrap_or(false);
 
-    if existing {
+    if exists {
         return Err(AppError::BadRequest("Username already exists".into()));
     }
 
@@ -147,18 +129,14 @@ async fn register(
     let api_key = generate_api_key();
     let clean_display = payload.display_name.as_deref().map(str::trim).filter(|s| !s.is_empty());
 
-    sqlx::query(
-        r#"
-        INSERT INTO users (id, username, password_hash, display_name, api_key)
-        VALUES (?1, ?2, ?3, ?4, ?5)
-        "#,
+    AuthRepo::create_user(
+        &state.db,
+        &user_id,
+        username,
+        &password_hash,
+        clean_display,
+        &api_key,
     )
-    .bind(&user_id)
-    .bind(username)
-    .bind(&password_hash)
-    .bind(clean_display)
-    .bind(&api_key)
-    .execute(&state.db)
     .await
     .map_err(|e| AppError::Internal(e.to_string()))?;
 
@@ -180,27 +158,13 @@ async fn login(
     State(state): State<AppState>,
     Json(payload): Json<LoginPayload>,
 ) -> Result<Response, AppError> {
-    let row = sqlx::query(
-        r#"
-        SELECT id, username, password_hash, display_name, api_key 
-        FROM users 
-        WHERE username = ?1 COLLATE NOCASE
-        LIMIT 1
-        "#,
-    )
-    .bind(payload.username.trim())
-    .fetch_optional(&state.db)
-    .await
-    .map_err(|e| AppError::Internal(e.to_string()))?
-    .ok_or_else(|| AppError::BadRequest("Invalid username or password".into()))?;
+    let user = AuthRepo::find_for_login(&state.db, payload.username.trim())
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?
+        .ok_or_else(|| AppError::BadRequest("Invalid username or password".into()))?;
 
-    let user_id: String = row.get("id");
-    let username: String = row.get("username");
-    let password_hash: String = row.get("password_hash");
-    let display_name: Option<String> = row.get("display_name");
-    let api_key: Option<String> = row.get("api_key");
-
-    let parsed_hash = PasswordHash::new(&password_hash).map_err(|e| AppError::Internal(e.to_string()))?;
+    let parsed_hash = PasswordHash::new(&user.password_hash)
+        .map_err(|e| AppError::Internal(e.to_string()))?;
 
     if Argon2::default()
         .verify_password(payload.password.as_bytes(), &parsed_hash)
@@ -209,28 +173,24 @@ async fn login(
         return Err(AppError::BadRequest("Invalid username or password".into()));
     }
 
-    let active_key = match api_key {
+    let active_key = match user.api_key {
         Some(k) if !k.is_empty() => k,
         _ => {
             let new_key = generate_api_key();
-            let _ = sqlx::query("UPDATE users SET api_key = ?1 WHERE id = ?2")
-                .bind(&new_key)
-                .bind(&user_id)
-                .execute(&state.db)
-                .await;
+            let _ = AuthRepo::set_api_key(&state.db, &user.id, &new_key).await;
             new_key
         }
     };
 
     let response_body = AuthSuccessResponse {
-        user_id: user_id.clone(),
-        username,
-        display_name,
+        user_id: user.id.clone(),
+        username: user.username,
+        display_name: user.display_name,
         api_key: active_key,
     };
 
     let mut headers = HeaderMap::new();
-    headers.insert(header::SET_COOKIE, make_session_cookie(&user_id));
+    headers.insert(header::SET_COOKIE, make_session_cookie(&user.id));
 
     Ok((StatusCode::OK, headers, Json(response_body)).into_response())
 }
@@ -247,9 +207,7 @@ async fn get_api_key(
     State(state): State<AppState>,
     auth_user: AuthUser,
 ) -> Result<Json<ApiKeyResponse>, AppError> {
-    let key: Option<String> = sqlx::query_scalar("SELECT api_key FROM users WHERE id = ?1")
-        .bind(&auth_user.id)
-        .fetch_optional(&state.db)
+    let key = AuthRepo::get_api_key(&state.db, &auth_user.id)
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?;
 
@@ -257,10 +215,7 @@ async fn get_api_key(
         Some(k) if !k.is_empty() => k,
         _ => {
             let new_key = generate_api_key();
-            sqlx::query("UPDATE users SET api_key = ?1 WHERE id = ?2")
-                .bind(&new_key)
-                .bind(&auth_user.id)
-                .execute(&state.db)
+            AuthRepo::set_api_key(&state.db, &auth_user.id, &new_key)
                 .await
                 .map_err(|e| AppError::Internal(e.to_string()))?;
             new_key
@@ -277,10 +232,7 @@ async fn rotate_api_key(
 ) -> Result<Json<ApiKeyResponse>, AppError> {
     let new_key = generate_api_key();
 
-    sqlx::query("UPDATE users SET api_key = ?1 WHERE id = ?2")
-        .bind(&new_key)
-        .bind(&auth_user.id)
-        .execute(&state.db)
+    AuthRepo::set_api_key(&state.db, &auth_user.id, &new_key)
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?;
 
@@ -293,17 +245,12 @@ async fn register_biometric(
     auth_user: AuthUser,
     Json(payload): Json<RegisterBiometricPayload>,
 ) -> Result<Json<bool>, AppError> {
-    sqlx::query(
-        r#"
-        INSERT INTO passkey_credentials (id, user_id, public_key, name)
-        VALUES (?1, ?2, X'00', ?3)
-        ON CONFLICT(id) DO UPDATE SET name = excluded.name
-        "#,
+    AuthRepo::upsert_passkey_credential(
+        &state.db,
+        &payload.credential_id,
+        &auth_user.id,
+        payload.name.as_deref(),
     )
-    .bind(&payload.credential_id)
-    .bind(&auth_user.id)
-    .bind(payload.name)
-    .execute(&state.db)
     .await
     .map_err(|e| AppError::Internal(e.to_string()))?;
 

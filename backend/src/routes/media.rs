@@ -6,8 +6,8 @@ use axum::{
 use tower_http::services::ServeFile;
 use tracing::error;
 
-use crate::db::AssetRepo;
-use crate::domain::media::{
+use db::AssetRepo;
+use db::domain::{
     BatchActionRequest, BatchActionResponse, DynamicFiltersResponse, FavoriteToggleResponse,
     MediaPageResponse, MediaQuery, SimilarMediaItem, SoftDeleteResponse,
 };

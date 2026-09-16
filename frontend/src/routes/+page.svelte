@@ -43,16 +43,37 @@
   const { selectedMap, selectedCount, isActionLoading } = selection;
 
   // Modal inspection
-  let selectedIndex: number | null = null;
+  // Track the asset by unique ID:
+  let selectedAssetId: string | null = null;
+
+  // Reactively resolve index & asset via the index map:
+  $: selectedIndex = selectedAssetId !== null && itemIndexMap.has(selectedAssetId)
+    ? itemIndexMap.get(selectedAssetId)!
+    : null;
+
   $: selectedAsset = selectedIndex !== null ? items[selectedIndex] : null;
 
   $: folderSegments = $filterStore.folder_path
     ? $filterStore.folder_path.split('/').filter(Boolean)
     : [];
 
-  function prependItem(item: MediaItem) {
+  function compareItems(a: MediaItem, b: MediaItem): number {
+    // 1. Primary sort: captured_at descending (nulls placed at the very bottom)
+    const timeA = a.captured_at ? new Date(a.captured_at).getTime() : -Infinity;
+    const timeB = b.captured_at ? new Date(b.captured_at).getTime() : -Infinity;
+
+    if (timeA !== timeB) {
+      return timeB - timeA; // Descending (newer dates first)
+    }
+
+    // 2. Secondary sort tie-breaker matching backend cursor: id descending
+    return b.id.localeCompare(a.id);
+  }
+
+  function insertItemSorted(item: MediaItem) {
     if (itemIndexMap.has(item.id)) return;
 
+    // Track ID for highlight animation
     recentAssetIds.add(item.id);
     recentAssetIds = new Set(recentAssetIds);
     setTimeout(() => {
@@ -60,7 +81,28 @@
       recentAssetIds = new Set(recentAssetIds);
     }, 2000);
 
-    items = [item, ...items];
+    // Binary search insertion (O(log n) location search, O(n) array splice)
+    let low = 0;
+    let high = items.length;
+
+    while (low < high) {
+      const mid = (low + high) >>> 1;
+      if (compareItems(item, items[mid]) < 0) {
+        high = mid;
+      } else {
+        low = mid + 1;
+      }
+    }
+
+    // If the item belongs past the currently loaded cursor and more pages exist,
+    // do not splice it into the view (it will naturally appear when scrolling down).
+    if (low === items.length && hasMore) {
+      return;
+    }
+
+    const updated = [...items];
+    updated.splice(low, 0, item);
+    items = updated;
   }
 
   async function fetchMedia(reset = false) {
@@ -126,7 +168,7 @@
       const match = data.items.find((i) => i.id === assetId);
 
       if (match) {
-        prependItem(match);
+        insertItemSorted(match);
       } else {
         fetchMedia(true);
       }
@@ -233,8 +275,7 @@
                   {asset}
                   isSelected={Boolean($selectedMap[asset.id])}
                   on:open={() => {
-                    const idx = itemIndexMap.get(asset.id);
-                    if (idx !== undefined) selectedIndex = idx;
+                    selectedAssetId = asset.id;
                   }}
                   on:select={(e) => selection.toggleSelect(asset.id, e.detail, items, itemIndexMap)}
                 />
@@ -260,6 +301,7 @@
     on:clear={selection.clearSelection}
   />
 
+  <!-- In PhotoModal: -->
   {#if selectedAsset && selectedIndex !== null}
     <PhotoModal
       asset={selectedAsset}
@@ -267,14 +309,19 @@
       nextAsset={selectedIndex < items.length - 1 ? items[selectedIndex + 1] : null}
       hasPrev={selectedIndex > 0}
       hasNext={selectedIndex < items.length - 1}
-      on:close={() => (selectedIndex = null)}
-      on:prev={() => selectedIndex && (selectedIndex -= 1)}
-      on:next={() => selectedIndex !== null && (selectedIndex += 1)}
-      on:selectAsset={(e) => {
-        const targetIdx = itemIndexMap.get(e.detail.id);
-        if (targetIdx !== undefined) {
-          selectedIndex = targetIdx;
+      on:close={() => (selectedAssetId = null)}
+      on:prev={() => {
+        if (selectedIndex !== null && selectedIndex > 0) {
+          selectedAssetId = items[selectedIndex - 1].id;
         }
+      }}
+      on:next={() => {
+        if (selectedIndex !== null && selectedIndex < items.length - 1) {
+          selectedAssetId = items[selectedIndex + 1].id;
+        }
+      }}
+      on:selectAsset={(e) => {
+        selectedAssetId = e.detail.id;
       }}
       on:toggleFavorite={(e) => {
         const item = items.find((i) => i.id === e.detail.id);

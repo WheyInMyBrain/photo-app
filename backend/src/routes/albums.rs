@@ -5,7 +5,7 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 
-use crate::db::AlbumRepo;
+use db::{AlbumRepo};
 use crate::error::AppError;
 use crate::AppState;
 

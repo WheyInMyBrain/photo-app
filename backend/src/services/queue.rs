@@ -1,16 +1,15 @@
-use sqlx::{QueryBuilder, Row, Sqlite, SqlitePool};
+use sqlx::SqlitePool;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{broadcast, Notify, Semaphore};
 use tracing::{error, info, warn};
 
-use crate::db::{AssetRepo, JobRepo};
-use crate::domain::job_repo::DbJob;
-use crate::domain::media::NewAssetRecord;
+use db::JobRepo;
+use db::domain::{DbJob, NewAssetRecord};
+
 use crate::services::engine_coordinator::EngineCoordinator;
 use crate::WsMediaEvent;
-
 use media_processing::ProcessedMediaResult;
 
 pub type ProcessJob = DbJob;
@@ -255,17 +254,15 @@ impl QueueService {
         job: &DbJob,
         res: ProcessedMediaResult,
     ) -> Result<String, String> {
-        let mut tx = pool.begin().await.map_err(|e| e.to_string())?;
-
         let db_thumb_path = format!("users/{}/thumbs/{}", job.user_id, res.thumb_path);
         let db_preview_path = format!("users/{}/thumbs/{}", job.user_id, res.preview_path);
 
-        let clip_embedding_bytes: Option<Vec<u8>> = res
+        let clip_embedding_bytes = res
             .clip_embedding
             .as_ref()
             .map(|emb| bytemuck::cast_slice(emb.as_slice()).to_vec());
 
-        let record = NewAssetRecord {
+        let asset = NewAssetRecord {
             id: job.asset_id.clone(),
             user_id: job.user_id.clone(),
             sha256: job.sha256.clone(),
@@ -297,178 +294,48 @@ impl QueueService {
             clip_embedding: clip_embedding_bytes,
         };
 
-        AssetRepo::insert_asset_tx(&mut *tx, &record)
-            .await
-            .map_err(|e| e.to_string())?;
-
-        // 1. Batch insert new persons with cover_face_id = NULL to satisfy foreign keys
-        let new_covers: Vec<(String, String)> = res
-            .new_persons
-            .iter()
-            .filter(|np| !np.cover_face_id.is_empty())
-            .map(|np| (np.person_id.clone(), np.cover_face_id.clone()))
-            .collect();
-
-        if !res.new_persons.is_empty() {
-            let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new(
-                "INSERT INTO persons (id, user_id, name, cover_face_id, face_count, centroid_embedding) ",
-            );
-
-            qb.push_values(res.new_persons, |mut b, np| {
-                let embedding_bytes: &[u8] = bytemuck::cast_slice(&np.centroid);
-                b.push_bind(np.person_id)
-                    .push_bind(&job.user_id)
-                    .push_bind(None::<String>) // name is NULL initially
-                    .push_bind(None::<String>) // cover_face_id is NULL initially!
-                    .push_bind(1i32)
-                    .push_bind(embedding_bytes);
-            });
-
-            qb.build()
-                .execute(&mut *tx)
-                .await
-                .map_err(|e| e.to_string())?;
-        }
-
-        // 2. Update existing cluster centroids
-        for uc in res.updated_clusters {
-            let embedding_bytes: &[u8] = bytemuck::cast_slice(&uc.new_centroid);
-            sqlx::query(
-                "UPDATE persons 
-                SET centroid_embedding = ?1, face_count = ?2, updated_at = CURRENT_TIMESTAMP
-                WHERE id = ?3 AND user_id = ?4",
-            )
-            .bind(embedding_bytes)
-            .bind(uc.new_face_count)
-            .bind(&uc.person_id)
-            .bind(&job.user_id)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| e.to_string())?;
-        }
-
-        // 3. Batch insert detected faces (now both asset_id and person_id exist!)
-        if !res.detected_faces.is_empty() {
-            let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new(
-                "INSERT INTO asset_faces (
-                    id, asset_id, person_id, bbox_x, bbox_y, bbox_w, bbox_h,
-                    detection_score, face_thumb_path, embedding, is_verified
-                ) ",
-            );
-
-            qb.push_values(res.detected_faces, |mut b, face| {
-                let embedding_bytes: &[u8] = bytemuck::cast_slice(&face.embedding);
-                let face_thumb_db_path = format!("users/{}/thumbs/{}", job.user_id, face.face_thumb_rel_path);
-
-                b.push_bind(face.face_id)
-                    .push_bind(&job.asset_id)
-                    .push_bind(face.person_id)
-                    .push_bind(face.bbox_x)
-                    .push_bind(face.bbox_y)
-                    .push_bind(face.bbox_w)
-                    .push_bind(face.bbox_h)
-                    .push_bind(face.score)
-                    .push_bind(face_thumb_db_path)
-                    .push_bind(embedding_bytes)
-                    .push_bind(0i32);
-            });
-
-            qb.build()
-                .execute(&mut *tx)
-                .await
-                .map_err(|e| e.to_string())?;
-        }
-
-        // 3b. Backfill cover_face_id for new persons now that asset_faces exist
-        for (person_id, cover_face_id) in new_covers {
-            sqlx::query(
-                "UPDATE persons SET cover_face_id = ?1 WHERE id = ?2 AND user_id = ?3",
-            )
-            .bind(cover_face_id)
-            .bind(person_id)
-            .bind(&job.user_id)
-            .execute(&mut *tx)
-            .await
-            .map_err(|e| e.to_string())?;
-        }
-
-        // 4. Batch insert/link tags
-        if !res.tags.is_empty() {
-            let mut tag_qb: QueryBuilder<Sqlite> =
-                QueryBuilder::new("INSERT INTO tags (user_id, name, source) ");
-
-            tag_qb.push_values(&res.tags, |mut b, tag| {
-                b.push_bind(&job.user_id)
-                    .push_bind(&tag.name)
-                    .push_bind("model");
-            });
-            tag_qb.push(" ON CONFLICT(user_id, name) DO NOTHING");
-
-            tag_qb
-                .build()
-                .execute(&mut *tx)
-                .await
-                .map_err(|e| e.to_string())?;
-
-            let mut fetch_qb: QueryBuilder<Sqlite> =
-                QueryBuilder::new("SELECT id, name FROM tags WHERE user_id = ");
-            fetch_qb.push_bind(&job.user_id);
-            fetch_qb.push(" AND name IN (");
-
-            let mut separated = fetch_qb.separated(", ");
-            for tag in &res.tags {
-                separated.push_bind(&tag.name);
-            }
-            separated.push_unseparated(")");
-
-            let tag_rows = fetch_qb
-                .build()
-                .fetch_all(&mut *tx)
-                .await
-                .map_err(|e| e.to_string())?;
-
-            let tag_map: std::collections::HashMap<String, i64> = tag_rows
+        let payload = db::IngestionPayload {
+            asset,
+            new_persons: res
+                .new_persons
                 .into_iter()
-                .filter_map(|r| {
-                    let id: i64 = r.try_get("id").ok()?;
-                    let name: String = r.try_get("name").ok()?;
-                    Some((name.to_lowercase(), id))
+                .map(|np| db::IngestionNewPerson {
+                    person_id: np.person_id,
+                    cover_face_id: np.cover_face_id,
+                    centroid: np.centroid,
                 })
-                .collect();
-
-            let valid_tags: Vec<(i64, f64)> = res
-                .tags
-                .iter()
-                .filter_map(|t| {
-                    tag_map
-                        .get(&t.name.to_lowercase())
-                        .map(|&id| (id, t.confidence as f64))
+                .collect(),
+            updated_clusters: res
+                .updated_clusters
+                .into_iter()
+                .map(|uc| db::IngestionUpdatedCluster {
+                    person_id: uc.person_id,
+                    new_centroid: uc.new_centroid,
+                    new_face_count: uc.new_face_count,
                 })
-                .collect();
+                .collect(),
+            detected_faces: res
+                .detected_faces
+                .into_iter()
+                .map(|face| db::IngestionDetectedFace {
+                    face_id: face.face_id,
+                    person_id: face.person_id,
+                    bbox_x: face.bbox_x,
+                    bbox_y: face.bbox_y,
+                    bbox_w: face.bbox_w,
+                    bbox_h: face.bbox_h,
+                    score: face.score,
+                    face_thumb_db_path: format!("users/{}/thumbs/{}", job.user_id, face.face_thumb_rel_path),
+                    embedding: face.embedding,
+                })
+                .collect(),
+            tags: res.tags.into_iter().map(|t| (t.name, t.confidence)).collect(),
+        };
 
-            if !valid_tags.is_empty() {
-                let mut link_qb: QueryBuilder<Sqlite> = QueryBuilder::new(
-                    "INSERT INTO asset_tags (asset_id, tag_id, confidence, source) ",
-                );
+        db::IngestionRepo::commit_processed_asset(pool, payload)
+            .await
+            .map_err(|e| e.to_string())?;
 
-                link_qb.push_values(valid_tags, |mut b, (tag_id, conf)| {
-                    b.push_bind(&job.asset_id)
-                        .push_bind(tag_id)
-                        .push_bind(conf)
-                        .push_bind("AI");
-                });
-
-                link_qb.push(" ON CONFLICT(asset_id, tag_id) DO UPDATE SET confidence = excluded.confidence");
-
-                link_qb
-                    .build()
-                    .execute(&mut *tx)
-                    .await
-                    .map_err(|e| e.to_string())?;
-            }
-        }
-
-        tx.commit().await.map_err(|e| e.to_string())?;
         Ok(db_thumb_path)
     }
 }

@@ -4,8 +4,8 @@ use axum::{
 };
 use serde::Deserialize;
 
-use crate::db::{AssetRepo, PersonRepo};
-use crate::domain::person::{AssetFaceDetail, PersonCard};
+use db::{AssetRepo, PersonRepo};
+use db::domain::{AssetFaceDetail, PersonCard};
 use crate::error::AppError;
 use crate::middleware::auth::AuthUser;
 use crate::AppState;

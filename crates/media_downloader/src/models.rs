@@ -1,4 +1,5 @@
 use bytes::Bytes;
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MediaType {
@@ -54,4 +55,25 @@ pub struct DownloadedBatch {
     pub caption: String,
     pub target_folder: String,
     pub assets: Vec<DownloadedAsset>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StagedCandidateItem {
+    pub id: String,                         // e.g. "item_0" or DB item id
+    pub media_type: String,                 // "image" | "video"
+    pub thumbnail_url: String,
+    pub thumbnail_base64: Option<String>,
+    pub high_res_url: String,
+    pub audio_url: Option<String>,
+    pub suggested_filename: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StagedManifest {
+    pub post_id: String,
+    pub platform: String,
+    pub author: String,
+    pub caption: String,
+    pub suggested_folder: String,
+    pub items: Vec<StagedCandidateItem>,
 }
