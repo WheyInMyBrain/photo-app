@@ -21,7 +21,7 @@ CREATE TABLE IF NOT EXISTS passkey_credentials (
 );
 
 CREATE INDEX IF NOT EXISTS idx_passkeys_user ON passkey_credentials(user_id);
-CREATE INDEX idx_users_api_key ON users(api_key);
+CREATE INDEX IF NOT EXISTS idx_users_api_key ON users(api_key);
 
 
 -- ============================================================================
@@ -76,7 +76,7 @@ CREATE TABLE IF NOT EXISTS assets (
     country TEXT,
     country_code TEXT,
 
-    -- Camera EXIF
+    -- Camera & Origin EXIF
     camera_make TEXT,
     camera_model TEXT,
     lens_model TEXT,
@@ -89,9 +89,15 @@ CREATE TABLE IF NOT EXISTS assets (
     flash_fired INTEGER CHECK (flash_fired IN (0, 1)),
     white_balance TEXT,
     orientation INTEGER DEFAULT 1,
-    author TEXT,
+    
+    -- Social & Web Origin Tracking
+    author TEXT,                           -- e.g. "@username" or camera owner
     copyright TEXT,
-    raw_metadata JSON,
+    source_platform TEXT,                  -- 'direct', 'instagram', 'reddit', 'local'
+    source_url TEXT,                       -- original post link
+    source_post_id TEXT,                   -- external post identifier
+    caption TEXT,                          -- primary post title or IG/Reddit caption
+    raw_metadata JSON,                     -- unconstrained JSON fallback
     
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -101,22 +107,22 @@ CREATE TABLE IF NOT EXISTS assets (
     UNIQUE(user_id, rel_path)
 );
 
--- 1. Main Feed & Pagination (Partial Index: per user, active only)
+-- Main Feed & Pagination (Partial Index: per user, active only)
 CREATE INDEX IF NOT EXISTS idx_assets_cursor_pagination 
     ON assets(user_id, captured_at DESC, id DESC)
     WHERE deleted_at IS NULL;
 
--- 2. Trash View Index (Per user trash and background purge worker)
+-- Trash View Index
 CREATE INDEX IF NOT EXISTS idx_assets_trash
     ON assets(user_id, deleted_at DESC, id DESC)
     WHERE deleted_at IS NOT NULL;
 
--- 3. Geo Coordinate Bounding Box Index
+-- Geo Coordinate Bounding Box Index
 CREATE INDEX IF NOT EXISTS idx_assets_lat_long
     ON assets(user_id, latitude, longitude)
     WHERE latitude IS NOT NULL AND longitude IS NOT NULL AND deleted_at IS NULL;
 
--- 4. Pipeline Queue Indexes (Active assets only)
+-- Pipeline Queue Indexes
 CREATE INDEX IF NOT EXISTS idx_assets_unprocessed_faces 
     ON assets(user_id, id) 
     WHERE face_processed = 0 AND deleted_at IS NULL;
@@ -130,13 +136,17 @@ CREATE INDEX IF NOT EXISTS idx_assets_clip
     WHERE clip_embedding IS NOT NULL;
 
 CREATE INDEX IF NOT EXISTS idx_assets_unprocessed_clip
-    ON assets(user_id, id)
+    ON assets(user_id, id) 
     WHERE clip_processed = 0 AND deleted_at IS NULL;
 
--- 5. Filtering & Aggregation Indexes (Per user, active assets only)
+-- Filtering & Aggregation Indexes
 CREATE INDEX IF NOT EXISTS idx_assets_folder_seek 
     ON assets(user_id, folder_path)
     WHERE deleted_at IS NULL;
+
+CREATE INDEX IF NOT EXISTS idx_assets_platform_lookup
+    ON assets(user_id, source_platform)
+    WHERE source_platform IS NOT NULL AND deleted_at IS NULL;
 
 CREATE INDEX IF NOT EXISTS idx_assets_geo 
     ON assets(user_id, city, country_code)
@@ -162,9 +172,9 @@ CREATE TABLE IF NOT EXISTS tags (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     name TEXT NOT NULL COLLATE NOCASE,
-    category INTEGER NOT NULL DEFAULT 0, -- 0=General, 4=Character, 9=Rating
+    category INTEGER NOT NULL DEFAULT 0,  -- 0=General, 1=Hashtag, 2=Author/Artist, 4=Character, 9=Rating
     usage_count INTEGER NOT NULL DEFAULT 0,
-    source TEXT NOT NULL DEFAULT 'model' CHECK (source IN ('model', 'manual')),
+    source TEXT NOT NULL DEFAULT 'model' CHECK (source IN ('model', 'manual', 'scraped')),
     UNIQUE(user_id, name COLLATE NOCASE)
 );
 
@@ -174,8 +184,8 @@ CREATE INDEX IF NOT EXISTS idx_tags_user_autocomplete
 CREATE TABLE IF NOT EXISTS asset_tags (
     asset_id TEXT NOT NULL REFERENCES assets(id) ON DELETE CASCADE,
     tag_id INTEGER NOT NULL REFERENCES tags(id) ON DELETE CASCADE,
-    confidence REAL NOT NULL,
-    source TEXT NOT NULL DEFAULT 'AI' CHECK (source IN ('AI', 'USER')),
+    confidence REAL NOT NULL DEFAULT 1.0,
+    source TEXT NOT NULL DEFAULT 'AI' CHECK (source IN ('AI', 'USER', 'SCRAPE')),
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (asset_id, tag_id)
 ) WITHOUT ROWID;
@@ -262,13 +272,15 @@ CREATE TABLE IF NOT EXISTS album_assets (
 CREATE VIRTUAL TABLE IF NOT EXISTS asset_search_index USING fts5(
     asset_id UNINDEXED,
     user_id UNINDEXED,
+    caption,       -- e.g., "Beautiful sunset over Marine Drive"
+    author,        -- e.g., "natgeo notrealbutwow"
     persons,       -- e.g., "ram sharma john"
-    tags,          -- e.g., "hotel swimming pool indoor building"
+    tags,          -- e.g., "fashion ootd viral summer"
     location,      -- e.g., "mumbai maharashtra india"
     temporal,      -- e.g., "2026 2026-09 september sep monday"
     camera,        -- e.g., "sony ilce-7m4 a7iv 50mm"
-    file_name,     -- e.g., "IMG_2041.jpg"
-    tokenize = 'unicode61 remove_diacritics 2 tokenchars ''-._'''
+    file_name,     -- e.g., "instagram_post_1.mp4"
+    tokenize = 'unicode61 remove_diacritics 2 tokenchars ''-._#@'''
 );
 
 CREATE TRIGGER IF NOT EXISTS trg_assets_fts_cleanup
@@ -295,6 +307,7 @@ CREATE TABLE IF NOT EXISTS processing_jobs (
     status TEXT NOT NULL DEFAULT 'pending', -- 'pending', 'processing', 'completed', 'failed'
     attempts INTEGER NOT NULL DEFAULT 0,
     last_error TEXT,
+    payload JSON,                          -- Holds context: { "tags": [...], "caption": "...", "author": "..." }
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
@@ -312,16 +325,22 @@ CREATE INDEX IF NOT EXISTS idx_jobs_type_status
 CREATE INDEX IF NOT EXISTS idx_processing_jobs_queue 
     ON processing_jobs (job_type, status, attempts, created_at);
 
+
 -- ============================================================================
--- 7. SCRAPED POSTS & MEDIA STAGING (USER-SCOPED)
+-- 7. SCRAPED POSTS, MEDIA STAGING, VARIANTS & DISCOVERY QUEUE
 -- ============================================================================
+
+-- 7.1 Primary Inspected Post or Feed
 CREATE TABLE IF NOT EXISTS scraped_posts (
     id TEXT PRIMARY KEY NOT NULL,
     user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
     platform TEXT NOT NULL,                     -- 'direct', 'instagram', 'reddit', 'tiktok'
-    external_post_id TEXT NOT NULL,             -- URL hash, IG shortcode, or Reddit ID
-    author TEXT NOT NULL,                       -- 'natgeo', 'web', 'r/rust'
-    caption TEXT,
+    external_post_id TEXT NOT NULL,             -- URL hash, shortcode, or post ID
+    source_url TEXT NOT NULL,                   -- Canonical link
+    author TEXT NOT NULL,                       -- '@username' or 'web'
+    caption TEXT,                               -- Caption or thread title
+    tags JSON NOT NULL DEFAULT '[]',            -- ["viral", "fashion", "ootd"]
+    next_page_url TEXT,                         -- Pagination cursor (e.g. ?max_id=...)
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     UNIQUE(user_id, platform, external_post_id)
 );
@@ -329,15 +348,37 @@ CREATE TABLE IF NOT EXISTS scraped_posts (
 CREATE INDEX IF NOT EXISTS idx_scraped_posts_lookup 
     ON scraped_posts(user_id, platform, external_post_id);
 
+
+-- 7.2 Discovered Sibling / Child Posts (Crawled from grids, feeds, or rel="next")
+CREATE TABLE IF NOT EXISTS discovered_queue (
+    id TEXT PRIMARY KEY NOT NULL,
+    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    parent_post_id TEXT REFERENCES scraped_posts(id) ON DELETE CASCADE,
+    discovered_url TEXT NOT NULL,               -- e.g. "https://instagram.com/p/DcafCJ7yrYV/"
+    platform TEXT NOT NULL,                     -- 'instagram', 'reddit', 'generic'
+    status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'processing', 'completed', 'failed', 'ignored')),
+    depth INTEGER NOT NULL DEFAULT 1,           -- Crawl depth level
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(user_id, discovered_url)
+);
+
+CREATE INDEX IF NOT EXISTS idx_discovered_queue_pending 
+    ON discovered_queue(user_id, status, created_at)
+    WHERE status = 'pending';
+
+
+-- 7.3 Canonical Media Item (Best Available Master)
 CREATE TABLE IF NOT EXISTS scraped_media_items (
     id TEXT PRIMARY KEY NOT NULL,
     scraped_post_id TEXT NOT NULL REFERENCES scraped_posts(id) ON DELETE CASCADE,
-    item_index INTEGER NOT NULL,
+    item_index INTEGER NOT NULL,                -- 0 for single post, 0..N for carousel
     media_type TEXT NOT NULL CHECK (media_type IN ('image', 'video')),
-    cdn_url TEXT NOT NULL,
-    audio_url TEXT,
-    thumbnail_url TEXT,
+    cdn_url TEXT NOT NULL,                      -- Primary highest-resolution link
+    audio_url TEXT,                             -- Separate audio stream (DASH/CMAF/HLS)
+    thumbnail_url TEXT,                         -- Feed/grid preview poster
     suggested_filename TEXT NOT NULL,
+    width INTEGER,                              -- Highest quality width
+    height INTEGER,                             -- Highest quality height
     status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'downloaded', 'skipped')),
     asset_id TEXT REFERENCES assets(id) ON DELETE SET NULL,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -351,7 +392,25 @@ CREATE INDEX IF NOT EXISTS idx_scraped_items_asset
     ON scraped_media_items(asset_id) 
     WHERE asset_id IS NOT NULL;
 
--- Trigger: When an asset is purged from `assets`, detach and reset scraped item to 'skipped'
+
+-- 7.4 Alternate Resolutions & Encodes (720p, 1080p, 4K, Mobile Bitrates)
+CREATE TABLE IF NOT EXISTS scraped_media_variants (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    media_item_id TEXT NOT NULL REFERENCES scraped_media_items(id) ON DELETE CASCADE,
+    url TEXT NOT NULL,                          -- Direct CDN variant link
+    width INTEGER,                              -- e.g. 720
+    height INTEGER,                             -- e.g. 1280
+    label TEXT,                                 -- e.g. '720p', '1080p', '640w', 'DASH_AUDIO_128'
+    file_size_bytes INTEGER,                    -- Known size or NULL
+    is_master INTEGER NOT NULL DEFAULT 0 CHECK (is_master IN (0, 1)),
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(media_item_id, url)
+);
+
+CREATE INDEX IF NOT EXISTS idx_variants_media_item 
+    ON scraped_media_variants(media_item_id, width DESC);
+
+-- Trigger: When an asset is deleted, reset staged item
 CREATE TRIGGER IF NOT EXISTS trg_scraped_items_on_asset_delete
 AFTER DELETE ON assets
 BEGIN

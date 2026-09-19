@@ -51,6 +51,11 @@ pub struct NewAssetRecord {
     pub country_code: Option<String>,
     pub camera_make: Option<String>,
     pub camera_model: Option<String>,
+    pub author: Option<String>,
+    pub source_platform: Option<String>,
+    pub source_url: Option<String>,
+    pub source_post_id: Option<String>,
+    pub caption: Option<String>,
     pub clip_embedding: Option<Vec<u8>>,
 }
 

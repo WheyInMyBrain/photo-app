@@ -35,6 +35,7 @@
   let isUploading = false;
   let uploadProgress = 0;
   let statusMessage = '';
+  let inspectError = '';
   let existingFolders: string[] = [];
 
   // File Upload State
@@ -162,9 +163,19 @@
   }
 
   // --- EXTERNAL LINK LOGIC ---
+  function getThumbnailSrc(item: CandidateItem): string {
+    if (item.thumbnail_base64 && item.thumbnail_base64.trim().length > 0) {
+      return item.thumbnail_base64.startsWith('data:')
+        ? item.thumbnail_base64
+        : `data:image/jpeg;base64,${item.thumbnail_base64}`;
+    }
+    return item.thumbnail_url || '';
+  }
+
   async function inspectLink() {
-    if (!linkUrl.trim()) return;
+    if (!linkUrl.trim() || isUploading) return;
     isUploading = true;
+    inspectError = '';
     statusMessage = 'Inspecting link...';
 
     try {
@@ -174,25 +185,37 @@
         body: JSON.stringify({ url: linkUrl.trim() }),
       });
 
-      if (res.status === 401) throw new Error('Session expired.');
-      if (!res.ok) throw new Error(await res.text());
+      if (res.status === 401) {
+        authStore.checkStatus();
+        throw new Error('Session expired.');
+      }
+
+      if (!res.ok) {
+        const errorText = await res.text();
+        throw new Error(errorText || `Server responded with ${res.status}`);
+      }
 
       const data = await res.json();
-      
-      if (data.Committed) {
-        // Fast-path: Single item was automatically processed
+
+      // Support either enum wrapped ({ "Preview": { ... } }) or direct struct representation
+      const previewData: InspectPreview | null = data.Preview ?? (data.items ? data : null);
+
+      if (previewData && Array.isArray(previewData.items)) {
+        linkPreview = previewData;
+        folderPath = previewData.suggested_folder || '';
+        selectedLinkItems = new Set(previewData.items.map((i: CandidateItem) => i.id));
+      } else if (data.Committed) {
+        // Handled if server had auto-committed single items
         dispatch('uploaded', { count: data.Committed.total_uploaded || 1 });
         forceClose();
-      } else if (data.Preview) {
-        linkPreview = data.Preview;
-        folderPath = data.Preview.suggested_folder;
-        selectedLinkItems = new Set(data.Preview.items.map((i: CandidateItem) => i.id));
+      } else {
+        throw new Error('No media items could be found at this link.');
       }
     } catch (e: any) {
-      statusMessage = `Inspection failed: ${e.message}`;
-      setTimeout(() => (statusMessage = ''), 3000);
+      inspectError = e.message || 'Inspection failed.';
     } finally {
       isUploading = false;
+      statusMessage = '';
     }
   }
 
@@ -207,7 +230,7 @@
 
   async function commitLink() {
     if (!linkPreview || selectedLinkItems.size === 0) return;
-    
+
     isUploading = true;
     uploadProgress = 10;
     statusMessage = 'Importing selected media...';
@@ -227,11 +250,11 @@
 
       if (!res.ok) throw new Error(await res.text());
       const data = await res.json();
-      
+
       dispatch('uploaded', { count: data.total_uploaded || payload.selected_items.length });
       forceClose();
     } catch (e: any) {
-      statusMessage = `Import failed: ${e.message}`;
+      inspectError = `Import failed: ${e.message}`;
       isUploading = false;
     }
   }
@@ -278,6 +301,7 @@
     folderPath = '';
     uploadProgress = 0;
     statusMessage = '';
+    inspectError = '';
     linkUrl = '';
     linkPreview = null;
     selectedLinkItems.clear();
@@ -331,14 +355,14 @@
         <div class="flex p-1 bg-neutral-950 border border-neutral-800 rounded-lg">
           <button
             class="flex-1 text-xs py-1.5 rounded-md transition-colors font-medium {uploadMode === 'files' ? 'bg-neutral-800 text-white' : 'text-neutral-500 hover:text-neutral-300'}"
-            on:click={() => (uploadMode = 'files')}
+            on:click={() => { uploadMode = 'files'; inspectError = ''; }}
             disabled={isUploading}
           >
             Device Files
           </button>
           <button
             class="flex-1 text-xs py-1.5 rounded-md transition-colors font-medium {uploadMode === 'link' ? 'bg-neutral-800 text-white' : 'text-neutral-500 hover:text-neutral-300'}"
-            on:click={() => (uploadMode = 'link')}
+            on:click={() => { uploadMode = 'link'; inspectError = ''; }}
             disabled={isUploading}
           >
             Web Link
@@ -444,7 +468,7 @@
                     id="link-url-input"
                     type="url"
                     bind:value={linkUrl}
-                    placeholder="https://instagram.com/p/..."
+                    placeholder="https://instagram.com/p/... or https://reddit.com/r/..."
                     disabled={isUploading}
                     on:keydown={(e) => e.key === 'Enter' && inspectLink()}
                     class="flex-1 bg-neutral-950 border border-neutral-800 focus:border-purple-500 rounded-lg px-3 py-2 text-xs text-white placeholder-neutral-600 outline-none transition-colors"
@@ -453,11 +477,18 @@
                     type="button"
                     on:click={inspectLink}
                     disabled={!linkUrl.trim() || isUploading}
-                    class="bg-neutral-800 hover:bg-neutral-700 text-white px-4 py-2 rounded-lg text-xs font-medium transition-colors disabled:opacity-50 cursor-pointer"
+                    class="bg-neutral-800 hover:bg-neutral-700 text-white px-4 py-2 rounded-lg text-xs font-medium transition-colors disabled:opacity-50 cursor-pointer flex items-center gap-1.5 min-w-[75px] justify-center"
                   >
-                    Inspect
+                    {#if isUploading}
+                      <span class="inline-block w-3 h-3 border-2 border-white/20 border-t-white rounded-full animate-spin"></span>
+                    {:else}
+                      <span>Inspect</span>
+                    {/if}
                   </button>
                 </div>
+                {#if inspectError}
+                  <p class="text-[11px] text-red-400 pt-1 leading-snug">{inspectError}</p>
+                {/if}
               </div>
             </div>
           {:else}
@@ -466,13 +497,13 @@
               <div class="flex items-center justify-between text-xs">
                 <div>
                   <span class="text-white font-medium">{linkPreview.author}</span>
-                  <span class="text-neutral-500"> on {linkPreview.platform}</span>
+                  <span class="text-neutral-500"> on {linkPreview.platform} ({linkPreview.items.length} items)</span>
                 </div>
                 <button
                   type="button"
-                  on:click={() => (linkPreview = null)}
+                  on:click={() => { linkPreview = null; inspectError = ''; }}
                   disabled={isUploading}
-                  class="text-purple-400 hover:text-purple-300 font-medium"
+                  class="text-purple-400 hover:text-purple-300 font-medium cursor-pointer"
                 >
                   Change Link
                 </button>
@@ -484,54 +515,62 @@
                 </p>
               {/if}
 
-              <div class="grid grid-cols-3 gap-2 max-h-56 overflow-y-auto">
+              <div class="grid grid-cols-3 gap-2 max-h-56 overflow-y-auto pr-0.5">
                 {#each linkPreview.items as item}
                   <button
                     type="button"
                     disabled={isUploading}
                     on:click={() => toggleLinkItem(item.id)}
-                    class="relative aspect-square bg-neutral-800 rounded-md overflow-hidden cursor-pointer group"
+                    class="relative aspect-square bg-neutral-950 border border-neutral-800 rounded-lg overflow-hidden cursor-pointer group focus:outline-none"
                   >
                     {#if item.thumbnail_base64 || item.thumbnail_url}
                       <img
-                        src={item.thumbnail_base64 ? `data:image/jpeg;base64,${item.thumbnail_base64}` : item.thumbnail_url}
+                        src={getThumbnailSrc(item)}
                         alt="Preview"
                         class="w-full h-full object-cover transition-opacity {selectedLinkItems.has(item.id) ? 'opacity-100' : 'opacity-40 group-hover:opacity-75'}"
                       />
                     {:else}
-                      <div class="w-full h-full flex items-center justify-center text-neutral-600 text-xs {selectedLinkItems.has(item.id) ? 'text-white' : ''}">
-                        {item.media_type}
+                      <div class="w-full h-full flex flex-col items-center justify-center text-neutral-500 text-xs gap-1 {selectedLinkItems.has(item.id) ? 'text-white' : ''}">
+                        <span>{item.media_type === 'video' ? '🎬' : '🖼️'}</span>
+                        <span class="capitalize text-[10px]">{item.media_type}</span>
                       </div>
                     {/if}
-                    
+
                     <!-- Selection Indicator -->
-                    <div class="absolute top-1.5 left-1.5 w-4 h-4 rounded-full border border-white flex items-center justify-center {selectedLinkItems.has(item.id) ? 'bg-purple-500 border-purple-500' : 'bg-black/20'}">
+                    <div class="absolute top-1.5 left-1.5 w-4 h-4 rounded-full border flex items-center justify-center transition-colors {selectedLinkItems.has(item.id) ? 'bg-purple-600 border-purple-500 text-white' : 'bg-black/50 border-white/40'}">
                       {#if selectedLinkItems.has(item.id)}
-                        <svg class="w-2.5 h-2.5 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="3" d="M5 13l4 4L19 7" /></svg>
+                        <svg class="w-2.5 h-2.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="3" d="M5 13l4 4L19 7" /></svg>
                       {/if}
                     </div>
+
+                    <!-- Media Type Badge -->
+                    <span class="absolute bottom-1 right-1 text-[9px] uppercase px-1 py-0.5 rounded bg-black/70 text-neutral-300 font-mono">
+                      {item.media_type}
+                    </span>
                   </button>
                 {/each}
               </div>
+
+              {#if inspectError}
+                <p class="text-[11px] text-red-400 pt-1 leading-snug">{inspectError}</p>
+              {/if}
             </div>
           {/if}
         {/if}
 
         <!-- Progress Indicator (Shared) -->
-        {#if isUploading}
+        {#if isUploading && (uploadMode === 'files' || uploadProgress > 0)}
           <div class="space-y-1.5 pt-2">
             <div class="flex justify-between text-xs text-neutral-400">
               <span class="truncate max-w-[260px]">{statusMessage}</span>
-              <span>{uploadMode === 'files' ? uploadProgress : ''}</span>
+              <span>{uploadMode === 'files' ? `${uploadProgress}%` : ''}</span>
             </div>
-            {#if uploadMode === 'files' || uploadProgress > 0}
-              <div class="w-full bg-neutral-800 rounded-full h-1.5 overflow-hidden">
-                <div
-                  class="bg-purple-600 h-full transition-all duration-300 ease-out"
-                  style="width: {uploadProgress > 0 ? uploadProgress : 100}%"
-                ></div>
-              </div>
-            {/if}
+            <div class="w-full bg-neutral-800 rounded-full h-1.5 overflow-hidden">
+              <div
+                class="bg-purple-600 h-full transition-all duration-300 ease-out"
+                style="width: {uploadProgress > 0 ? uploadProgress : 100}%"
+              ></div>
+            </div>
           </div>
         {/if}
       </div>
@@ -550,10 +589,11 @@
           type="button"
           on:click={handleMasterUpload}
           disabled={!canUpload || isUploading}
-          class="px-4 py-1.5 rounded-lg text-xs font-semibold bg-purple-600 hover:bg-purple-500 text-white transition-colors disabled:opacity-40 cursor-pointer"
+          class="px-4 py-1.5 rounded-lg text-xs font-semibold bg-purple-600 hover:bg-purple-500 text-white transition-colors disabled:opacity-40 cursor-pointer flex items-center gap-1.5"
         >
           {#if isUploading}
-            Processing...
+            <span class="inline-block w-3 h-3 border-2 border-white/20 border-t-white rounded-full animate-spin"></span>
+            <span>Processing...</span>
           {:else if uploadMode === 'files'}
             Upload {stagedFiles.length} item{stagedFiles.length === 1 ? '' : 's'}
           {:else}

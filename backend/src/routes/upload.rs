@@ -11,7 +11,7 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use uuid::Uuid;
 
 use crate::error::AppError;
-use crate::services::queue::{ProcessJob, QueueService};
+use crate::services::queue::{QueueService};
 use crate::middleware::auth::AuthUser;
 use crate::AppState;
 
@@ -22,12 +22,13 @@ use db::domain::{
     CommitLinkRequest, FinalizeChunkQuery, InspectLinkRequest,
     InspectLinkResponse, InspectResult, RawUploadQuery, StagedFile, UploadItemResult,
 };
-use db::domain::job_repo::DbJob;
+use db::domain::job_repo::{DbJob, JobPayload};
 use db::AssetRepo;
 
-use db::{ScrapedMediaItemRecord, ScrapesRepo};
-use media_downloader::{download_asset, extract_manifest};
+use db::scrapes_repo::{ScrapedMediaItemRecord, ScrapedVariantRecord, ScrapesRepo};
+use media_downloader::{download_media, extract_media, ExtractedMediaMetadata, MediaType};
 
+/// Pipeline for raw in-memory byte uploads (direct small files, single web uploads)
 async fn persist_and_enqueue_bytes(
     state: &AppState,
     user_id: &str,
@@ -39,7 +40,9 @@ async fn persist_and_enqueue_bytes(
     let sha256 = hex::encode(Sha256::digest(bytes));
 
     // Deduplication check scoped to this user
-    if let Ok(Some(existing_id)) = AssetRepo::find_user_asset_by_sha256(&state.db, user_id, &sha256).await {
+    if let Ok(Some(existing_id)) =
+        AssetRepo::find_user_asset_by_sha256(&state.db, user_id, &sha256).await
+    {
         return UploadItemResult {
             file_name: file_name.to_string(),
             status: "duplicate".to_string(),
@@ -69,9 +72,8 @@ async fn persist_and_enqueue_bytes(
     let disk_filename = StorageService::generate_disk_filename(&asset_id, file_name);
     let disk_path = target_dir.join(&disk_filename);
 
-    // rel_path must include the folder if not "root"
-    let rel_path = if sanitized_folder == "root" {
-        disk_filename.clone()
+    let rel_path = if sanitized_folder.is_empty() || sanitized_folder == "root" {
+        disk_filename
     } else {
         format!("{}/{}", sanitized_folder, disk_filename)
     };
@@ -97,6 +99,7 @@ async fn persist_and_enqueue_bytes(
         sha256,
         job_type: "thumbnail".to_string(),
         file_size_bytes: bytes.len() as i64,
+        payload: None, // No scraped context for generic file uploads
     };
 
     if let Err(e) = QueueService::enqueue(&state.db, &state.queue_notify, job).await {
@@ -118,22 +121,23 @@ async fn persist_and_enqueue_bytes(
     }
 }
 
-/// Core pipeline for stitched chunk files already present on disk
+/// Core pipeline for files on disk: hashes, deduplicates, moves, and enqueues
 async fn persist_and_enqueue_staged_file(
     state: &AppState,
     user_id: &str,
     part_path: &Path,
     file_name: &str,
     folder: &str,
+    payload: Option<JobPayload>,
 ) -> Result<UploadItemResult, AppError> {
     if !part_path.exists() {
-        return Err(AppError::NotFound("Temporary chunk file not found".into()));
+        return Err(AppError::NotFound("Temporary file not found".into()));
     }
 
-    // 1. Flush & Stream-hash using 64KB buffers
+    // 1. Stream-hash using 64KB buffers
     let mut file_to_hash = File::open(part_path)
         .await
-        .map_err(|e| AppError::Internal(format!("Failed opening part file: {e}")))?;
+        .map_err(|e| AppError::Internal(format!("Failed opening file: {e}")))?;
 
     file_to_hash.sync_all().await.ok();
 
@@ -160,8 +164,10 @@ async fn persist_and_enqueue_staged_file(
 
     let sha256_hash = hex::encode(hasher.finalize());
 
-    // 2. Duplicate Check (Scoped to the authenticated user)
-    if let Ok(Some(existing_id)) = AssetRepo::find_user_asset_by_sha256(&state.db, user_id, &sha256_hash).await {
+    // 2. Duplicate Check (Scoped to authenticated user)
+    if let Ok(Some(existing_id)) =
+        AssetRepo::find_user_asset_by_sha256(&state.db, user_id, &sha256_hash).await
+    {
         let _ = fs::remove_file(part_path).await;
         return Ok(UploadItemResult {
             file_name: file_name.to_string(),
@@ -172,7 +178,7 @@ async fn persist_and_enqueue_staged_file(
         });
     }
 
-    // 3. Resolve destination & move -> storage_root/originals/<user_id>/<folder>
+    // 3. Resolve destination & move
     let sanitized_folder = StorageService::sanitize_folder_path(folder);
     let target_dir = StorageService::resolve_upload_dir(
         &state.config.storage_root,
@@ -182,7 +188,7 @@ async fn persist_and_enqueue_staged_file(
 
     fs::create_dir_all(&target_dir)
         .await
-        .map_err(|e| AppError::Internal(format!("Failed to create folder: {e}")))?;
+        .map_err(|e| AppError::Internal(format!("Failed creating directory: {e}")))?;
 
     let asset_id = Uuid::new_v4().to_string();
     let disk_file_name = StorageService::generate_disk_filename(&asset_id, file_name);
@@ -190,7 +196,7 @@ async fn persist_and_enqueue_staged_file(
 
     fs::rename(part_path, &destination_path)
         .await
-        .map_err(|e| AppError::Internal(format!("Failed to move asset to storage: {e}")))?;
+        .map_err(|e| AppError::Internal(format!("Failed moving asset: {e}")))?;
 
     let relative_path = if sanitized_folder.is_empty() || sanitized_folder == "root" {
         disk_file_name
@@ -198,8 +204,8 @@ async fn persist_and_enqueue_staged_file(
         format!("{}/{}", sanitized_folder, disk_file_name)
     };
 
-    // 4. Enqueue into DB as a "thumbnail" job
-    let job = ProcessJob {
+    // 4. Enqueue into DB-backed QueueService
+    let job = DbJob {
         id: Uuid::new_v4().to_string(),
         user_id: user_id.to_string(),
         asset_id: asset_id.clone(),
@@ -210,11 +216,12 @@ async fn persist_and_enqueue_staged_file(
         sha256: sha256_hash,
         job_type: "thumbnail".to_string(),
         file_size_bytes: bytes_len,
+        payload,
     };
 
     QueueService::enqueue(&state.db, &state.queue_notify, job)
         .await
-        .map_err(|e| AppError::Internal(format!("Failed enqueuing job into database: {e}")))?;
+        .map_err(|e| AppError::Internal(format!("Failed enqueuing job: {e}")))?;
 
     Ok(UploadItemResult {
         file_name: file_name.to_string(),
@@ -402,9 +409,11 @@ pub async fn inspect_link(
     auth_user: AuthUser,
     Json(payload): Json<InspectLinkRequest>,
 ) -> Result<Json<InspectResult>, AppError> {
-    // 1. Check if post already exists in SQLite via db crate
+    let clean_url = payload.url.trim();
+
+    // 1. Check if post is already cached
     let manifest = if let Some(post) =
-        ScrapesRepo::find_post_by_external_id(&state.db, &auth_user.id, &payload.url)
+        ScrapesRepo::find_post_by_url(&state.db, &auth_user.id, clean_url)
             .await
             .map_err(|e| AppError::Internal(e.to_string()))?
     {
@@ -431,52 +440,124 @@ pub async fn inspect_link(
                 .collect(),
         }
     } else {
-        // 2. Not cached: extract upstream through media_downloader
-        let extracted = extract_manifest(&payload.url)
+        // 2. Extract media from link
+        let extracted: ExtractedMediaMetadata = extract_media(clean_url)
             .await
             .map_err(|e| AppError::BadRequest(format!("Link extraction failed: {e}")))?;
 
-        // 3. Persist to DB using ScrapesRepo
+        let post_uuid = Uuid::new_v4().to_string();
+        let total_items = extracted.items.len();
+
         let db_items: Vec<ScrapedMediaItemRecord> = extracted
             .items
             .iter()
-            .map(|i| ScrapedMediaItemRecord {
-                id: i.id.clone(),
-                media_type: i.media_type.clone(),
-                cdn_url: i.high_res_url.clone(),
-                audio_url: i.audio_url.clone(),
-                thumbnail_url: Some(i.thumbnail_url.clone()),
-                suggested_filename: i.suggested_filename.clone(),
+            .enumerate()
+            .map(|(idx, item)| {
+                let media_type_str = match item.media_type {
+                    MediaType::Video => "video",
+                    MediaType::Image => "image",
+                };
+
+                let ext = if media_type_str == "video" {
+                    "mp4"
+                } else if item.high_res_url.contains(".png") {
+                    "png"
+                } else if item.high_res_url.contains(".webp") {
+                    "webp"
+                } else {
+                    "jpg"
+                };
+
+                let prefix = extracted
+                    .caption
+                    .chars()
+                    .take(24)
+                    .map(|c| if c.is_alphanumeric() { c } else { '_' })
+                    .collect::<String>()
+                    .trim_matches('_')
+                    .to_lowercase();
+
+                let safe_prefix = if prefix.is_empty() { "media" } else { &prefix };
+                let suggested_filename = if total_items > 1 {
+                    format!("{}_{}.{}", safe_prefix, idx + 1, ext)
+                } else {
+                    format!("{}.{}", safe_prefix, ext)
+                };
+
+                let (w, h) = item
+                    .dimensions
+                    .as_ref()
+                    .map(|d| (Some(d.width as i64), Some(d.height as i64)))
+                    .unwrap_or((None, None));
+
+                let variants = item
+                    .variants
+                    .iter()
+                    .map(|v| {
+                        let (vw, vh) = v
+                            .dimensions
+                            .as_ref()
+                            .map(|d| (Some(d.width as i64), Some(d.height as i64)))
+                            .unwrap_or((None, None));
+
+                        ScrapedVariantRecord {
+                            url: v.url.clone(),
+                            width: vw,
+                            height: vh,
+                            label: v.label.clone(),
+                            file_size_bytes: v.file_size_bytes.map(|s| s as i64),
+                            is_master: v.url == item.high_res_url,
+                        }
+                    })
+                    .collect();
+
+                ScrapedMediaItemRecord {
+                    id: Uuid::new_v4().to_string(),
+                    media_type: media_type_str.to_string(),
+                    cdn_url: item.high_res_url.clone(),
+                    audio_url: item.audio_url.clone(),
+                    thumbnail_url: item.thumbnail_url.clone(),
+                    suggested_filename,
+                    width: w,
+                    height: h,
+                    variants,
+                }
             })
             .collect();
 
+        // 3. Persist post and items
         ScrapesRepo::save_scraped_post_and_items(
             &state.db,
-            &extracted.post_id,
+            &post_uuid,
             &auth_user.id,
             &extracted.platform,
-            &payload.url,
+            clean_url,
+            clean_url,
             &extracted.author,
-            &extracted.caption,
+            Some(&extracted.caption),
+            &extracted.tags,
+            &extracted.discovered_post_urls,
+            extracted.next_page_url.as_deref(),
             &db_items,
         )
         .await
-        .map_err(|e| AppError::Internal(e.to_string()))?;
+        .map_err(|e| AppError::Internal(format!("Failed saving scrape: {e}")))?;
+
+        let suggested_folder = format!("{}/{}", extracted.platform, extracted.author);
 
         CandidateManifest {
             platform: extracted.platform,
             author: extracted.author,
             caption: extracted.caption,
-            suggested_folder: extracted.suggested_folder,
-            items: extracted
-                .items
+            suggested_folder,
+            items: db_items
                 .into_iter()
                 .map(|i| CandidateItem {
                     id: i.id,
                     media_type: i.media_type,
-                    thumbnail_url: i.thumbnail_url,
-                    thumbnail_base64: i.thumbnail_base64,
-                    high_res_url: i.high_res_url,
+                    thumbnail_url: i.thumbnail_url.unwrap_or_default(),
+                    thumbnail_base64: None,
+                    high_res_url: i.cdn_url,
                     audio_url: i.audio_url,
                     suggested_filename: i.suggested_filename,
                 })
@@ -486,19 +567,16 @@ pub async fn inspect_link(
 
     let target_folder = StorageService::sanitize_folder_path(&manifest.suggested_folder);
 
-    // Single item fast-path
     if manifest.items.len() == 1 {
         let commit_req = CommitLinkRequest {
             platform: manifest.platform,
             folder: Some(target_folder),
             selected_items: manifest.items,
         };
-
         let Json(receipt) = commit_link_download(State(state), auth_user, Json(commit_req)).await?;
         return Ok(Json(InspectResult::Committed(receipt)));
     }
 
-    // Multi-item preview
     Ok(Json(InspectResult::Preview(InspectLinkResponse {
         suggested_folder: target_folder,
         platform: manifest.platform,
@@ -518,45 +596,79 @@ pub async fn commit_link_download(
         return Err(AppError::BadRequest("No items selected for download".to_string()));
     }
 
-    let raw_folder = payload.folder.unwrap_or(payload.platform);
+    let raw_folder = payload.folder.unwrap_or(payload.platform.clone());
     let sanitized_folder = StorageService::sanitize_folder_path(&raw_folder);
     let mut results = Vec::new();
 
+    // Use a temp directory for initial download stream
+    let temp_download_dir = state.config.storage_root.join("temp").join("downloads");
+    tokio::fs::create_dir_all(&temp_download_dir)
+        .await
+        .map_err(|e| AppError::Internal(format!("Failed creating temp dir: {e}")))?;
+
     for item in payload.selected_items {
-        let bytes = match download_asset(
+        let temp_file_path = temp_download_dir.join(format!("{}_{}", Uuid::new_v4(), item.suggested_filename));
+
+        // 1. Download asset directly to disk
+        if let Err(e) = download_media(
             &item.high_res_url,
             item.audio_url.as_deref(),
-            &item.media_type,
+            &temp_file_path,
+            None,
         )
         .await
         {
-            Ok(b) => {
-                // Update SQLite status via ScrapesRepo
-                let _ = ScrapesRepo::mark_item_downloaded(&state.db, &item.id).await;
-                b
-            }
-            Err(e) => {
-                results.push(UploadItemResult {
-                    file_name: item.suggested_filename,
-                    status: "error".to_string(),
-                    id: None,
-                    relative_path: None,
-                    message: Some(format!("Asset download failed: {e}")),
-                });
-                continue;
-            }
+            results.push(UploadItemResult {
+                file_name: item.suggested_filename,
+                status: "error".to_string(),
+                id: None,
+                relative_path: None,
+                message: Some(format!("Download failed: {e}")),
+            });
+            continue;
+        }
+
+        // 2. Query context from ScrapesRepo
+        let ctx = ScrapesRepo::get_item_context(&state.db, &item.id)
+            .await
+            .unwrap_or(None);
+
+        let (platform, author, caption, tags, source_url) = if let Some(c) = ctx {
+            (Some(c.platform), Some(c.author), c.caption, c.tags, Some(c.source_url))
+        } else {
+            (Some(payload.platform.clone()), None, None, Vec::new(), None)
         };
 
-        let res = persist_and_enqueue_bytes(
+        let job_payload = JobPayload {
+            author,
+            platform,
+            source_url,
+            source_post_id: None,
+            caption,
+            tags,
+            scraped_item_id: Some(item.id.clone()),
+        };
+
+        // 3. Delegate hashing, deduplication, moving, and queueing to persist_and_enqueue_staged_file
+        match persist_and_enqueue_staged_file(
             &state,
             &auth_user.id,
+            &temp_file_path,
             &item.suggested_filename,
-            &bytes,
             &sanitized_folder,
+            Some(job_payload),
         )
-        .await;
-
-        results.push(res);
+        .await
+        {
+            Ok(res) => results.push(res),
+            Err(e) => results.push(UploadItemResult {
+                file_name: item.suggested_filename,
+                status: "error".to_string(),
+                id: None,
+                relative_path: None,
+                message: Some(format!("{e:?}")),
+            }),
+        }
     }
 
     let success_count = results.iter().filter(|r| r.status == "queued").count();
@@ -671,6 +783,7 @@ pub async fn finalize_chunk(
         &part_path,
         &query.file_name,
         &raw_folder,
+        None,
     )
     .await?;
 

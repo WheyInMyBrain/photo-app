@@ -10,7 +10,7 @@ pub async fn init_db_pool(db_url: &str) -> Result<SqlitePool, sqlx::Error> {
         .journal_mode(SqliteJournalMode::Wal)
         .synchronous(SqliteSynchronous::Normal)
         .foreign_keys(true)
-        .busy_timeout(Duration::from_secs(30))
+        .busy_timeout(Duration::from_secs(5))
         .pragma("cache_size", "-64000")              // 64 MB page cache
         .pragma("mmap_size", "268435456")            // 256 MB memory mapping
         .pragma("temp_store", "memory")             // Memory-backed temp tables

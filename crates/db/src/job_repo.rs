@@ -1,6 +1,8 @@
+// photo-app/crates/db/src/job_repo.rs
+
+use crate::domain::job_repo::{DbJob, JobPayload};
 use sqlx::{Row, SqlitePool};
 use std::path::PathBuf;
-use crate::domain::job_repo::DbJob;
 
 pub struct JobRepo;
 
@@ -12,12 +14,18 @@ impl JobRepo {
             &job.job_type
         };
 
+        // Serialize the structured payload to JSON string (or None)
+        let payload_json = job
+            .payload
+            .as_ref()
+            .and_then(|p| serde_json::to_string(p).ok());
+
         sqlx::query(
             r#"
             INSERT INTO processing_jobs (
                 id, user_id, asset_id, file_name, rel_path, folder_path,
-                disk_path, sha256, file_size_bytes, job_type, status
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')
+                disk_path, sha256, file_size_bytes, job_type, payload, status
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')
             "#,
         )
         .bind(&job.id)
@@ -30,6 +38,7 @@ impl JobRepo {
         .bind(&job.sha256)
         .bind(job.file_size_bytes)
         .bind(job_type)
+        .bind(payload_json)
         .execute(pool)
         .await?;
 
@@ -56,7 +65,7 @@ impl JobRepo {
         let row = sqlx::query(
             r#"
             SELECT id, user_id, asset_id, file_name, rel_path, folder_path,
-                   disk_path, sha256, file_size_bytes, job_type
+                   disk_path, sha256, file_size_bytes, job_type, payload
             FROM processing_jobs
             WHERE status = 'pending' AND job_type = ? AND attempts < 3
             ORDER BY created_at ASC
@@ -68,6 +77,11 @@ impl JobRepo {
         .await?;
 
         if let Some(r) = row {
+            let payload_raw: Option<String> = r.get("payload");
+            let payload: Option<JobPayload> = payload_raw
+                .as_deref()
+                .and_then(|raw| serde_json::from_str(raw).ok());
+
             let job = DbJob {
                 id: r.get("id"),
                 user_id: r.get("user_id"),
@@ -79,6 +93,7 @@ impl JobRepo {
                 sha256: r.get("sha256"),
                 job_type: r.get("job_type"),
                 file_size_bytes: r.get("file_size_bytes"),
+                payload,
             };
 
             sqlx::query(

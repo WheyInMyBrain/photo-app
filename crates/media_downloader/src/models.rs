@@ -1,35 +1,73 @@
-use bytes::Bytes;
-use serde::{Deserialize, Serialize};
+// src/models.rs
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MediaType {
-    Image,
     Video,
+    Image,
+}
+
+#[derive(Debug, Clone)]
+pub struct MediaDimensions {
+    pub width: usize,
+    pub height: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct MediaVariant {
+    pub url: String,
+    pub dimensions: Option<MediaDimensions>,
+    pub file_size_bytes: Option<u64>,
+    pub label: Option<String>, // e.g. "4k", "1080p", "640w"
 }
 
 #[derive(Debug, Clone)]
 pub struct MediaItem {
     pub media_type: MediaType,
+    pub mime_type: String,
+    pub dimensions: Option<MediaDimensions>,
+    pub file_size_bytes: Option<u64>,
     pub high_res_url: String,
+    pub thumbnail_url: Option<String>,
     pub audio_url: Option<String>,
-    pub thumbnail_url: String,
-    pub thumbnail_base64: Option<String>,
+    pub subtitles_url: Option<String>,
+    pub referer_required: Option<String>,
+    pub raw_master_url: String,
+    pub variants: Vec<MediaVariant>, 
 }
 
 impl MediaItem {
-    /// Internal constructor for scrapers that do not know about base64
     pub fn new(
         media_type: MediaType,
-        high_res_url: String,
+        mime_type: impl Into<String>,
+        dimensions: Option<MediaDimensions>,
+        file_size_bytes: Option<u64>,
+        high_res_url: impl Into<String>,
+        thumbnail_url: Option<String>,
         audio_url: Option<String>,
-        thumbnail_url: String,
+        subtitles_url: Option<String>,
+        referer_required: Option<String>,
+        raw_master_url: impl Into<String>,
     ) -> Self {
+        let url_str = high_res_url.into();
+        let initial_variant = MediaVariant {
+            url: url_str.clone(),
+            dimensions: dimensions.clone(),
+            file_size_bytes,
+            label: None,
+        };
+
         Self {
             media_type,
-            high_res_url,
-            audio_url,
+            mime_type: mime_type.into(),
+            dimensions,
+            file_size_bytes,
+            high_res_url: url_str,
             thumbnail_url,
-            thumbnail_base64: None,
+            audio_url,
+            subtitles_url,
+            referer_required,
+            raw_master_url: raw_master_url.into(),
+            variants: vec![initial_variant],
         }
     }
 }
@@ -39,41 +77,11 @@ pub struct ExtractedMediaMetadata {
     pub platform: String,
     pub author: String,
     pub caption: String,
+    pub post_text: Option<String>,
+    pub published_at: Option<String>,
+    pub tags: Vec<String>,
     pub items: Vec<MediaItem>,
-}
-
-#[derive(Debug, Clone)]
-pub struct DownloadedAsset {
-    pub file_name: String,
-    pub bytes: Bytes,
-}
-
-#[derive(Debug, Clone)]
-pub struct DownloadedBatch {
-    pub platform: String,
-    pub author: String,
-    pub caption: String,
-    pub target_folder: String,
-    pub assets: Vec<DownloadedAsset>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct StagedCandidateItem {
-    pub id: String,                         // e.g. "item_0" or DB item id
-    pub media_type: String,                 // "image" | "video"
-    pub thumbnail_url: String,
-    pub thumbnail_base64: Option<String>,
-    pub high_res_url: String,
-    pub audio_url: Option<String>,
-    pub suggested_filename: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct StagedManifest {
-    pub post_id: String,
-    pub platform: String,
-    pub author: String,
-    pub caption: String,
-    pub suggested_folder: String,
-    pub items: Vec<StagedCandidateItem>,
+    pub next_page_url: Option<String>,
+    pub discovered_post_urls: Vec<String>,
+    pub embedded_player_urls: Vec<String>,
 }

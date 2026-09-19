@@ -1,3 +1,5 @@
+// photo-app/crates/server/src/services/queue_service.rs
+
 use sqlx::SqlitePool;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -6,6 +8,7 @@ use tokio::sync::{broadcast, Notify, Semaphore};
 use tracing::{error, info, warn};
 
 use db::domain::{DbJob, NewAssetRecord};
+use db::tag_repo::{IngestionTagInput, TagRepo};
 use db::{AssetRepo, IngestionRepo, JobRepo};
 
 use crate::services::engine_coordinator::EngineCoordinator;
@@ -130,7 +133,7 @@ impl QueueService {
                                     }
                                 };
 
-                                // Insert base asset record into SQLite and emit WS event immediately
+                                // Insert base asset record, social tags, and link staging
                                 match Self::commit_base_asset(&pool, &job, derivatives).await {
                                     Ok(thumb_path) => {
                                         let _ = JobRepo::mark_completed(&pool, &job_id).await;
@@ -152,7 +155,7 @@ impl QueueService {
                                     }
                                 };
 
-                                // Enqueue background AI enrichment job
+                                // Enqueue background AI enrichment job (preserves payload)
                                 let ai_job = DbJob {
                                     id: uuid::Uuid::new_v4().to_string(),
                                     user_id: job.user_id,
@@ -164,6 +167,7 @@ impl QueueService {
                                     sha256: job.sha256,
                                     job_type: "ai_enrichment".to_string(),
                                     file_size_bytes: job.file_size_bytes,
+                                    payload: job.payload,
                                 };
 
                                 if let Err(e) = JobRepo::enqueue(&pool, &ai_job).await {
@@ -216,7 +220,7 @@ impl QueueService {
                         }
                     };
 
-                    // Acquire concurrency permit (strictly 1 to preserve CPU/NPU & prevent DB locks)
+                    // Concurrency limit 1 to protect CPU/RAM/VRAM
                     let _permit = match ai_semaphore.clone().acquire_owned().await {
                         Ok(p) => p,
                         Err(_) => break,
@@ -226,7 +230,6 @@ impl QueueService {
                     let asset_id = job.asset_id.clone();
                     let user_id = job.user_id.clone();
 
-                    // 1. Acquire Model Engines & Caches
                     let media_engine = match coordinator.ensure_pipeline_engine().await {
                         Ok(e) => e,
                         Err(err) => {
@@ -273,7 +276,6 @@ impl QueueService {
                     let engine = media_engine.clone();
                     let asset_id_for_ai = asset_id.clone();
 
-                    // 2. Offload heavy ML inference via spawn_blocking and AWAIT it
                     let phase2_res = tokio::task::spawn_blocking(move || {
                         engine.process_ai_sync(
                             &disk_path,
@@ -298,7 +300,7 @@ impl QueueService {
                         }
                     };
 
-                    // 3. Update in-memory face cluster cache
+                    // Update in-memory face cluster cache
                     if !ai_result.new_persons.is_empty() || !ai_result.updated_clusters.is_empty() {
                         let mut write_guard = cluster_cache.write().await;
                         let user_bucket = write_guard.entry(user_id.clone()).or_default();
@@ -312,7 +314,7 @@ impl QueueService {
                                     person_id: np.person_id.clone(),
                                     face_count: 1,
                                     cover_face_id: Some(np.cover_face_id.clone()),
-                                    exemplars: vec![emb_arr], // Initial exemplar
+                                    exemplars: vec![emb_arr],
                                 });
                             }
                         }
@@ -329,7 +331,7 @@ impl QueueService {
                         }
                     }
 
-                    // 4. Update SIMD CLIP vector cache
+                    // Update SIMD CLIP cache
                     if let Some(ref embedding_vec) = ai_result.clip_embedding {
                         if embedding_vec.len() == media_processing::EMBEDDING_DIM {
                             let mut emb_array = [0.0f32; media_processing::EMBEDDING_DIM];
@@ -357,7 +359,7 @@ impl QueueService {
                         }
                     }
 
-                    // 5. Persist AI enrichments to database
+                    // Persist AI enrichments
                     if let Err(e) = Self::commit_ai_enrichment(&pool, &job, ai_result).await {
                         warn!("Failed persisting AI metadata for {}: {}", job.asset_id, e);
                     }
@@ -365,8 +367,6 @@ impl QueueService {
                     let _ = JobRepo::mark_completed(&pool, &job_id).await;
                     coordinator.keep_warm().await;
                     info!(id = %job.asset_id, user_id = %job.user_id, "Asset fully indexed with AI");
-
-                    // `_permit` drops here automatically at the end of the job iteration
                 }
             });
         }
@@ -379,6 +379,13 @@ impl QueueService {
     ) -> Result<String, String> {
         let db_thumb_path = format!("users/{}/thumbs/{}", job.user_id, derivatives.thumb_path);
         let db_preview_path = format!("users/{}/thumbs/{}", job.user_id, derivatives.preview_path);
+
+        let p = job.payload.as_ref();
+        let author = p.and_then(|x| x.author.clone());
+        let platform = p.and_then(|x| x.platform.clone());
+        let source_url = p.and_then(|x| x.source_url.clone());
+        let source_post_id = p.and_then(|x| x.source_post_id.clone());
+        let caption = p.and_then(|x| x.caption.clone());
 
         let asset = NewAssetRecord {
             id: job.asset_id.clone(),
@@ -409,16 +416,83 @@ impl QueueService {
             country_code: derivatives.meta.country_code,
             camera_make: derivatives.meta.camera_make,
             camera_model: derivatives.meta.camera_model,
+            author: author.clone(),
+            source_platform: platform,
+            source_url,
+            source_post_id,
+            caption: caption.clone(),
             clip_embedding: None,
         };
 
-        // AssetRepo requires an active transaction handle
         let mut tx = pool.begin().await.map_err(|e| e.to_string())?;
+
+        // 1. Insert core asset record
         AssetRepo::insert_asset_tx(&mut *tx, &asset)
             .await
             .map_err(|e| e.to_string())?;
-        tx.commit().await.map_err(|e| e.to_string())?;
 
+        // 2. Commit scraped hashtags and author to tags and FTS5 index immediately
+        if let Some(payload) = p {
+            let mut initial_tags = Vec::new();
+
+            for tag_str in &payload.tags {
+                initial_tags.push(IngestionTagInput::new_hashtag(tag_str));
+            }
+
+            if let Some(ref a) = payload.author {
+                if !a.is_empty() && a != "unknown" && a != "web" {
+                    initial_tags.push(IngestionTagInput::new_author(a));
+                }
+            }
+
+            if !initial_tags.is_empty() {
+                TagRepo::save_asset_tags_tx(&mut tx, &job.user_id, &job.asset_id, &initial_tags)
+                    .await
+                    .map_err(|e| e.to_string())?;
+            }
+
+            let author_val = author.unwrap_or_default();
+            let caption_val = caption.unwrap_or_default();
+
+            // FTS5 safe update: Delete existing row first, then re-insert
+            sqlx::query("DELETE FROM asset_search_index WHERE asset_id = ?1")
+                .bind(&job.asset_id)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| e.to_string())?;
+
+            let tags_str = payload.tags.join(" ");
+
+            sqlx::query(
+                r#"
+                INSERT INTO asset_search_index (asset_id, user_id, caption, author, tags, file_name)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+                "#,
+            )
+            .bind(&job.asset_id)
+            .bind(&job.user_id)
+            .bind(&caption_val)
+            .bind(&author_val)
+            .bind(&tags_str)
+            .bind(&job.file_name)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| e.to_string())?;
+        }
+
+        // 3. Mark scraped item downloaded if linked
+        if let Some(scraped_id) = p.and_then(|x| x.scraped_item_id.as_deref()) {
+            sqlx::query(
+                "UPDATE scraped_media_items SET status = 'downloaded', asset_id = ?1 WHERE id = ?2",
+            )
+            .bind(&job.asset_id)
+            .bind(scraped_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| e.to_string())?;
+        }
+
+        tx.commit().await.map_err(|e| e.to_string())?;
         Ok(db_thumb_path)
     }
 
@@ -431,6 +505,12 @@ impl QueueService {
             .clip_embedding
             .as_ref()
             .map(|emb| bytemuck::cast_slice(emb.as_slice()).to_vec());
+
+        let ai_tags = res
+            .tags
+            .into_iter()
+            .map(|t| IngestionTagInput::new_ai(t.name, t.confidence))
+            .collect();
 
         let payload = db::AiEnrichmentPayload {
             asset_id: job.asset_id.clone(),
@@ -469,7 +549,7 @@ impl QueueService {
                     embedding: face.embedding,
                 })
                 .collect(),
-            tags: res.tags.into_iter().map(|t| (t.name, t.confidence)).collect(),
+            tags: ai_tags,
         };
 
         IngestionRepo::commit_ai_metadata(pool, payload)

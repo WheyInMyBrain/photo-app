@@ -1,0 +1,44 @@
+services:
+  gateway:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    ports:
+      - "4001:80" # Cloudflare Tunnel points here (localhost:4001)
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+    depends_on:
+      - backend
+      - frontend
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    expose:
+      - "3000"
+
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    restart: unless-stopped
+    expose:
+      - "3000"
+    volumes:
+      # Map your host's actual storage folder directly into the container's /data
+      - ./storage:/data
+    env_file:
+      - .env
+    depends_on:
+      - chrome
+
+  chrome:
+    image: ghcr.io/browserless/chromium:latest
+    restart: unless-stopped
+    shm_size: '2gb'
+    environment:
+      - MAX_CONCURRENT_SESSIONS=2
+      - PREBOOT_CHROME=true
+    expose:
+      - "3000"

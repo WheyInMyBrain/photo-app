@@ -8,6 +8,7 @@ pub struct Config {
     pub db_url: String,
     pub vault_api_key: String,
     pub worker_concurrency: usize,
+    pub downloader: DownloaderConfig,
 }
 
 impl Config {
@@ -51,6 +52,13 @@ impl Config {
             .and_then(|v| v.parse::<usize>().ok())
             .unwrap_or(5);
 
+        // 6. Downlaoder data needed 
+        let downloader = DownloaderConfig {
+            chrome_ws_url: std::env::var("CHROME_WS_URL").ok().filter(|s| !s.trim().is_empty()),
+            ig_cookie: std::env::var("IG_COOKIE").ok().filter(|s| !s.trim().is_empty()),
+            ig_csrf_token: std::env::var("IG_CSRF_TOKEN").ok().filter(|s| !s.trim().is_empty()),
+        };
+
         Self {
             server_host,
             server_port,
@@ -58,6 +66,7 @@ impl Config {
             db_url,
             vault_api_key,
             worker_concurrency,
+            downloader,
         }
     }
 }
