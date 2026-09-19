@@ -1,5 +1,6 @@
 // src/websites/reddit.rs
 
+use crate::config::DownloaderConfig;
 use crate::models::{ExtractedMediaMetadata, MediaDimensions, MediaItem, MediaType, MediaVariant};
 use crate::websites::hls;
 use crate::websites::Extractor;
@@ -21,6 +22,7 @@ impl Extractor for RedditExtractor {
     fn extract<'a>(
         &'a self,
         url: &'a str,
+        _config: Option<&'a DownloaderConfig>,
     ) -> Pin<Box<dyn Future<Output = Result<ExtractedMediaMetadata>> + Send + 'a>> {
         Box::pin(async move { extract_reddit(url).await })
     }
@@ -223,7 +225,6 @@ async fn parse_reddit_video(vid: &Value, post_data: &Value, page_url: &str) -> O
         None
     };
 
-    // Separate DASH/CMAF audio stream fallback
     let (url_path, query_params) = match fallback_url.split_once('?') {
         Some((path, query)) => (path, format!("?{query}")),
         None => (fallback_url.as_str(), String::new()),
@@ -242,7 +243,6 @@ async fn parse_reddit_video(vid: &Value, post_data: &Value, page_url: &str) -> O
         None
     };
 
-    // Auto-resolve HLS variants if Reddit returned HLS manifest
     let mut variants = Vec::new();
     let mut resolved_video_url = fallback_url.clone();
     let mut resolved_audio_url = audio_url.clone();
@@ -266,7 +266,6 @@ async fn parse_reddit_video(vid: &Value, post_data: &Value, page_url: &str) -> O
         }
     }
 
-    // Default fallback variant
     if variants.is_empty() {
         variants.push(MediaVariant {
             url: fallback_url.clone(),
@@ -309,7 +308,6 @@ fn parse_reddit_single_image(post_data: &Value, _page_url: &str) -> Option<Media
 
     let mut variants = Vec::new();
 
-    // Collect all preview renditions
     if let Some(resolutions) = first_img.get("resolutions").and_then(|r| r.as_array()) {
         for res in resolutions {
             if let Some(u) = res.get("url").and_then(|u| u.as_str()) {
@@ -367,7 +365,6 @@ fn parse_reddit_gallery_node(media_obj: &Value, _page_url: &str) -> Option<Media
         }
     }
 
-    // Video slide inside gallery
     if let Some(mp4) = media_obj.get("s").and_then(|s| s.get("mp4")).and_then(|u| u.as_str()) {
         let clean_mp4 = clean_url_str(mp4);
         let w = media_obj.pointer("/s/x").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
@@ -398,7 +395,6 @@ fn parse_reddit_gallery_node(media_obj: &Value, _page_url: &str) -> Option<Media
         return Some(media);
     }
 
-    // Image slide inside gallery
     if let Some(img) = media_obj.get("s").and_then(|s| s.get("u")).and_then(|u| u.as_str()) {
         let clean_img = clean_url_str(img);
         let w = media_obj.pointer("/s/x").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
@@ -434,7 +430,6 @@ fn parse_reddit_gallery_node(media_obj: &Value, _page_url: &str) -> Option<Media
 fn parse_reddit_gif_or_preview(post_data: &Value, _page_url: &str) -> Option<MediaItem> {
     let thumbnail_url = extract_preview_thumbnail(post_data);
 
-    // Preview video conversion
     if let Some(rvp) = post_data.get("preview").and_then(|p| p.get("reddit_video_preview")) {
         if let Some(fallback_url) = rvp.get("fallback_url").and_then(|u| u.as_str()) {
             let clean_vid = clean_url_str(fallback_url);
@@ -457,7 +452,6 @@ fn parse_reddit_gif_or_preview(post_data: &Value, _page_url: &str) -> Option<Med
         }
     }
 
-    // GIF variants inside image previews
     if let Some(images) = post_data.get("preview").and_then(|p| p.get("images")).and_then(|i| i.as_array()) {
         if let Some(first_img) = images.first() {
             if let Some(variants) = first_img.get("variants") {

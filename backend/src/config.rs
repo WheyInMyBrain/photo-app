@@ -1,3 +1,4 @@
+use media_downloader::DownloaderConfig;
 use std::path::PathBuf;
 
 #[derive(Clone, Debug)]
@@ -25,7 +26,7 @@ impl Config {
             .and_then(|p| p.parse::<u16>().ok())
             .unwrap_or(3000);
 
-        // 2. Storage Root (Reads STORAGE_ROOT if set, otherwise resolves dynamically)
+        // 2. Storage Root
         let storage_root = if let Ok(custom_storage) = std::env::var("STORAGE_ROOT") {
             PathBuf::from(custom_storage)
         } else {
@@ -37,22 +38,22 @@ impl Config {
             }
         };
 
-        // 3. Database URL (Reads DATABASE_URL if set, otherwise points to <storage_root>/db/app.db)
+        // 3. Database URL
         let db_url = std::env::var("DATABASE_URL").unwrap_or_else(|_| {
             let db_path = storage_root.join("db/app.db");
             format!("sqlite://{}?mode=rwc", db_path.to_string_lossy())
         });
 
-        // 4. API Key for Shortcuts / Mobile upload
+        // 4. API Key
         let vault_api_key = std::env::var("VAULT_API_KEY").unwrap_or_default();
 
-        // 5. Workers for media processing
+        // 5. Workers concurrency
         let worker_concurrency = std::env::var("WORKER_CONCURRENCY")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
             .unwrap_or(5);
 
-        // 6. Downlaoder data needed 
+        // 6. Downloader config
         let downloader = DownloaderConfig {
             chrome_ws_url: std::env::var("CHROME_WS_URL").ok().filter(|s| !s.trim().is_empty()),
             ig_cookie: std::env::var("IG_COOKIE").ok().filter(|s| !s.trim().is_empty()),

@@ -2,6 +2,7 @@
 
 pub mod config;
 pub use config::DownloaderConfig;
+
 pub mod downloader;
 pub mod filter;
 pub mod models;
@@ -11,14 +12,17 @@ pub mod websites;
 use anyhow::Result;
 use std::path::{Path, PathBuf};
 
+pub use downloader::engine::download_to_disk;
 pub use filter::{apply_custom_filters, apply_default_filters, DimensionFilterConfig};
 pub use models::{ExtractedMediaMetadata, MediaDimensions, MediaItem, MediaType};
-pub use downloader::engine::download_to_disk;
 
 /// Primary public entrypoint: extracts raw links, then runs the filter pipeline
-pub async fn extract_media(url: &str) -> Result<ExtractedMediaMetadata> {
-    // 1. Unfiltered raw extraction
-    let mut meta = websites::route_and_extract(url).await?;
+pub async fn extract_media(
+    url: &str,
+    config: Option<&DownloaderConfig>,
+) -> Result<ExtractedMediaMetadata> {
+    // 1. Unfiltered raw extraction passing the unified config down to route_and_extract
+    let mut meta = websites::route_and_extract(url, config).await?;
 
     // 2. Filter out tiny thumbnails and junk
     filter::apply_default_filters(&mut meta);
@@ -27,8 +31,11 @@ pub async fn extract_media(url: &str) -> Result<ExtractedMediaMetadata> {
 }
 
 /// Variant entrypoint: skips all filtering to inspect 100% raw assets
-pub async fn extract_media_raw(url: &str) -> Result<ExtractedMediaMetadata> {
-    websites::route_and_extract(url).await
+pub async fn extract_media_raw(
+    url: &str,
+    config: Option<&DownloaderConfig>,
+) -> Result<ExtractedMediaMetadata> {
+    websites::route_and_extract(url, config).await
 }
 
 /// Decoupled download entrypoint: accepts raw URLs directly

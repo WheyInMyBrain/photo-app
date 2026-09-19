@@ -441,7 +441,7 @@ pub async fn inspect_link(
         }
     } else {
         // 2. Extract media from link
-        let extracted: ExtractedMediaMetadata = extract_media(clean_url)
+        let extracted: ExtractedMediaMetadata = extract_media(clean_url, Some(&state.config.downloader))
             .await
             .map_err(|e| AppError::BadRequest(format!("Link extraction failed: {e}")))?;
 
