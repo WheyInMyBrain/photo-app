@@ -21,7 +21,7 @@ services:
   backend:
     build:
       context: .
-      dockerfile: Dockerfile.backend
+      dockerfile: backend/Dockerfile
     restart: unless-stopped
     expose:
       - "3000"

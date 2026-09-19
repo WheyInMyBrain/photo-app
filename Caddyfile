@@ -1,0 +1,9 @@
+# Reverse proxy API traffic to the backend container
+handle /api/* {
+    reverse_proxy backend:3000
+}
+
+# Reverse proxy all other traffic to the frontend container
+handle {
+    reverse_proxy frontend:3000
+}
