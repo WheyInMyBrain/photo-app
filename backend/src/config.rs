@@ -2,6 +2,25 @@ use media_downloader::DownloaderConfig;
 use std::path::PathBuf;
 
 #[derive(Clone, Debug)]
+pub struct B2Config {
+    pub key_id: String,
+    pub application_key: String,
+    pub endpoint: String,
+    pub bucket_name: String,
+    pub backup_interval_hours: u64,
+    pub encryption_key: Option<[u8; 32]>,
+}
+
+impl B2Config {
+    pub fn is_configured(&self) -> bool {
+        !self.key_id.is_empty()
+            && !self.application_key.is_empty()
+            && !self.endpoint.is_empty()
+            && !self.bucket_name.is_empty()
+    }
+}
+
+#[derive(Clone, Debug)]
 pub struct Config {
     pub server_host: String,
     pub server_port: u16,
@@ -9,6 +28,8 @@ pub struct Config {
     pub db_url: String,
     pub vault_api_key: String,
     pub worker_concurrency: usize,
+    pub allow_registration: bool,
+    pub b2: B2Config,
     pub downloader: DownloaderConfig,
 }
 
@@ -53,7 +74,36 @@ impl Config {
             .and_then(|v| v.parse::<usize>().ok())
             .unwrap_or(5);
 
-        // 6. Downloader config
+        // 6. Registration toggle (defaults to true if unset)
+        let allow_registration = std::env::var("ALLOW_REGISTRATION")
+            .map(|v| v.trim().eq_ignore_ascii_case("true") || v.trim() == "1")
+            .unwrap_or(true);
+
+        // 7. Backblaze B2 Config
+        let b2 = B2Config {
+            key_id: std::env::var("B2_KEY_ID").unwrap_or_default(),
+            application_key: std::env::var("B2_APPLICATION_KEY").unwrap_or_default(),
+            endpoint: std::env::var("B2_ENDPOINT").unwrap_or_default(),
+            bucket_name: std::env::var("B2_BUCKET_NAME").unwrap_or_default(),
+            backup_interval_hours: std::env::var("BACKUP_INTERVAL_HOURS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(168), // default: 7 days
+            encryption_key: std::env::var("BACKUP_PASSPHRASE")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .map(|pass| {
+                use sha2::{Digest, Sha256};
+                let mut hasher = Sha256::new();
+                hasher.update(pass.trim().as_bytes());
+                let result = hasher.finalize();
+                let mut key = [0u8; 32];
+                key.copy_from_slice(&result);
+                key
+            }),
+        };
+
+        // 8. Downloader config
         let downloader = DownloaderConfig {
             chrome_ws_url: std::env::var("CHROME_WS_URL").ok().filter(|s| !s.trim().is_empty()),
             ig_cookie: std::env::var("IG_COOKIE").ok().filter(|s| !s.trim().is_empty()),
@@ -67,6 +117,8 @@ impl Config {
             db_url,
             vault_api_key,
             worker_concurrency,
+            allow_registration,
+            b2,
             downloader,
         }
     }

@@ -103,6 +103,11 @@ async fn register(
     State(state): State<AppState>,
     Json(payload): Json<RegisterPayload>,
 ) -> Result<Response, AppError> {
+    // Immediate lockdown check
+    if !state.config.allow_registration {
+        return Err(AppError::Forbidden("Registration is currently disabled".into()));
+    }
+
     let username = payload.username.trim();
     if username.len() < 3 {
         return Err(AppError::BadRequest("Username must be at least 3 characters".into()));

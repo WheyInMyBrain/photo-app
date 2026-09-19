@@ -7,6 +7,7 @@ CREATE TABLE IF NOT EXISTS users (
     password_hash TEXT NOT NULL,
     display_name TEXT,
     api_key TEXT UNIQUE,
+    backup_enabled INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
@@ -22,7 +23,7 @@ CREATE TABLE IF NOT EXISTS passkey_credentials (
 
 CREATE INDEX IF NOT EXISTS idx_passkeys_user ON passkey_credentials(user_id);
 CREATE INDEX IF NOT EXISTS idx_users_api_key ON users(api_key);
-
+CREATE INDEX IF NOT EXISTS idx_users_backup ON users(backup_enabled);
 
 -- ============================================================================
 -- 1. CORE ASSETS TABLE
@@ -418,3 +419,17 @@ BEGIN
     SET asset_id = NULL, status = 'skipped' 
     WHERE asset_id = OLD.id;
 END;
+
+-- ============================================================================
+-- 8. BACKUP MEDIA FOR USERS
+-- ============================================================================
+
+CREATE TABLE IF NOT EXISTS asset_backups (
+    asset_id TEXT PRIMARY KEY NOT NULL REFERENCES assets(id) ON DELETE CASCADE,
+    user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    remote_path TEXT NOT NULL,
+    synced_sha256 TEXT NOT NULL,
+    backed_up_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_asset_backups_user ON asset_backups(user_id);

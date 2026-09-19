@@ -9,6 +9,7 @@ pub mod person_repo;
 pub mod scrapes_repo;
 pub mod tag_repo;
 pub mod ingestion_repo;
+pub mod backup_repo;
 
 pub use album_repo::AlbumRepo;
 pub use asset_repo::AssetRepo;

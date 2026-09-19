@@ -10,6 +10,7 @@ pub enum AppError {
     BadRequest(String),
     NotFound(String),
     Unauthorized(String),
+    Forbidden(String),
     Internal(String),
 }
 
@@ -19,6 +20,7 @@ impl IntoResponse for AppError {
             AppError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg),
             AppError::NotFound(msg) => (StatusCode::NOT_FOUND, msg),
             AppError::Unauthorized(msg) => (StatusCode::UNAUTHORIZED, msg),
+            AppError::Forbidden(msg) => (StatusCode::FORBIDDEN, msg),
             AppError::Internal(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg),
         };
 

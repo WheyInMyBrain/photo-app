@@ -157,7 +157,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .route("/upload", post(routes::upload::upload_raw_binary))
                 .route("/albums", get(routes::albums::get_folder_suggestions)),
         )
-        .layer(Extension(pool))
+        .layer(Extension(pool.clone()))
         .layer(DefaultBodyLimit::max(100 * 1024 * 1024))
         .layer(TraceLayer::new_for_http())
         .with_state(state);
@@ -170,6 +170,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("------------------------------------------------------------");
     info!("Server running on http://{} | Initial Idle RAM: {:.2} MB", addr, initial_ram);
     info!("------------------------------------------------------------");
+
+    services::backup::BackupService::start_scheduler(
+        pool.clone(),
+        config.storage_root.clone(),
+        config.b2.clone(),
+    );
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app).await?;
