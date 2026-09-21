@@ -7,8 +7,9 @@ pub struct AssetStorageInfo {
     pub is_video: bool,
 }
 
-#[derive(Serialize, Deserialize, sqlx::FromRow, Clone, Debug)]
-pub struct MediaSummary {
+/// Raw row fetched directly from SQLite via SQLx
+#[derive(sqlx::FromRow, Debug, Clone)]
+pub struct RawMediaRow {
     pub id: String,
     pub file_name: String,
     pub thumb_path: String,
@@ -19,6 +20,32 @@ pub struct MediaSummary {
     pub captured_at: Option<String>,
     pub is_favorite: i64,
     pub deleted_at: Option<String>,
+    pub latitude: Option<f64>,
+    pub longitude: Option<f64>,
+}
+
+/// Dumb, wire-ready asset payload for the frontend
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct MediaItemSummary {
+    pub id: String,
+    pub file_name: String,
+    pub thumb_path: String,
+    pub preview_path: String,
+    pub aspect_ratio: f64,
+    pub duration_seconds: Option<f64>,
+    pub mime_type: String,
+    pub captured_at: Option<String>,
+    pub is_favorite: bool,
+    pub days_remaining: Option<i64>, // Pre-calculated (e.g. 30 - days_passed)
+    pub latitude: Option<f64>,
+    pub longitude: Option<f64>,
+}
+
+/// Ready-to-render DOM section mapping 1:1 to frontend template loops
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct MediaSection {
+    pub title: String, // e.g. "September 2026", "August 2026", "Undated"
+    pub items: Vec<MediaItemSummary>,
 }
 
 #[derive(Debug, Clone)]
@@ -59,42 +86,32 @@ pub struct NewAssetRecord {
     pub clip_embedding: Option<Vec<u8>>,
 }
 
-/// The unified filter parameters struct for querying media across the entire app.
-/// Every UI view (timeline, favorites, people, places, cameras, tags) uses this.
-#[allow(dead_code)]
 #[derive(Deserialize, Debug, Default, Clone)]
 pub struct MediaQuery {
-    // Full-text search term
     pub q: Option<String>,
-    // Media & curation flags
-    pub media_type: Option<String>, // "all" | "photos" | "videos"
+    pub media_type: Option<String>,
     pub is_favorite: Option<bool>,
 
-    // Entity Associations
     pub person_id: Option<String>,
     pub tag: Option<String>,
     pub folder_path: Option<String>,
 
-    // Geographic & Hardware Filters
     pub city: Option<String>,
     pub country: Option<String>,
     pub camera_make: Option<String>,
     pub camera_model: Option<String>,
 
-    // Temporal Filters
     pub year: Option<i32>,
     pub month: Option<i32>,
     pub day: Option<i32>,
-    pub from: Option<String>, // "YYYY-MM-DD"
-    pub to: Option<String>,   // "YYYY-MM-DD"
+    pub from: Option<String>,
+    pub to: Option<String>,
 
-    // Keyset Cursor Pagination & Access Control
     pub cursor_captured_at: Option<String>,
     pub cursor_id: Option<String>,
     pub limit: Option<i64>,
     pub show_trash: Option<bool>,
 
-    // Internal vector search candidate IDs (not sent by frontend, populated by backend)
     #[serde(skip)]
     pub candidate_ids: Option<Vec<String>>,
 }
@@ -107,11 +124,11 @@ pub struct SubAlbum {
     pub cover_thumb: Option<String>,
 }
 
-/// Standardized paginated response returned by the unified media query
-#[derive(Serialize, Clone, Debug)]
+/// The response sent over the wire to the frontend
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct MediaPageResponse {
     pub albums: Vec<SubAlbum>,
-    pub items: Vec<MediaSummary>,
+    pub sections: Vec<MediaSection>, // Cleanly pre-grouped sections
     pub next_cursor_captured_at: Option<String>,
     pub next_cursor_id: Option<String>,
     pub has_more: bool,

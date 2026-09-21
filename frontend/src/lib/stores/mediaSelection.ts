@@ -1,58 +1,38 @@
 import { writable, derived, get } from 'svelte/store';
-import type { MediaItem } from '$lib/types/media';
 import { authStore } from '$lib/stores/authStore';
 
 export function createMediaSelection(onChanged: () => void) {
-  const selectedMap = writable<Record<string, boolean>>({});
-  const lastSelectedId = writable<string | null>(null);
-  const isActionLoading = writable(false);
+  // Native Set for true O(1) membership checks and zero object-spread churn
+  const selectedIds = writable<Set<string>>(new Set());
+  const isActionLoading = writable<boolean>(false);
 
-  const selectedCount = derived(selectedMap, ($map) => Object.keys($map).length);
+  // Instant O(1) size property — no Object.keys() array allocation
+  const selectedCount = derived(selectedIds, ($set) =>$set.size);
 
   function clearSelection() {
-    selectedMap.set({});
-    lastSelectedId.set(null);
+    selectedIds.set(new Set());
   }
 
-  function toggleSelect(
-    id: string,
-    e: MouseEvent,
-    items: MediaItem[],
-    itemIndexMap: Map<string, number>
-  ) {
-    e.stopPropagation();
-    const currentMap = { ...get(selectedMap) };
-    const lastId = get(lastSelectedId);
-
-    if (e.shiftKey && lastId && lastId !== id) {
-      const startIdx = itemIndexMap.get(lastId);
-      const endIdx = itemIndexMap.get(id);
-
-      if (startIdx !== undefined && endIdx !== undefined) {
-        const [low, high] = [Math.min(startIdx, endIdx), Math.max(startIdx, endIdx)];
-        for (let i = low; i <= high; i++) {
-          const target = items[i];
-          if (target) currentMap[target.id] = true;
-        }
-        selectedMap.set(currentMap);
-        lastSelectedId.set(id);
-        return;
+  // Fast O(1) toggle
+  function toggle(id: string) {
+    selectedIds.update((set) => {
+      const next = new Set(set);
+      if (next.has(id)) {
+        next.delete(id);
+      } else {
+        next.add(id);
       }
-    }
+      return next;
+    });
+  }
 
-    if (currentMap[id]) {
-      delete currentMap[id];
-      lastSelectedId.set(null);
-    } else {
-      currentMap[id] = true;
-      lastSelectedId.set(id);
-    }
-
-    selectedMap.set(currentMap);
+  // Explicit batch setter (for future drag-to-select or select-all)
+  function selectAll(ids: string[]) {
+    selectedIds.set(new Set(ids));
   }
 
   async function batchToggleDelete() {
-    const ids = Object.keys(get(selectedMap));
+    const ids = Array.from(get(selectedIds));
     if (ids.length === 0 || get(isActionLoading)) return;
     isActionLoading.set(true);
 
@@ -80,7 +60,7 @@ export function createMediaSelection(onChanged: () => void) {
   }
 
   async function batchPurge() {
-    const ids = Object.keys(get(selectedMap));
+    const ids = Array.from(get(selectedIds));
     if (ids.length === 0 || get(isActionLoading)) return;
     if (!confirm(`Permanently delete ${ids.length} item(s)? This cannot be undone.`)) return;
 
@@ -109,10 +89,11 @@ export function createMediaSelection(onChanged: () => void) {
   }
 
   return {
-    selectedMap,
+    selectedIds,
     selectedCount,
     isActionLoading,
-    toggleSelect,
+    toggle,
+    selectAll,
     clearSelection,
     batchToggleDelete,
     batchPurge

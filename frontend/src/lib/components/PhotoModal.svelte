@@ -63,10 +63,17 @@
   let showBoxes = true;
   let isFavorite = false;
 
+  // Mobile metadata sheet visibility
+  let showMobileInfo = false;
+
   let editingFaceId: string | null = null;
   let editingName = '';
 
   let detailAbortCtrl: AbortController | null = null;
+
+  // Touch gesture state for mobile swiping
+  let touchStartX = 0;
+  let touchStartY = 0;
 
   function focusInput(node: HTMLElement) {
     node.focus();
@@ -105,6 +112,7 @@
   $: if (asset?.id) {
     isFavorite = Boolean(asset.is_favorite);
     editingFaceId = null;
+    showMobileInfo = false;
     loadDetails(asset.id);
   }
 
@@ -135,9 +143,7 @@
   });
 
   async function loadDetails(id: string) {
-    if (detailAbortCtrl) {
-      detailAbortCtrl.abort();
-    }
+    if (detailAbortCtrl) detailAbortCtrl.abort();
     detailAbortCtrl = new AbortController();
     loadingDetails = true;
     loadingSimilar = true;
@@ -225,13 +231,32 @@
   }
 
   function handleKeydown(e: KeyboardEvent) {
-    // Ignore global keyboard triggers if user is actively naming a person
     if (editingFaceId || (e.target as HTMLElement)?.tagName === 'INPUT') return;
 
-    if (e.key === 'Escape') dispatch('close');
-    else if (e.key === 'ArrowLeft' && hasPrev) dispatch('prev');
+    if (e.key === 'Escape') {
+      if (showMobileInfo) showMobileInfo = false;
+      else dispatch('close');
+    } else if (e.key === 'ArrowLeft' && hasPrev) dispatch('prev');
     else if (e.key === 'ArrowRight' && hasNext) dispatch('next');
     else if (e.key.toLowerCase() === 'f') toggleFavorite();
+    else if (e.key.toLowerCase() === 'i') showMobileInfo = !showMobileInfo;
+  }
+
+  // Native touch gesture handling for mobile swiping
+  function handleTouchStart(e: TouchEvent) {
+    touchStartX = e.changedTouches[0].screenX;
+    touchStartY = e.changedTouches[0].screenY;
+  }
+
+  function handleTouchEnd(e: TouchEvent) {
+    const diffX = e.changedTouches[0].screenX - touchStartX;
+    const diffY = e.changedTouches[0].screenY - touchStartY;
+
+    // Ensure horizontal gesture intent (not vertical scroll)
+    if (Math.abs(diffX) > Math.abs(diffY) && Math.abs(diffX) > 45) {
+      if (diffX > 0 && hasPrev) dispatch('prev');
+      else if (diffX < 0 && hasNext) dispatch('next');
+    }
   }
 </script>
 
@@ -246,24 +271,52 @@
 </datalist>
 
 {#if asset}
-  <div class="fixed inset-0 z-50 flex bg-black/95 backdrop-blur-md select-none">
-    <!-- Top-Left Close Button -->
-    <button
-      type="button"
-      on:click={() => dispatch('close')}
-      class="absolute top-4 left-4 z-30 text-neutral-400 hover:text-white bg-neutral-900/80 hover:bg-neutral-800 p-2.5 rounded-full transition-colors cursor-pointer"
-      title="Close (Esc)"
+  <div class="fixed inset-0 z-50 flex flex-col md:flex-row bg-black select-none overflow-hidden">
+    <div
+      class="absolute top-0 inset-x-0 z-30 flex items-center justify-between px-4 py-3 pt-[max(0.75rem,env(safe-area-inset-top))] bg-gradient-to-b from-black/80 via-black/40 to-transparent pointer-events-none"
     >
-      ✕
-    </button>
+      <button
+        type="button"
+        on:click={() => dispatch('close')}
+        class="pointer-events-auto text-neutral-300 hover:text-white bg-neutral-900/80 hover:bg-neutral-800 p-2.5 rounded-full transition-colors cursor-pointer backdrop-blur-md"
+        title="Close (Esc)"
+      >
+        ✕
+      </button>
 
-    <!-- Main Viewport -->
-    <div class="flex-1 relative flex items-center justify-center p-4 overflow-hidden">
+      <div class="pointer-events-auto flex items-center gap-2">
+        <button
+          type="button"
+          on:click={toggleFavorite}
+          class="text-base p-2.5 rounded-full bg-neutral-900/80 hover:bg-neutral-800 backdrop-blur-md transition-colors cursor-pointer {isFavorite ? 'text-amber-400' : 'text-neutral-400 hover:text-white'}"
+          title="Toggle Favorite"
+        >
+          ★
+        </button>
+
+        <button
+          type="button"
+          on:click={() => (showMobileInfo = !showMobileInfo)}
+          class="md:hidden text-xs font-serif font-bold p-2.5 rounded-full bg-neutral-900/80 hover:bg-neutral-800 backdrop-blur-md text-neutral-300 transition-colors cursor-pointer w-9 h-9 flex items-center justify-center {showMobileInfo ? 'text-blue-400 bg-neutral-800 ring-1 ring-blue-500' : ''}"
+          title="Details"
+        >
+          ℹ
+        </button>
+      </div>
+    </div>
+
+    <div
+      role="region"
+      aria-label="Media preview viewport"
+      class="flex-1 relative flex items-center justify-center overflow-hidden w-full h-full p-2 md:p-4"
+      on:touchstart={handleTouchStart}
+      on:touchend={handleTouchEnd}
+    >
       {#if hasPrev}
         <button
           type="button"
           on:click={() => dispatch('prev')}
-          class="absolute left-6 z-20 text-white/70 hover:text-white bg-black/40 hover:bg-black/80 border border-neutral-800/80 p-3 rounded-full transition-all cursor-pointer backdrop-blur-xs"
+          class="hidden md:flex absolute left-6 z-20 text-white/70 hover:text-white bg-black/40 hover:bg-black/80 border border-neutral-800/80 p-3 rounded-full transition-all cursor-pointer backdrop-blur-xs items-center justify-center"
           title="Previous (←)"
         >
           ‹
@@ -274,7 +327,7 @@
         <button
           type="button"
           on:click={() => dispatch('next')}
-          class="absolute right-6 z-20 text-white/70 hover:text-white bg-black/40 hover:bg-black/80 border border-neutral-800/80 p-3 rounded-full transition-all cursor-pointer backdrop-blur-xs"
+          class="hidden md:flex absolute right-6 z-20 text-white/70 hover:text-white bg-black/40 hover:bg-black/80 border border-neutral-800/80 p-3 rounded-full transition-all cursor-pointer backdrop-blur-xs items-center justify-center"
           title="Next (→)"
         >
           ›
@@ -284,7 +337,6 @@
       <div class="relative max-h-full max-w-full flex items-center justify-center">
         {#key asset.id}
           {#if isMotionMedia}
-            <!-- Uses generated 720p H.264 FastStart preview MP4 with WebP poster -->
             <video
               src={resolveThumbUrl(asset.preview_path)}
               poster={resolveThumbUrl(asset.thumb_path)}
@@ -294,7 +346,7 @@
               muted={asset.mime_type === 'image/gif'}
               playsinline
               preload="metadata"
-              class="max-h-[90vh] max-w-[75vw] rounded-lg shadow-2xl object-contain bg-black"
+              class="max-h-[92vh] md:max-h-[90vh] max-w-full md:max-w-[75vw] rounded-none md:rounded-lg shadow-2xl object-contain bg-black"
             >
               <track kind="captions" />
             </video>
@@ -304,7 +356,7 @@
                 src="/api/assets/{asset.id}/stream"
                 alt={asset.file_name}
                 decoding="async"
-                class="max-h-[90vh] max-w-[75vw] object-contain rounded-lg shadow-2xl block select-none pointer-events-none"
+                class="max-h-[92vh] md:max-h-[90vh] max-w-full md:max-w-[75vw] object-contain rounded-none md:rounded-lg shadow-2xl block select-none pointer-events-none"
               />
 
               {#if showBoxes}
@@ -312,12 +364,18 @@
                   <div
                     class="absolute border border-emerald-400/80 bg-emerald-400/10 rounded cursor-pointer group z-10 hover:border-emerald-300 hover:bg-emerald-400/20 transition-colors"
                     style="left: {f.bbox_x * 100}%; top: {f.bbox_y * 100}%; width: {f.bbox_w * 100}%; height: {f.bbox_h * 100}%;"
-                    on:click={() => { editingFaceId = f.face_id; editingName = f.person_name ?? ''; }}
+                    on:click={() => {
+                      editingFaceId = f.face_id;
+                      editingName = f.person_name ?? '';
+                      showMobileInfo = true;
+                    }}
                     role="button"
                     tabindex="0"
                     on:keydown={(e) => e.key === 'Enter' && (editingFaceId = f.face_id)}
                   >
-                    <span class="absolute -bottom-6 left-1/2 -translate-x-1/2 bg-neutral-900/90 text-[10px] text-emerald-300 px-1.5 py-0.5 rounded shadow whitespace-nowrap opacity-80 group-hover:opacity-100 border border-neutral-700 pointer-events-none">
+                    <span
+                      class="absolute -bottom-6 left-1/2 -translate-x-1/2 bg-neutral-900/90 text-[10px] text-emerald-300 px-1.5 py-0.5 rounded shadow whitespace-nowrap opacity-80 group-hover:opacity-100 border border-neutral-700 pointer-events-none"
+                    >
                       {f.person_name || 'Unnamed'}
                     </span>
                   </div>
@@ -329,12 +387,37 @@
       </div>
     </div>
 
-    <!-- Metadata Drawer -->
-    <aside class="w-80 border-l border-neutral-800 bg-neutral-950 p-5 flex flex-col justify-between overflow-y-auto space-y-6 flex-shrink-0">
+    {#if showMobileInfo}
+      <button
+        type="button"
+        class="fixed inset-0 z-40 bg-black/60 backdrop-blur-xs md:hidden cursor-pointer border-0"
+        on:click={() => (showMobileInfo = false)}
+        aria-label="Close details sheet"
+      ></button>
+    {/if}
+
+    <aside
+      class="
+        fixed md:static inset-x-0 bottom-0 z-50 md:z-auto
+        w-full md:w-80 h-[72vh] md:h-full
+        border-t md:border-t-0 md:border-l border-neutral-800
+        bg-neutral-950 p-5 pb-[max(1.25rem,env(safe-area-inset-bottom))]
+        flex flex-col justify-between overflow-y-auto space-y-6 flex-shrink-0
+        rounded-t-2xl md:rounded-none shadow-2xl md:shadow-none
+        transition-transform duration-300 ease-out
+        {showMobileInfo ? 'translate-y-0' : 'translate-y-full md:translate-y-0'}
+      "
+    >
       <div class="space-y-5">
+        <div class="flex flex-col items-center -mt-2 mb-1 md:hidden">
+          <div class="w-10 h-1 rounded-full bg-neutral-700/80"></div>
+        </div>
+
         <div class="flex items-center justify-between border-b border-neutral-900 pb-3">
           <div class="truncate mr-2">
-            <h3 class="font-medium text-xs text-white truncate" title={asset.file_name}>{asset.file_name}</h3>
+            <h3 class="font-medium text-xs text-white truncate" title={asset.file_name}>
+              {asset.file_name}
+            </h3>
             <p class="text-[10px] text-neutral-500 mt-0.5 font-mono">
               {asset.captured_at ? new Date(asset.captured_at).toLocaleDateString() : 'Undated'}
             </p>
@@ -343,13 +426,12 @@
             type="button"
             on:click={toggleFavorite}
             class="text-sm p-1.5 rounded hover:bg-neutral-900 transition-colors cursor-pointer {isFavorite ? 'text-amber-400' : 'text-neutral-600 hover:text-white'}"
-            title="Toggle Favorite (F)"
+            title="Toggle Favorite"
           >
             ★
           </button>
         </div>
 
-        <!-- People Section -->
         <div>
           <div class="flex items-center justify-between mb-2">
             <span class="text-[10px] uppercase font-semibold text-neutral-500 tracking-wider">People</span>
@@ -397,8 +479,11 @@
                         <span class="text-xs text-neutral-300 truncate">{f.person_name || 'Unnamed'}</span>
                         <button
                           type="button"
-                          on:click={() => { editingFaceId = f.face_id; editingName = f.person_name ?? ''; }}
-                          class="text-[10px] text-neutral-500 hover:text-white ml-1 cursor-pointer"
+                          on:click={() => {
+                            editingFaceId = f.face_id;
+                            editingName = f.person_name ?? '';
+                          }}
+                          class="text-[10px] text-neutral-500 hover:text-white ml-1 cursor-pointer p-1"
                         >
                           ✎
                         </button>
@@ -411,7 +496,6 @@
           {/if}
         </div>
 
-        <!-- Tags Section -->
         <div>
           <span class="text-[10px] uppercase font-semibold text-neutral-500 tracking-wider block mb-2">Tags</span>
           {#if loadingDetails}
@@ -429,7 +513,6 @@
           {/if}
         </div>
 
-        <!-- Visual Similarity Section -->
         <div class="border-t border-neutral-900 pt-4">
           <div class="flex items-center justify-between mb-2.5">
             <span class="text-[10px] uppercase font-semibold text-neutral-500 tracking-wider">Similar Media</span>
@@ -447,7 +530,10 @@
               {#each similarItems as s (s.id)}
                 <button
                   type="button"
-                  on:click={() => dispatch('selectAsset', { id: s.id })}
+                  on:click={() => {
+                    showMobileInfo = false;
+                    dispatch('selectAsset', { id: s.id });
+                  }}
                   class="group relative aspect-square rounded-md overflow-hidden bg-neutral-900 border border-neutral-800/80 hover:border-blue-500/80 transition-all cursor-pointer text-left"
                   title="Similarity: {Math.round(s.similarity * 100)}%"
                 >

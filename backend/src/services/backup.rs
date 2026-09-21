@@ -75,7 +75,7 @@ impl BackupService {
         let creds = Credentials::new(key_id, app_key, None, None, "b2_static");
         let config = aws_config::defaults(BehaviorVersion::latest())
             .credentials_provider(creds)
-            .region(Region::new("us-east-1")) // B2 accepts standard/dummy region
+            .region(Region::new("us-east-1"))
             .endpoint_url(endpoint)
             .load()
             .await;
@@ -146,9 +146,8 @@ impl BackupService {
                     }
                 };
 
-                // Use TryRng exactly as defined in the rand 0.10 source
                 let mut nonce_bytes = [0u8; 12];
-                SysRng.try_fill_bytes(&mut nonce_bytes).expect("System RNG failed to provide entropy");
+                SysRng.try_fill_bytes(&mut nonce_bytes).expect("Failed to get system entropy");
                 let nonce = Nonce::from(nonce_bytes);
 
                 let ciphertext = match cipher.encrypt(&nonce, plain_data.as_ref()) {
@@ -159,7 +158,6 @@ impl BackupService {
                     }
                 };
 
-                // Wire format: [12-byte Nonce] + [Ciphertext + Auth Tag]
                 let mut payload = Vec::with_capacity(12 + ciphertext.len());
                 payload.extend_from_slice(&nonce_bytes);
                 payload.extend_from_slice(&ciphertext);
@@ -221,6 +219,7 @@ impl BackupService {
         item: &BackupCandidate,
         is_encrypted: bool,
     ) {
+        // suggested_remote_path from the query is already the stored remote_path
         let remote_key = if is_encrypted && !item.suggested_remote_path.ends_with(".enc") {
             format!("{}.enc", item.suggested_remote_path)
         } else {
@@ -238,7 +237,7 @@ impl BackupService {
         info!(
             asset_id = %item.asset_id,
             remote = %remote_key,
-            "Purged soft-deleted asset from B2 backup"
+            "Purged hard-deleted asset from B2 backup"
         );
     }
 }

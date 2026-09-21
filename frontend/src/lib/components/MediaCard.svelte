@@ -90,7 +90,7 @@
       playsinline
       disablepictureinpicture
       class="absolute inset-0 w-full h-full object-cover z-10 pointer-events-none"
-    />
+    ></video>
   {/if}
 
   <!-- Multi-Select Checkbox -->

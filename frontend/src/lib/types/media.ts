@@ -5,29 +5,30 @@ export interface SubAlbum {
   cover_thumb: string | null;
 }
 
-export interface MediaItem {
+export interface MediaItemSummary {
   id: string;
   file_name: string;
   thumb_path: string;
   preview_path: string;
-  aspect_ratio: number | null;
+  aspect_ratio: number;
   duration_seconds: number | null;
   mime_type: string;
   captured_at: string | null;
-  is_favorite: number;
-  deleted_at: string | null;
+  is_favorite: boolean;
+  days_remaining: number | null;
+  latitude: number | null;
+  longitude: number | null;
+}
+
+export interface MediaSection {
+  title: string;
+  items: MediaItemSummary[];
 }
 
 export interface MediaPageResponse {
   albums: SubAlbum[];
-  items: MediaItem[];
+  sections: MediaSection[];
   next_cursor_captured_at: string | null;
   next_cursor_id: string | null;
-  has_more: boolean;
-}
-
-export interface WsMediaEvent {
-  event_type: 'asset_ready' | 'asset_failed';
-  asset_id: string;
-  thumb_path: string;
+  has_more: bool;
 }

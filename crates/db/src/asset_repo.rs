@@ -1,14 +1,80 @@
 use sqlx::{QueryBuilder, Row, Sqlite, SqlitePool};
 use std::path::Path;
+use chrono::{DateTime, Utc};
 
 use crate::domain::media::{
-    AssetStorageInfo, MediaPageResponse, MediaQuery, MediaSummary, SubAlbum,
+    AssetStorageInfo, MediaPageResponse, MediaQuery, SubAlbum, MediaSection,
     NewAssetRecord, DynamicFiltersResponse, FilterOption, AssetCacheMetadata,
+    RawMediaRow, MediaItemSummary, 
 };
 
 pub struct AssetRepo;
 
 impl AssetRepo {
+
+    /// Single-pass sequential grouper (O(N) with zero heap fragmentation)
+    fn build_grouped_sections(rows: Vec<RawMediaRow>) -> Vec<MediaSection> {
+        let mut sections: Vec<MediaSection> = Vec::new();
+        let now = Utc::now();
+
+        for r in rows {
+            let group_title = match &r.captured_at {
+                Some(dt) if dt.len() >= 7 => Self::fast_month_year(&dt[0..4], &dt[5..7]),
+                _ => "Undated".to_string(),
+            };
+
+            let days_remaining = r.deleted_at.as_deref().map(|d| {
+                if let Ok(deleted_time) = d.parse::<DateTime<Utc>>() {
+                    let passed = (now - deleted_time).num_days();
+                    (30 - passed).max(0)
+                } else {
+                    30
+                }
+            });
+
+            let item = MediaItemSummary {
+                id: r.id,
+                file_name: r.file_name,
+                thumb_path: r.thumb_path,
+                preview_path: r.preview_path,
+                aspect_ratio: r.aspect_ratio.unwrap_or(1.0),
+                duration_seconds: r.duration_seconds,
+                mime_type: r.mime_type,
+                captured_at: r.captured_at,
+                is_favorite: r.is_favorite == 1,
+                days_remaining,
+                latitude: r.latitude,
+                longitude: r.longitude,
+            };
+
+            if let Some(last_sec) = sections.last_mut() {
+                if last_sec.title == group_title {
+                    last_sec.items.push(item);
+                    continue;
+                }
+            }
+
+            sections.push(MediaSection {
+                title: group_title,
+                items: vec![item],
+            });
+        }
+
+        sections
+    }
+
+    #[inline]
+    fn fast_month_year(year: &str, month: &str) -> String {
+        let m = match month {
+            "01" => "January",   "02" => "February", "03" => "March",
+            "04" => "April",     "05" => "May",      "06" => "June",
+            "07" => "July",      "08" => "August",   "09" => "September",
+            "10" => "October",   "11" => "November", "12" => "December",
+            _ => "Unknown",
+        };
+        format!("{m} {year}")
+    }
+    
     pub async fn query_media(
         pool: &SqlitePool,
         user_id: &str,
@@ -18,11 +84,12 @@ impl AssetRepo {
         let fetch_limit = limit + 1;
         let show_trash = q.show_trash.unwrap_or(false);
 
+        // 1. SELECT query with latitude and longitude included
         let mut builder: QueryBuilder<Sqlite> = QueryBuilder::new(
             "SELECT \
                 a.id, a.file_name, a.thumb_path, a.preview_path, \
                 a.aspect_ratio, a.duration_seconds, a.mime_type, a.captured_at, \
-                a.is_favorite, a.deleted_at \
+                a.is_favorite, a.deleted_at, a.latitude, a.longitude \
             FROM assets a "
         );
 
@@ -156,16 +223,23 @@ impl AssetRepo {
             Vec::new()
         };
 
-        let mut items = builder.build_query_as::<MediaSummary>().fetch_all(pool).await?;
-        let has_more = items.len() as i64 > limit;
-        if has_more { items.pop(); }
+        // 2. Fetch rows into RawMediaRow
+        let mut rows = builder.build_query_as::<RawMediaRow>().fetch_all(pool).await?;
+        let has_more = rows.len() as i64 > limit;
+        if has_more { 
+            rows.pop(); 
+        }
 
-        let next_cursor_captured_at = items.last().and_then(|i| i.captured_at.clone());
-        let next_cursor_id = items.last().map(|i| i.id.clone());
+        // 3. Extract cursors from the last raw item
+        let next_cursor_captured_at = rows.last().and_then(|i| i.captured_at.clone());
+        let next_cursor_id = rows.last().map(|i| i.id.clone());
+
+        // 4. Pre-group into ready-to-render sections
+        let sections = Self::build_grouped_sections(rows);
 
         Ok(MediaPageResponse {
             albums,
-            items,
+            sections,
             next_cursor_captured_at,
             next_cursor_id,
             has_more,
