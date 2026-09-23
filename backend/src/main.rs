@@ -144,6 +144,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/faces/{face_id}/reassign", post(routes::people::reassign_face))
         .route("/api/faces/{face_id}/verify", post(routes::people::verify_face))
 
+        // Locations & Map data
+        .route("/api/media/locations", get(routes::media::get_media_locations))
+
         // Tag Metadata
         .route("/api/assets/{id}/tags", get(routes::tags::get_asset_tags))
         .route("/api/persons/names", get(routes::people::get_names_directory))

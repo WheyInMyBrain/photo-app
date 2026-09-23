@@ -3,32 +3,66 @@
   import { filterStore } from '$lib/stores/filterStore';
 
   export let albums: SubAlbum[] = [];
+
+  function resolveUrl(path: string | null | undefined): string {
+    if (!path) return '';
+    if (path.startsWith('http')) return path;
+    const clean = path.startsWith('/') ? path.slice(1) : path;
+    return clean.startsWith('users/') ? `/${clean}` : `/thumbs/${clean}`;
+  }
 </script>
 
 {#if albums.length > 0 && !$filterStore.show_trash}
-  <div>
-    <h3 class="text-[11px] uppercase font-semibold text-neutral-500 tracking-wider mb-2">Folders</h3>
-    <div class="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-6 gap-2.5">
+  <div class="space-y-2 mb-4">
+    <div class="flex items-center justify-between px-1">
+      <span class="text-[10px] uppercase font-bold tracking-wider text-[var(--text-muted)]">
+        Collections
+      </span>
+      <span class="text-[10px] font-mono text-[var(--text-muted)] opacity-60">
+        {albums.length} {albums.length === 1 ? 'folder' : 'folders'}
+      </span>
+    </div>
+
+    <!-- Square tiles matching the photo grid -->
+    <div class="flex flex-wrap gap-1.5 md:gap-2.5 justify-start after:content-[''] after:flex-grow-[999999999]">
       {#each albums as album (album.path)}
         <button
           type="button"
           on:click={() => filterStore.setFolderPath(album.path)}
-          class="group bg-neutral-900 border border-neutral-800 hover:border-neutral-700 p-2.5 rounded-xl flex items-center gap-2.5 text-left transition-all cursor-pointer"
+          style="flex-grow: 100; flex-basis: 140px; aspect-ratio: 1;"
+          class="group relative rounded-xl overflow-hidden glass-panel border border-[var(--border-glass)] hover:border-purple-500/60 shadow-sm hover:shadow-xl transition-all spring-tap cursor-pointer min-w-[90px] max-h-[260px] md:max-h-[320px] text-left focus:outline-none focus:ring-2 focus:ring-purple-400"
         >
-          <div class="w-9 h-9 rounded-lg bg-neutral-800 flex items-center justify-center overflow-hidden flex-shrink-0">
-            {#if album.cover_thumb}
-              <img
-                src="/{album.cover_thumb}"
-                alt={album.name}
-                class="w-full h-full object-cover group-hover:scale-105 transition-transform"
-              />
-            {:else}
+          <!-- Vignette Gradient -->
+          <div class="absolute inset-0 bg-gradient-to-t from-black/85 via-black/20 to-black/10 z-10 pointer-events-none"></div>
+
+          <!-- Cover Image -->
+          {#if album.cover_thumb}
+            <img
+              src={resolveUrl(album.cover_thumb)}
+              alt={album.name}
+              loading="lazy"
+              class="w-full h-full object-cover transition-transform duration-500 group-hover:scale-105 pointer-events-none"
+            />
+          {:else}
+            <div class="w-full h-full flex items-center justify-center text-3xl bg-[var(--bg-surface-elevated)]">
               📁
-            {/if}
+            </div>
+          {/if}
+
+          <!-- Micro Badge -->
+          <div class="absolute top-2 left-2 z-20 glass-panel px-2 py-0.5 rounded-full flex items-center gap-1 text-[10px] text-white font-medium border border-white/10 shadow-sm">
+            <span>📁</span>
+            <span class="font-mono text-[9px] opacity-80">{album.count}</span>
           </div>
-          <div class="truncate">
-            <div class="text-xs font-medium text-neutral-200 group-hover:text-white truncate">{album.name}</div>
-            <div class="text-[10px] text-neutral-500">{album.count} items</div>
+
+          <!-- Title Details -->
+          <div class="absolute bottom-2.5 inset-x-2.5 z-20 pointer-events-none">
+            <h4 class="text-xs font-bold text-white tracking-tight truncate drop-shadow-sm">
+              {album.name}
+            </h4>
+            <span class="text-[9px] text-white/60 font-mono tracking-wide uppercase">
+              Album
+            </span>
           </div>
         </button>
       {/each}

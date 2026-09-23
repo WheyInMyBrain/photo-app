@@ -1,15 +1,172 @@
-/* frontend/src/app.css */
-@import "tailwindcss";
+@import 'tailwindcss';
+@import 'leaflet/dist/leaflet.css';
+@import 'leaflet.markercluster/dist/MarkerCluster.css';
 
 :root {
-	color-scheme: dark;
+  /* Dynamic Notch & Home Indicator Safe Insets */
+  --sat: env(safe-area-inset-top, 0px);
+  --sab: env(safe-area-inset-bottom, 0px);
+  --sal: env(safe-area-inset-left, 0px);
+  --sar: env(safe-area-inset-right, 0px);
+
+  /* Light Theme Tokens */
+  --bg-primary: #f8fafc;
+  --bg-surface: rgba(255, 255, 255, 0.72);
+  --bg-surface-elevated: rgba(255, 255, 255, 0.88);
+  --border-glass: rgba(0, 0, 0, 0.08);
+  --border-specular: rgba(255, 255, 255, 0.9);
+  --text-main: #09090b;
+  --text-muted: #64748b;
+  --shimmer-1: #e2e8f0;
+  --shimmer-2: #f1f5f9;
+  --pill-shadow: 0 16px 36px -8px rgba(0, 0, 0, 0.12), 0 4px 12px -2px rgba(0, 0, 0, 0.05);
 }
 
-body {
-	background-color: #0b0c10;
-	color: #e0e2ec;
-	font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-	margin: 0;
-	padding: 0;
-	overflow-x: hidden;
+@media (prefers-color-scheme: dark) {
+  :root {
+    /* High-End OLED Dark Tokens */
+    --bg-primary: #000000;
+    --bg-surface: rgba(18, 18, 22, 0.75);
+    --bg-surface-elevated: rgba(26, 26, 32, 0.85);
+    --border-glass: rgba(255, 255, 255, 0.09);
+    --border-specular: rgba(255, 255, 255, 0.16);
+    --text-main: #f8fafc;
+    --text-muted: #94a3b8;
+    --shimmer-1: #0f1015;
+    --shimmer-2: #1c1d24;
+    --pill-shadow: 0 20px 48px -10px rgba(0, 0, 0, 0.8), 0 0 1px 1px rgba(255, 255, 255, 0.1);
+  }
+}
+
+html, body {
+  height: 100%;
+  width: 100%;
+  margin: 0;
+  padding: 0;
+  background-color: var(--bg-primary);
+  color: var(--text-main);
+  font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Display', 'Segoe UI', Roboto, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  -webkit-tap-highlight-color: transparent;
+  user-select: none;
+  -webkit-user-select: none;
+  overscroll-behavior-y: none;
+}
+
+/* Glassmorphism Surface Primitives */
+.glass-panel {
+  background: var(--bg-surface);
+  backdrop-filter: blur(28px) saturate(190%);
+  -webkit-backdrop-filter: blur(28px) saturate(190%);
+  border: 1px solid var(--border-glass);
+  box-shadow: inset 0 1px 0 0 var(--border-specular);
+}
+
+.glass-pill {
+  background: var(--bg-surface-elevated);
+  backdrop-filter: blur(32px) saturate(210%);
+  -webkit-backdrop-filter: blur(32px) saturate(210%);
+  border: 1px solid var(--border-glass);
+  box-shadow: var(--pill-shadow), inset 0 1px 0 0 var(--border-specular);
+}
+
+/* Fluid Shimmer Skeleton */
+.tile-shimmer {
+  background: linear-gradient(
+    110deg,
+    var(--shimmer-1) 8%,
+    var(--shimmer-2) 20%,
+    var(--shimmer-1) 33%
+  );
+  background-size: 200% 100%;
+  animation: shimmer-swipe 1.6s cubic-bezier(0.4, 0, 0.2, 1) infinite;
+}
+
+@keyframes shimmer-swipe {
+  0% { background-position-x: 200%; }
+  100% { background-position-x: -200%; }
+}
+
+/* Spring Physics for Tile Tap */
+.spring-tap {
+  transition: transform 0.24s cubic-bezier(0.34, 1.56, 0.64, 1), box-shadow 0.2s ease;
+}
+.spring-tap:active {
+  transform: scale(0.965);
+}
+
+/* Scrollbar Utility while preserving fluid touch physics */
+.no-scrollbar::-webkit-scrollbar { display: none; }
+.no-scrollbar { -ms-overflow-style: none; scrollbar-width: none; }
+
+/* Apple-Style Photo Bubble Pin */
+.apple-map-pin {
+  background: transparent;
+  border: none;
+}
+
+.apple-photo-bubble {
+  position: relative;
+  width: 48px;
+  height: 48px;
+  border-radius: 14px;
+  border: 2px solid #ffffff;
+  box-shadow: 0 8px 24px -4px rgba(0, 0, 0, 0.45), 0 2px 6px rgba(0, 0, 0, 0.25);
+  overflow: hidden;
+  background-color: var(--bg-surface-elevated);
+  transition: transform 0.2s cubic-bezier(0.34, 1.56, 0.64, 1);
+  cursor: pointer;
+}
+
+.apple-photo-bubble:hover {
+  transform: scale(1.15) translateY(-2px);
+  z-index: 1000 !important;
+}
+
+.apple-photo-bubble img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+
+/* Cluster Count Badge */
+.apple-photo-badge {
+  position: absolute;
+  top: -6px;
+  right: -6px;
+  background: #9333ea;
+  color: #ffffff;
+  font-family: -apple-system, BlinkMacSystemFont, monospace;
+  font-size: 10px;
+  font-weight: 700;
+  padding: 1px 5px;
+  border-radius: 10px;
+  border: 1.5px solid #ffffff;
+  box-shadow: 0 2px 4px rgba(0, 0, 0, 0.3);
+  line-height: 1.2;
+}
+
+/* Pin drop indicator tail */
+.apple-photo-bubble::after {
+  content: '';
+  position: absolute;
+  bottom: -4px;
+  left: 50%;
+  transform: translateX(-50%) rotate(45deg);
+  width: 8px;
+  height: 8px;
+  background: #ffffff;
+  z-index: -1;
+}
+
+/* Dark mode map tile filter to match OLED palette */
+@media (prefers-color-scheme: dark) {
+  .leaflet-tile-pane {
+    filter: brightness(0.65) invert(1) contrast(3) hue-rotate(200deg) saturate(0.3) brightness(0.75);
+  }
+  .leaflet-container {
+    background: #000000 !important;
+  }
 }

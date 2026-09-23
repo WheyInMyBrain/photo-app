@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use sqlx::{FromRow};
 
 #[derive(Debug, Clone)]
 pub struct AssetStorageInfo {
@@ -190,4 +191,23 @@ pub struct SimilarMediaItem {
 pub struct AssetCacheMetadata {
     pub thumb_path: String,
     pub mime_type: String,
+}
+
+/// Lightweight point returned strictly for map markers and clustering.
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
+pub struct MapLocationPoint {
+    pub id: String,
+    pub lat: f64,
+    pub lng: f64,
+    pub thumb_path: String,
+}
+
+/// Optional viewport bounding-box filter parameters
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct MapLocationsQuery {
+    pub min_lat: Option<f64>,
+    pub max_lat: Option<f64>,
+    pub min_lng: Option<f64>,
+    pub max_lng: Option<f64>,
+    pub folder_path: Option<String>,
 }

@@ -13,6 +13,9 @@ export function createTimelineStore() {
   let nextId: string | null = null;
   let pageAbortCtrl: AbortController | null = null;
 
+  // Monotonic sequence token preventing race conditions between resets & pagination
+  let currentRequestId = 0;
+
   function appendSections(current: MediaSection[], incoming: MediaSection[]): MediaSection[] {
     if (incoming.length === 0) return current;
     const cloned = [...current];
@@ -32,12 +35,16 @@ export function createTimelineStore() {
   async function fetchMedia(queryString = '', reset = false) {
     if (!browser) return;
 
+    // Invalidate any in-flight requests and assign an incrementing sequence ID
+    const requestId = ++currentRequestId;
+
     if (reset) {
       if (pageAbortCtrl) pageAbortCtrl.abort();
       nextCapturedAt = null;
       nextId = null;
       hasMore.set(true);
-      sections.set([]);
+      // STALE-WHILE-REVALIDATE: Do NOT wipe sections.set([]) here.
+      // Keeps old content visible until new data resolves to prevent layout collapse.
     }
 
     pageAbortCtrl = new AbortController();
@@ -52,6 +59,10 @@ export function createTimelineStore() {
       }
 
       const res = await fetch(`/api/media?${params.toString()}`, { signal: pageAbortCtrl.signal });
+
+      // Discard stale or superseded responses
+      if (requestId !== currentRequestId) return;
+
       if (res.status === 401) {
         authStore.checkStatus();
         return;
@@ -59,18 +70,26 @@ export function createTimelineStore() {
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
 
       const data: MediaPageResponse = await res.json();
+      if (requestId !== currentRequestId) return;
 
-      if (reset) albums.set(data.albums ?? []);
-
-      sections.update((curr) => (reset ? (data.sections ?? []) : appendSections(curr, data.sections ?? [])));
+      if (reset) {
+        albums.set(data.albums ?? []);
+        sections.set(data.sections ?? []);
+      } else {
+        sections.update((curr) => appendSections(curr, data.sections ?? []));
+      }
 
       nextCapturedAt = data.next_cursor_captured_at;
       nextId = data.next_cursor_id;
       hasMore.set(data.has_more);
     } catch (err: any) {
-      if (err?.name !== 'AbortError') console.error('Timeline fetch error:', err);
+      if (err?.name !== 'AbortError' && requestId === currentRequestId) {
+        console.error('Timeline fetch error:', err);
+      }
     } finally {
-      isLoading.set(false);
+      if (requestId === currentRequestId) {
+        isLoading.set(false);
+      }
     }
   }
 
@@ -85,6 +104,7 @@ export function createTimelineStore() {
   }
 
   function destroy() {
+    currentRequestId++;
     if (pageAbortCtrl) pageAbortCtrl.abort();
   }
 
@@ -95,6 +115,6 @@ export function createTimelineStore() {
     hasMore,
     fetchMedia,
     patchFavorite,
-    destroy,
+    destroy
   };
 }

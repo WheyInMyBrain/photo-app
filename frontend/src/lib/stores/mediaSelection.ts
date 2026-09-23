@@ -1,38 +1,53 @@
-import { writable, derived, get } from 'svelte/store';
+import { writable, get } from 'svelte/store';
 import { authStore } from '$lib/stores/authStore';
 
 export function createMediaSelection(onChanged: () => void) {
-  // Native Set for true O(1) membership checks and zero object-spread churn
-  const selectedIds = writable<Set<string>>(new Set());
+  const selectedSet = new Set<string>();
+  const selectedCount = writable<number>(0);
+  const isSelectionActive = writable<boolean>(false);
   const isActionLoading = writable<boolean>(false);
 
-  // Instant O(1) size property — no Object.keys() array allocation
-  const selectedCount = derived(selectedIds, ($set) =>$set.size);
-
   function clearSelection() {
-    selectedIds.set(new Set());
-  }
+    selectedSet.clear();
+    selectedCount.set(0);
+    isSelectionActive.set(false);
 
-  // Fast O(1) toggle
-  function toggle(id: string) {
-    selectedIds.update((set) => {
-      const next = new Set(set);
-      if (next.has(id)) {
-        next.delete(id);
-      } else {
-        next.add(id);
+    if (typeof document !== 'undefined') {
+      const selectedEls = document.querySelectorAll('[data-asset-id][aria-pressed="true"]');
+      for (let i = 0; i < selectedEls.length; i++) {
+        selectedEls[i].setAttribute('aria-pressed', 'false');
       }
-      return next;
-    });
+    }
   }
 
-  // Explicit batch setter (for future drag-to-select or select-all)
-  function selectAll(ids: string[]) {
-    selectedIds.set(new Set(ids));
+  function toggle(id: string, cardEl?: HTMLElement | null) {
+    const nextState = !selectedSet.has(id);
+    setTargetState(id, cardEl, nextState);
+  }
+
+  function setTargetState(id: string, cardEl: HTMLElement | null | undefined, state: boolean) {
+    if (state) {
+      selectedSet.add(id);
+    } else {
+      selectedSet.delete(id);
+    }
+
+    const el = cardEl ?? document.querySelector(`[data-asset-id="${id}"]`);
+    if (el) {
+      el.setAttribute('aria-pressed', state ? 'true' : 'false');
+    }
+
+    const count = selectedSet.size;
+    selectedCount.set(count);
+    isSelectionActive.set(count > 0);
+  }
+
+  function getSelectedIds(): string[] {
+    return Array.from(selectedSet);
   }
 
   async function batchToggleDelete() {
-    const ids = Array.from(get(selectedIds));
+    const ids = getSelectedIds();
     if (ids.length === 0 || get(isActionLoading)) return;
     isActionLoading.set(true);
 
@@ -47,7 +62,6 @@ export function createMediaSelection(onChanged: () => void) {
         authStore.checkStatus();
         return;
       }
-
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
 
       clearSelection();
@@ -60,7 +74,7 @@ export function createMediaSelection(onChanged: () => void) {
   }
 
   async function batchPurge() {
-    const ids = Array.from(get(selectedIds));
+    const ids = getSelectedIds();
     if (ids.length === 0 || get(isActionLoading)) return;
     if (!confirm(`Permanently delete ${ids.length} item(s)? This cannot be undone.`)) return;
 
@@ -76,7 +90,6 @@ export function createMediaSelection(onChanged: () => void) {
         authStore.checkStatus();
         return;
       }
-
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
 
       clearSelection();
@@ -89,12 +102,13 @@ export function createMediaSelection(onChanged: () => void) {
   }
 
   return {
-    selectedIds,
     selectedCount,
+    isSelectionActive,
     isActionLoading,
     toggle,
-    selectAll,
+    setTargetState,
     clearSelection,
+    getSelectedIds,
     batchToggleDelete,
     batchPurge
   };

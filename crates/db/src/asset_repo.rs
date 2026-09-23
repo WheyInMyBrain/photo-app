@@ -5,7 +5,7 @@ use chrono::{DateTime, Utc};
 use crate::domain::media::{
     AssetStorageInfo, MediaPageResponse, MediaQuery, SubAlbum, MediaSection,
     NewAssetRecord, DynamicFiltersResponse, FilterOption, AssetCacheMetadata,
-    RawMediaRow, MediaItemSummary, 
+    RawMediaRow, MediaItemSummary, MapLocationPoint, MapLocationsQuery,
 };
 
 pub struct AssetRepo;
@@ -1040,5 +1040,60 @@ impl AssetRepo {
             thumb_path: r.get("thumb_path"),
             mime_type: r.get("mime_type"),
         }))
+    }
+
+    /// Fetch all active geotagged media for a user with optional bounding-box constraints.
+    pub async fn query_locations(
+        pool: &SqlitePool,
+        user_id: &str,
+        q: &MapLocationsQuery,
+    ) -> Result<Vec<MapLocationPoint>, sqlx::Error> {
+        let mut builder: QueryBuilder<Sqlite> = QueryBuilder::new(
+            "SELECT \
+                a.id, \
+                a.latitude AS lat, \
+                a.longitude AS lng, \
+                a.thumb_path \
+            FROM assets a \
+            WHERE a.user_id = "
+        );
+        builder.push_bind(user_id);
+
+        // Strict non-trashed & non-null geo constraints (hits idx_assets_user_geo)
+        builder.push(" AND a.deleted_at IS NULL ");
+        builder.push(" AND a.latitude IS NOT NULL ");
+        builder.push(" AND a.longitude IS NOT NULL ");
+
+        // Optional Bounding-Box filtering for high-density viewport updates
+        if let (Some(min_lat), Some(max_lat)) = (q.min_lat, q.max_lat) {
+            builder.push(" AND a.latitude BETWEEN ");
+            builder.push_bind(min_lat);
+            builder.push(" AND ");
+            builder.push_bind(max_lat);
+        }
+
+        if let (Some(min_lng), Some(max_lng)) = (q.min_lng, q.max_lng) {
+            builder.push(" AND a.longitude BETWEEN ");
+            builder.push_bind(min_lng);
+            builder.push(" AND ");
+            builder.push_bind(max_lng);
+        }
+
+        if let Some(ref folder) = q.folder_path {
+            if !folder.is_empty() {
+                builder.push(" AND a.folder_path = ");
+                builder.push_bind(folder);
+            }
+        }
+
+        // Return latest captures first
+        builder.push(" ORDER BY a.captured_at DESC, a.created_at DESC");
+
+        let points = builder
+            .build_query_as::<MapLocationPoint>()
+            .fetch_all(pool)
+            .await?;
+
+        Ok(points)
     }
 }

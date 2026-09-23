@@ -154,40 +154,40 @@
 </datalist>
 
 {#if isOpen}
-  <!-- Dim Backdrop -->
+  <!-- Backdrop -->
   <!-- svelte-ignore a11y-click-events-have-key-events -->
   <!-- svelte-ignore a11y-no-static-element-interactions -->
   <div
-    class="fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-center justify-center p-3 sm:p-6 select-none"
+    class="fixed inset-0 z-50 bg-black/70 backdrop-blur-md flex items-center justify-center p-3 sm:p-6 select-none"
     on:click|self={() => dispatch('close')}
   >
-    <!-- Modal Dialog Window -->
+    <!-- Modal Window Container -->
     <div
       role="dialog"
       aria-modal="true"
       aria-label="Manage People"
-      class="bg-neutral-950 border border-neutral-800 rounded-2xl w-full max-w-4xl max-h-[85vh] flex flex-col shadow-2xl overflow-hidden"
+      class="glass-panel rounded-3xl w-full max-w-4xl max-h-[85vh] flex flex-col shadow-2xl overflow-hidden border border-[var(--border-glass)] bg-[var(--bg-surface-elevated)]"
     >
       <!-- Header -->
-      <div class="px-5 py-4 border-b border-neutral-800/80 flex items-center justify-between">
+      <div class="px-6 py-4.5 border-b border-[var(--border-glass)] flex items-center justify-between">
         <div>
-          <h2 class="text-base sm:text-lg font-bold text-white flex items-center gap-2">
+          <h2 class="text-sm sm:text-base font-bold text-[var(--text-main)] flex items-center gap-2">
             <span>👤</span>
             <span>People & Faces</span>
           </h2>
-          <p class="text-[11px] text-neutral-400 mt-0.5">
-            Select to filter timeline. Drag onto another card to merge identities.
+          <p class="text-[11px] text-[var(--text-muted)] mt-0.5">
+            Click to filter timeline. Drag a card onto another to merge duplicate identities.
           </p>
         </div>
 
         <div class="flex items-center gap-3">
-          <span class="text-xs text-neutral-500 font-mono hidden sm:inline">
+          <span class="text-xs text-[var(--text-muted)] font-mono hidden sm:inline">
             {people.length} identities
           </span>
           <button
             type="button"
             on:click={() => dispatch('close')}
-            class="p-1.5 rounded-lg bg-neutral-900 hover:bg-neutral-800 text-neutral-400 hover:text-white border border-neutral-800 transition-colors cursor-pointer text-xs"
+            class="w-7 h-7 flex items-center justify-center rounded-full glass-panel text-[var(--text-muted)] hover:text-[var(--text-main)] transition-colors spring-tap cursor-pointer text-xs"
             title="Close (Esc)"
             aria-label="Close dialog"
           >
@@ -196,12 +196,15 @@
         </div>
       </div>
 
-      <!-- Content Area -->
-      <div class="p-4 sm:p-6 overflow-y-auto flex-1">
+      <!-- Identity Grid Area -->
+      <div class="p-4 sm:p-6 overflow-y-auto flex-1 no-scrollbar">
         {#if isLoading}
-          <div class="text-xs text-neutral-500 text-center py-16">Reading faces from library...</div>
+          <div class="flex flex-col items-center justify-center py-20 gap-2.5 text-[var(--text-muted)]">
+            <div class="w-6 h-6 border-2 border-purple-500/20 border-t-purple-500 rounded-full animate-spin"></div>
+            <span class="text-xs font-medium">Scanning face embeddings...</span>
+          </div>
         {:else if people.length === 0}
-          <div class="text-xs text-neutral-500 text-center py-16">
+          <div class="text-xs text-[var(--text-muted)] text-center py-20 font-medium">
             No identified faces found in your library yet.
           </div>
         {:else}
@@ -217,10 +220,10 @@
                 on:drop={() => { if (source && source.id !== p.id) target = p; }}
                 on:click={() => handleSelect(p)}
                 on:keydown={(e) => e.key === 'Enter' && handleSelect(p)}
-                class="bg-neutral-900/60 hover:bg-neutral-900 border {isFiltered ? 'border-purple-500 ring-2 ring-purple-500/30' : 'border-neutral-800 hover:border-neutral-700'} rounded-xl p-3 flex flex-col items-center text-center cursor-pointer transition-all"
+                class="glass-panel rounded-2xl p-3 flex flex-col items-center text-center cursor-pointer transition-all spring-tap border border-[var(--border-glass)] hover:border-purple-500/50 hover:shadow-lg {isFiltered ? 'ring-2 ring-purple-500 shadow-md bg-purple-500/10' : ''}"
               >
-                <!-- Avatar -->
-                <div class="w-16 h-16 sm:w-20 sm:h-20 rounded-full overflow-hidden bg-neutral-800 border border-neutral-700 mb-2">
+                <!-- Avatar Circular Frame -->
+                <div class="w-16 h-16 sm:w-20 sm:h-20 rounded-full overflow-hidden bg-[var(--bg-surface)] border-2 border-[var(--border-glass)] mb-2.5 shadow-sm">
                   {#if p.avatar_thumb}
                     <img
                       src={p.avatar_thumb.startsWith('/') ? p.avatar_thumb : `/${p.avatar_thumb}`}
@@ -229,11 +232,11 @@
                       class="w-full h-full object-cover pointer-events-none"
                     />
                   {:else}
-                    <div class="w-full h-full flex items-center justify-center text-xl text-neutral-500">👤</div>
+                    <div class="w-full h-full flex items-center justify-center text-xl text-[var(--text-muted)]">👤</div>
                   {/if}
                 </div>
 
-                <!-- Editable Name -->
+                <!-- Editable Name Input -->
                 {#if editingId === p.id}
                   <input
                     type="text"
@@ -246,25 +249,27 @@
                       if (e.key === 'Enter') saveName(p);
                       if (e.key === 'Escape') editingId = null;
                     }}
-                    class="w-full bg-black border border-purple-500 text-xs text-center text-white rounded px-1 py-0.5 outline-none"
+                    class="w-full bg-[var(--bg-surface-elevated)] border border-purple-500 text-xs text-center text-[var(--text-main)] rounded-lg px-2 py-1 outline-none shadow-sm"
                   />
                 {:else}
-                  <div class="flex items-center justify-center gap-1 w-full px-1">
-                    <span class="text-xs font-medium text-neutral-200 truncate max-w-[90px] sm:max-w-[110px]">
+                  <div class="flex items-center justify-center gap-1.5 w-full px-1">
+                    <span class="text-xs font-semibold text-[var(--text-main)] truncate max-w-[95px] sm:max-w-[115px]">
                       {p.name || 'Unnamed'}
                     </span>
                     <button
                       type="button"
                       on:click|stopPropagation={() => { editingId = p.id; editingName = p.name ?? ''; }}
-                      class="text-[10px] text-neutral-500 hover:text-white cursor-pointer p-0.5"
+                      class="text-[11px] text-[var(--text-muted)] hover:text-[var(--text-main)] cursor-pointer p-0.5 spring-tap"
                       title="Rename person"
+                      aria-label="Rename {p.name || 'Unnamed'}"
                     >
                       ✎
                     </button>
                   </div>
                 {/if}
 
-                <span class="text-[10px] text-neutral-500 mt-0.5 font-mono">
+                <!-- Face Count Micro Pill -->
+                <span class="text-[10px] text-[var(--text-muted)] mt-1 font-mono font-medium">
                   {p.face_count} {p.face_count === 1 ? 'photo' : 'photos'}
                 </span>
               </div>
@@ -276,22 +281,27 @@
   </div>
 {/if}
 
-<!-- Nested Merge Confirmation Dialog -->
+<!-- Merge Confirmation Dialog Overlay -->
 {#if source && target}
-  <div class="fixed inset-0 bg-black/85 flex items-center justify-center p-4 z-[60]">
-    <div class="bg-neutral-900 border border-neutral-800 rounded-xl p-5 max-w-xs w-full space-y-3 text-center shadow-2xl">
-      <h3 class="text-sm font-bold text-white">Merge Identities?</h3>
-      <p class="text-xs text-neutral-300">
-        Merge <strong>{source.name || 'Unnamed'}</strong> into <strong>{target.name || 'Unnamed'}</strong>?
+  <div class="fixed inset-0 bg-black/80 backdrop-blur-md flex items-center justify-center p-4 z-[60]">
+    <div class="glass-panel rounded-3xl p-6 max-w-xs w-full space-y-3.5 text-center shadow-2xl border border-[var(--border-glass)] bg-[var(--bg-surface-elevated)]">
+      <div class="w-10 h-10 rounded-2xl bg-purple-600/10 text-purple-400 flex items-center justify-center text-lg mx-auto shadow-inner">
+        🔀
+      </div>
+
+      <h3 class="text-sm font-bold text-[var(--text-main)]">Merge Identities?</h3>
+      <p class="text-xs text-[var(--text-muted)] leading-relaxed">
+        Merge <strong class="text-[var(--text-main)]">{source.name || 'Unnamed'}</strong> into <strong class="text-[var(--text-main)]">{target.name || 'Unnamed'}</strong>?
       </p>
-      <p class="text-[10px] text-neutral-500">
-        All photo associations will point to {target.name || 'this identity'}.
+      <p class="text-[10px] text-[var(--text-muted)] opacity-80">
+        All photo associations will be re-assigned.
       </p>
+
       <div class="flex justify-end gap-2 pt-2">
         <button
           type="button"
           on:click={() => { source = null; target = null; }}
-          class="px-3 py-1 rounded text-xs text-neutral-400 hover:text-white cursor-pointer"
+          class="px-3.5 py-1.5 rounded-xl text-xs font-medium text-[var(--text-muted)] hover:text-[var(--text-main)] glass-panel transition-all spring-tap cursor-pointer"
         >
           Cancel
         </button>
@@ -299,7 +309,7 @@
           type="button"
           on:click={confirmMerge}
           disabled={isMerging}
-          class="px-3 py-1 bg-purple-600 hover:bg-purple-500 text-white rounded text-xs font-semibold cursor-pointer"
+          class="px-4 py-1.5 bg-purple-600 hover:bg-purple-500 text-white rounded-xl text-xs font-semibold shadow-md shadow-purple-600/25 transition-all spring-tap cursor-pointer disabled:opacity-50"
         >
           {isMerging ? 'Merging...' : 'Merge'}
         </button>

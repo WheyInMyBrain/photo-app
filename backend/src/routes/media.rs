@@ -9,7 +9,8 @@ use tracing::error;
 use db::AssetRepo;
 use db::domain::{
     BatchActionRequest, BatchActionResponse, DynamicFiltersResponse, FavoriteToggleResponse,
-    MediaPageResponse, MediaQuery, SimilarMediaItem, SoftDeleteResponse,
+    MediaPageResponse, MediaQuery, SimilarMediaItem, SoftDeleteResponse, MapLocationPoint, 
+    MapLocationsQuery,
 };
 use crate::error::AppError;
 use crate::middleware::auth::AuthUser;
@@ -303,5 +304,26 @@ async fn resolve_hybrid_query(state: &AppState, user_id: &str, q: &mut MediaQuer
         }
     } else {
         q.q = None;
+    }
+}
+
+pub async fn get_media_locations(
+    State(state): State<AppState>,
+    user: AuthUser,
+    Query(query): Query<MapLocationsQuery>,
+) -> Result<Json<Vec<MapLocationPoint>>, (StatusCode, String)> {
+    match AssetRepo::query_locations(&state.db, &user.id, &query).await {
+        Ok(points) => Ok(Json(points)),
+        Err(e) => {
+            error!(
+                user_id = %user.id,
+                error = %e,
+                "Failed to query media map locations"
+            );
+            Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Database error while querying locations".to_string(),
+            ))
+        }
     }
 }
