@@ -341,6 +341,7 @@ CREATE TABLE IF NOT EXISTS scraped_posts (
     author TEXT NOT NULL,                       -- '@username' or 'web'
     caption TEXT,                               -- Caption or thread title
     tags JSON NOT NULL DEFAULT '[]',            -- ["viral", "fashion", "ootd"]
+    published_at TEXT,                          -- Original post timestamp (ISO-8601)
     next_page_url TEXT,                         -- Pagination cursor (e.g. ?max_id=...)
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     UNIQUE(user_id, platform, external_post_id)

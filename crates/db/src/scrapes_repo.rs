@@ -11,6 +11,7 @@ pub struct ScrapedPostRecord {
     pub author: String,
     pub caption: Option<String>,
     pub tags: Vec<String>,
+    pub published_at: Option<String>, 
     pub next_page_url: Option<String>,
 }
 
@@ -44,6 +45,7 @@ pub struct ScrapedItemContext {
     pub caption: Option<String>,
     pub tags: Vec<String>,
     pub source_url: String,
+    pub published_at: Option<String>, 
 }
 
 pub struct ScrapesRepo;
@@ -58,7 +60,7 @@ impl ScrapesRepo {
     ) -> Result<Option<ScrapedPostRecord>, sqlx::Error> {
         let row = sqlx::query(
             r#"
-            SELECT id, platform, external_post_id, source_url, author, caption, tags, next_page_url
+            SELECT id, platform, external_post_id, source_url, author, caption, tags, published_at, next_page_url
             FROM scraped_posts
             WHERE user_id = ?1 AND platform = ?2 AND external_post_id = ?3
             "#,
@@ -81,12 +83,12 @@ impl ScrapesRepo {
                 author: r.get("author"),
                 caption: r.get("caption"),
                 tags,
+                published_at: r.get("published_at"),
                 next_page_url: r.get("next_page_url"),
             }
         }))
     }
 
-    /// Fetch all media items and variants for a staged post
     pub async fn fetch_items_for_post(
         pool: &SqlitePool,
         post_id: &str,
@@ -159,6 +161,7 @@ impl ScrapesRepo {
         author: &str,
         caption: Option<&str>,
         tags: &[String],
+        published_at: Option<&str>, // Added parameter
         discovered_urls: &[String],
         next_page_url: Option<&str>,
         items: &[ScrapedMediaItemRecord],
@@ -166,17 +169,18 @@ impl ScrapesRepo {
         let mut tx = pool.begin().await?;
         let tags_json = serde_json::to_string(tags).unwrap_or_else(|_| "[]".to_string());
 
-        // 1. Upsert Post Record
+        // 1. Upsert Post Record with published_at
         let resolved_post_id: String = sqlx::query_scalar(
             r#"
             INSERT INTO scraped_posts (
-                id, user_id, platform, external_post_id, source_url, author, caption, tags, next_page_url
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                id, user_id, platform, external_post_id, source_url, author, caption, tags, published_at, next_page_url
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
             ON CONFLICT(user_id, platform, external_post_id) DO UPDATE SET
                 source_url = excluded.source_url,
                 author = excluded.author,
                 caption = excluded.caption,
                 tags = excluded.tags,
+                published_at = excluded.published_at,
                 next_page_url = excluded.next_page_url
             RETURNING id
             "#,
@@ -189,6 +193,7 @@ impl ScrapesRepo {
         .bind(author)
         .bind(caption)
         .bind(tags_json)
+        .bind(published_at)
         .bind(next_page_url)
         .fetch_one(&mut *tx)
         .await?;
@@ -267,7 +272,6 @@ impl ScrapesRepo {
         Ok(resolved_post_id)
     }
 
-    /// Link asset to item and mark downloaded
     pub async fn mark_item_downloaded(
         pool: &SqlitePool,
         item_id: &str,
@@ -284,7 +288,6 @@ impl ScrapesRepo {
         Ok(())
     }
 
-    /// Find a cached post by source URL for a specific user
     pub async fn find_post_by_url(
         pool: &SqlitePool,
         user_id: &str,
@@ -292,7 +295,7 @@ impl ScrapesRepo {
     ) -> Result<Option<ScrapedPostRecord>, sqlx::Error> {
         let row = sqlx::query(
             r#"
-            SELECT id, platform, external_post_id, source_url, author, caption, tags, next_page_url
+            SELECT id, platform, external_post_id, source_url, author, caption, tags, published_at, next_page_url
             FROM scraped_posts
             WHERE user_id = ?1 AND source_url = ?2
             "#,
@@ -314,19 +317,20 @@ impl ScrapesRepo {
                 author: r.get("author"),
                 caption: r.get("caption"),
                 tags,
+                published_at: r.get("published_at"),
                 next_page_url: r.get("next_page_url"),
             }
         }))
     }
 
-    /// Fetch parent post metadata for a specific media item (used when enqueuing jobs)
+    /// Fetch parent post metadata for a specific media item
     pub async fn get_item_context(
         pool: &SqlitePool,
         item_id: &str,
     ) -> Result<Option<ScrapedItemContext>, sqlx::Error> {
         let row = sqlx::query(
             r#"
-            SELECT sp.platform, sp.author, sp.caption, sp.tags, sp.source_url
+            SELECT sp.platform, sp.author, sp.caption, sp.tags, sp.source_url, sp.published_at
             FROM scraped_media_items smi
             JOIN scraped_posts sp ON smi.scraped_post_id = sp.id
             WHERE smi.id = ?1
@@ -347,6 +351,7 @@ impl ScrapesRepo {
                 caption: r.get("caption"),
                 tags,
                 source_url: r.get("source_url"),
+                published_at: r.get("published_at"),
             }
         }))
     }

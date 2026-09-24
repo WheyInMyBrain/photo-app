@@ -160,7 +160,10 @@ async fn fetch_mobile_post_info(shortcode: &str, client: &Client) -> Result<Extr
         author,
         caption: caption.clone(),
         post_text: Some(caption),
-        published_at: item.get("taken_at").and_then(|t| t.as_i64()).map(|ts| ts.to_string()),
+        published_at: item
+            .get("taken_at")
+            .and_then(|t| t.as_i64())
+            .and_then(format_epoch_timestamp),
         tags,
         items,
         next_page_url: None,
@@ -230,7 +233,11 @@ async fn fetch_graphql_post_info(shortcode: &str, client: &Client) -> Result<Ext
         author,
         caption: caption.clone(),
         post_text: Some(caption),
-        published_at: media.get("taken_at_timestamp").and_then(|t| t.as_i64()).map(|ts| ts.to_string()),
+        published_at: media
+            .get("taken_at_timestamp")
+            .or_else(|| media.get("taken_at"))
+            .and_then(|t| t.as_i64())
+            .and_then(format_epoch_timestamp),
         tags,
         items,
         next_page_url: None,
@@ -276,10 +283,18 @@ fn parse_graphql_node(node: &Value) -> Option<MediaItem> {
                     if seen.insert(cleaned.clone()) {
                         let w = res.get("config_width").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
                         let h = res.get("config_height").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                        
+                        // GraphQL does not expose byte size; parse if present in custom nodes, else None
+                        let file_size_bytes = res.get("file_size_bytes").and_then(|v| v.as_u64());
+
                         variants.push(MediaVariant {
                             url: cleaned,
-                            dimensions: if w > 0 && h > 0 { Some(MediaDimensions { width: w, height: h }) } else { None },
-                            file_size_bytes: None,
+                            dimensions: if w > 0 && h > 0 {
+                                Some(MediaDimensions { width: w, height: h })
+                            } else {
+                                None
+                            },
+                            file_size_bytes,
                             label: Some(format!("{w}w")),
                         });
                     }
@@ -287,17 +302,45 @@ fn parse_graphql_node(node: &Value) -> Option<MediaItem> {
             }
         }
 
+        // Sort ascending by area (w * h):
+        // index 0 = smallest resolution (thumbnail)
+        // index last = highest resolution (master asset)
+        variants.sort_by_key(|v| {
+            v.dimensions
+                .as_ref()
+                .map(|d| d.width * d.height)
+                .unwrap_or(0)
+        });
+
+        // 1. Master High-Res URL: pick largest variant, or fallback to display_url
+        let high_res_url = variants
+            .last()
+            .map(|v| v.url.clone())
+            .unwrap_or_else(|| display_url.clone());
+
+        // 2. Best Dimensions: pick from largest variant, or fallback to node dims
+        let best_dims = variants
+            .last()
+            .and_then(|v| v.dimensions.clone())
+            .or(dims);
+
+        // 3. Thumbnail URL: pick smallest variant (~150w-640w), or fallback to display_url
+        let thumb_url = variants
+            .first()
+            .map(|v| v.url.clone())
+            .or_else(|| Some(display_url.clone()));
+
         let mut media = MediaItem::new(
             MediaType::Image,
             "image/jpeg",
-            dims,
+            best_dims,
             None,
-            display_url.clone(),
-            None,
+            high_res_url.clone(),
+            thumb_url,
             None,
             None,
             Some("https://www.instagram.com/".to_string()),
-            display_url,
+            high_res_url,
         );
 
         if !variants.is_empty() {
@@ -358,12 +401,18 @@ async fn extract_highlight_links(input_url: &str, client: &Client) -> Result<Ext
         }
     }
 
+    let published_at = raw_items
+        .first()
+        .and_then(|item| item.get("taken_at"))
+        .and_then(|t| t.as_i64())
+        .and_then(format_epoch_timestamp);
+
     Ok(ExtractedMediaMetadata {
         platform: "instagram".to_string(),
         author: user_name,
         caption: format!("Highlight {highlight_id}"),
         post_text: None,
-        published_at: None,
+        published_at: published_at,
         tags: Vec::new(),
         items,
         next_page_url: None,
@@ -548,12 +597,17 @@ async fn extract_direct_pk_links(
         items.push(media_item);
     }
 
+    let published_at = item
+        .get("taken_at")
+        .and_then(|t| t.as_i64())
+        .and_then(format_epoch_timestamp);
+
     Ok(ExtractedMediaMetadata {
         platform: "instagram".to_string(),
         author: username.to_string(),
         caption: format!("Story item {media_pk} from @{username}"),
         post_text: None,
-        published_at: None,
+        published_at: published_at,
         tags: Vec::new(),
         items,
         next_page_url: None,
@@ -576,7 +630,8 @@ fn parse_media_item(item: &Value) -> Option<MediaItem> {
             return None;
         }
 
-        let mut parsed_variants: Vec<(usize, usize, String)> = Vec::new();
+        // Struct for intermediate sorting: (width, height, url, file_size)
+        let mut parsed_variants: Vec<(usize, usize, String, Option<u64>)> = Vec::new();
         let mut seen_urls = HashSet::new();
 
         for v in versions {
@@ -585,13 +640,18 @@ fn parse_media_item(item: &Value) -> Option<MediaItem> {
                 if seen_urls.insert(cleaned.clone()) {
                     let w = v.get("width").and_then(|n| n.as_u64()).unwrap_or(0) as usize;
                     let h = v.get("height").and_then(|n| n.as_u64()).unwrap_or(0) as usize;
-                    parsed_variants.push((w, h, cleaned));
+                    let size = v
+                        .get("file_size")
+                        .or_else(|| v.get("file_size_bytes"))
+                        .and_then(|s| s.as_u64());
+
+                    parsed_variants.push((w, h, cleaned, size));
                 }
             }
         }
 
-        parsed_variants.sort_by_key(|(w, h, _)| std::cmp::Reverse(w * h));
-        let (best_w, best_h, best_url) = parsed_variants.first()?.clone();
+        parsed_variants.sort_by_key(|(w, h, _, _)| std::cmp::Reverse(w * h));
+        let (best_w, best_h, best_url, best_size) = parsed_variants.first()?.clone();
 
         let dims = if best_w > 0 && best_h > 0 {
             Some(MediaDimensions { width: best_w, height: best_h })
@@ -603,9 +663,9 @@ fn parse_media_item(item: &Value) -> Option<MediaItem> {
             MediaType::Video,
             "video/mp4",
             dims,
-            None,
+            best_size,
             best_url.clone(),
-            thumbnail_url,
+            thumbnail_url, // Lowest resolution poster
             None,
             None,
             Some("https://www.instagram.com/".to_string()),
@@ -614,21 +674,21 @@ fn parse_media_item(item: &Value) -> Option<MediaItem> {
 
         media.variants = parsed_variants
             .into_iter()
-            .map(|(w, h, url)| MediaVariant {
+            .map(|(w, h, url, size)| MediaVariant {
                 url,
                 dimensions: if w > 0 && h > 0 {
                     Some(MediaDimensions { width: w, height: h })
                 } else {
                     None
                 },
-                file_size_bytes: None,
+                file_size_bytes: size,
                 label: Some(format!("{w}x{h}")),
             })
             .collect();
 
         Some(media)
     } else {
-        let mut parsed_variants: Vec<(usize, usize, String)> = Vec::new();
+        let mut parsed_variants: Vec<(usize, usize, String, Option<u64>)> = Vec::new();
         let mut seen_urls = HashSet::new();
 
         for c in candidates {
@@ -637,13 +697,18 @@ fn parse_media_item(item: &Value) -> Option<MediaItem> {
                 if seen_urls.insert(cleaned.clone()) {
                     let w = c.get("width").and_then(|n| n.as_u64()).unwrap_or(0) as usize;
                     let h = c.get("height").and_then(|n| n.as_u64()).unwrap_or(0) as usize;
-                    parsed_variants.push((w, h, cleaned));
+                    let size = c
+                        .get("file_size")
+                        .or_else(|| c.get("file_size_bytes"))
+                        .and_then(|s| s.as_u64());
+
+                    parsed_variants.push((w, h, cleaned, size));
                 }
             }
         }
 
-        parsed_variants.sort_by_key(|(w, h, _)| std::cmp::Reverse(w * h));
-        let (best_w, best_h, best_url) = parsed_variants.first()?.clone();
+        parsed_variants.sort_by_key(|(w, h, _, _)| std::cmp::Reverse(w * h));
+        let (best_w, best_h, best_url, best_size) = parsed_variants.first()?.clone();
 
         let dims = if best_w > 0 && best_h > 0 {
             Some(MediaDimensions { width: best_w, height: best_h })
@@ -651,13 +716,19 @@ fn parse_media_item(item: &Value) -> Option<MediaItem> {
             None
         };
 
+        // Smallest candidate variant acts as the lightweight thumbnail
+        let thumb = parsed_variants
+            .last()
+            .map(|(_, _, u, _)| u.clone())
+            .or(thumbnail_url);
+
         let mut media = MediaItem::new(
             MediaType::Image,
             "image/jpeg",
             dims,
-            None,
+            best_size,
             best_url.clone(),
-            None,
+            thumb, // Populated with lightweight thumbnail
             None,
             None,
             Some("https://www.instagram.com/".to_string()),
@@ -666,14 +737,14 @@ fn parse_media_item(item: &Value) -> Option<MediaItem> {
 
         media.variants = parsed_variants
             .into_iter()
-            .map(|(w, h, url)| MediaVariant {
+            .map(|(w, h, url, size)| MediaVariant {
                 url,
                 dimensions: if w > 0 && h > 0 {
                     Some(MediaDimensions { width: w, height: h })
                 } else {
                     None
                 },
-                file_size_bytes: None,
+                file_size_bytes: size,
                 label: Some(format!("{w}w")),
             })
             .collect();
@@ -813,4 +884,9 @@ fn shortcode_to_id(shortcode: &str) -> Result<u128> {
         id = id.checked_mul(64).context("Overflow shortcode")? + val;
     }
     Ok(id)
+}
+
+fn format_epoch_timestamp(epoch_secs: i64) -> Option<String> {
+    chrono::DateTime::from_timestamp(epoch_secs, 0)
+        .map(|dt| dt.to_rfc3339())
 }

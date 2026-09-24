@@ -8,6 +8,7 @@ use reqwest::header::{HeaderValue, ACCEPT, CONTENT_LENGTH, CONTENT_RANGE, CONTEN
 use std::collections::HashSet;
 use std::time::Duration;
 
+#[derive(Clone)]
 pub struct ProbedImageMeta {
     pub dimensions: Option<MediaDimensions>,
     pub content_type: Option<String>,

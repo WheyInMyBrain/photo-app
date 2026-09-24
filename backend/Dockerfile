@@ -1,4 +1,4 @@
-# Stage 1: Build binary & libheif 1.23.1
+# Stage 1: Build binary & libheif 1.23.5
 FROM rust:1.98.1-bookworm AS builder
 WORKDIR /app
 
@@ -13,8 +13,8 @@ RUN apt-get update && apt-get install -y \
     libx265-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Build and install libheif 1.23.1
-RUN git clone --depth 1 --branch v1.23.1 https://github.com/strukturag/libheif.git /tmp/libheif \
+# Build and install libheif 1.23.5
+RUN git clone --depth 1 --branch v1.23.5 https://github.com/strukturag/libheif.git /tmp/libheif \
     && cd /tmp/libheif \
     && mkdir build && cd build \
     && cmake --preset=release-noplugins .. \
@@ -40,7 +40,10 @@ RUN apt-get update && apt-get install -y \
     ca-certificates \
     libsqlite3-0 \
     libde265-0 \
-    ffmpeg \
+    libx265-199 \
+    curl \
+    tar \
+    xz-utils \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy compiled libheif shared libraries from builder
@@ -49,6 +52,14 @@ RUN ldconfig
 
 # Copy backend binary
 COPY --from=builder /app/target/release/backend /app/backend
+
+# Grab the latest static build of ffmpeg & ffprobe directly from BtbN / John Van Sickle
+RUN ARCH=$(uname -m) && \
+    if [ "$ARCH" = "x86_64" ]; then FFMPEG_ARCH="linux64-gpl"; \
+    elif [ "$ARCH" = "aarch64" ]; then FFMPEG_ARCH="linuxarm64-gpl"; fi && \
+    curl -fsSL "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-master-latest-${FFMPEG_ARCH}.tar.xz" \
+    | tar -xJ --strip-components=2 -C /usr/local/bin/ --wildcards '*/bin/ffmpeg' '*/bin/ffprobe' \
+    && chmod +x /usr/local/bin/ffmpeg /usr/local/bin/ffprobe
 
 ENV SERVER_HOST=0.0.0.0
 ENV SERVER_PORT=3000

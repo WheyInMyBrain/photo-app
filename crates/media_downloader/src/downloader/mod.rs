@@ -2,10 +2,13 @@
 
 pub mod engine;
 pub mod hls;
+pub mod metadata;
 pub mod mux;
 
 use anyhow::Result;
 use std::path::{Path, PathBuf};
+
+pub use metadata::{inject_metadata, MediaMetadataPayload};
 
 /// The decoupled download request: completely agnostic of scrapers or platforms.
 #[derive(Debug, Clone)]
@@ -47,14 +50,12 @@ impl DownloadRequest {
         self
     }
 
-    /// Full canonical path to target destination
     pub fn target_path(&self) -> PathBuf {
         self.output_dir.join(&self.file_name)
     }
 }
 
 /// The universal download function. 
-/// Analyzes input links and routes to chunked streaming, HLS parsing, or ffmpeg muxing.
 pub async fn download(req: DownloadRequest) -> Result<PathBuf> {
     tokio::fs::create_dir_all(&req.output_dir).await?;
     let target = req.target_path();
@@ -64,17 +65,12 @@ pub async fn download(req: DownloadRequest) -> Result<PathBuf> {
         || req.audio_url.as_deref().map(|a| a.contains(".m3u8")).unwrap_or(false);
 
     match (is_hls, has_audio) {
-        // Case 1: HLS Stream(s) -> Let FFmpeg stream and assemble segments without RAM bloat
         (true, _) => {
             hls::download_hls_stream(&req, &target).await?;
         }
-
-        // Case 2: Direct Dual Streams (Video + Audio MP4s like Reddit DASH) -> Download chunks, then mux
         (false, true) => {
             mux::download_and_mux_direct(&req, &target).await?;
         }
-
-        // Case 3: Standard single direct URL (Images, MP4, WebM) -> Stream chunks directly to disk
         (false, false) => {
             engine::stream_direct_to_disk(&req.url, &target, req.referer.as_deref()).await?;
         }

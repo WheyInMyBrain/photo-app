@@ -123,11 +123,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // Upload
         .route("/api/upload", post(routes::upload::upload_photo))
-        .route("/api/upload/raw", post(routes::upload::upload_raw_binary))
         .route("/api/upload/chunk", post(routes::upload::upload_chunk))
         .route("/api/upload/chunk/finalize", post(routes::upload::finalize_chunk))
         .route("/api/upload/inspect", post(routes::upload::inspect_link))
-        .route("/api/upload/commit", post(routes::upload::commit_link_download))
+        .route("/api/upload/ingest", post(routes::upload::upload_ingest))
 
         // Event Stream
         .route("/api/events", get(routes::events::stream_events))
@@ -157,7 +156,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .nest(
             "/api/shortcuts",
             Router::new()
-                .route("/upload", post(routes::upload::upload_raw_binary))
                 .route("/albums", get(routes::albums::get_folder_suggestions)),
         )
         .layer(Extension(pool.clone()))

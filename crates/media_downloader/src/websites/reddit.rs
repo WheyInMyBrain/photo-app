@@ -84,7 +84,8 @@ pub async fn extract_reddit(input_url: &str) -> Result<ExtractedMediaMetadata> {
     let published_at = post_data
         .get("created_utc")
         .and_then(|c| c.as_f64())
-        .map(|ts| (ts as i64).to_string());
+        .map(|ts| ts as i64)
+        .and_then(format_epoch_timestamp);
 
     let mut tags = Vec::new();
     if let Some(flair) = post_data.get("link_flair_text").and_then(|f| f.as_str()) {
@@ -330,13 +331,16 @@ fn parse_reddit_single_image(post_data: &Value, _page_url: &str) -> Option<Media
         label: dims.as_ref().map(|d| format!("{}w", d.width)),
     });
 
+    // Pick the smallest resolution variant as thumbnail, falling back to high_res_url
+    let thumbnail_url = variants.first().map(|v| v.url.clone()).or_else(|| Some(high_res_url.clone()));
+
     let mut media = MediaItem::new(
         MediaType::Image,
         "image/jpeg",
         dims,
         None,
         high_res_url.clone(),
-        None,
+        thumbnail_url,
         None,
         None,
         Some("https://www.reddit.com/".to_string()),
@@ -401,6 +405,9 @@ fn parse_reddit_gallery_node(media_obj: &Value, _page_url: &str) -> Option<Media
         let h = media_obj.pointer("/s/y").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
         let dims = if w > 0 && h > 0 { Some(MediaDimensions { width: w, height: h }) } else { None };
 
+        // `p` array contains the lower resolution variants in ascending order (smallest first)
+        let thumbnail = variants.first().map(|v| v.url.clone()).or_else(|| Some(clean_img.clone()));
+
         variants.push(MediaVariant {
             url: clean_img.clone(),
             dimensions: dims.clone(),
@@ -414,7 +421,7 @@ fn parse_reddit_gallery_node(media_obj: &Value, _page_url: &str) -> Option<Media
             dims,
             None,
             clean_img.clone(),
-            None,
+            thumbnail, 
             None,
             None,
             Some("https://www.reddit.com/".to_string()),
@@ -511,4 +518,9 @@ fn extract_preview_thumbnail(post_data: &Value) -> Option<String> {
 
 fn clean_url_str(raw: &str) -> String {
     raw.replace("&amp;", "&").replace(r"\/", "/")
+}
+
+fn format_epoch_timestamp(epoch_secs: i64) -> Option<String> {
+    chrono::DateTime::from_timestamp(epoch_secs, 0)
+        .map(|dt| dt.to_rfc3339())
 }

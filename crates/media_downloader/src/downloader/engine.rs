@@ -6,6 +6,8 @@ use std::process::Stdio;
 use tokio::fs::File;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
+use base64::{engine::general_purpose::STANDARD, Engine as _};
+use bytes::Bytes;
 
 const BROWSER_UA: &str =
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:155.0) Gecko/20100101 Firefox/155.0";
@@ -154,4 +156,42 @@ async fn download_single_hls(
     }
 
     Ok(())
+}
+
+/// Fetches media directly into memory without any byte size limits.
+pub async fn stream_to_memory(
+    url: &str,
+    referer: Option<&str>,
+) -> Result<(Bytes, String)> {
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(15))
+        .build()?;
+
+    let mut req = client.get(url).header("User-Agent", BROWSER_UA);
+    if let Some(ref_val) = referer {
+        req = req.header("Referer", ref_val);
+    }
+
+    let resp = req.send().await.context("Failed to send in-memory stream request")?;
+    if !resp.status().is_success() {
+        bail!("Server returned HTTP {}", resp.status());
+    }
+
+    let mime = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("image/jpeg")
+        .to_string();
+
+    let bytes = resp.bytes().await.context("Failed to read stream bytes")?;
+
+    Ok((bytes, mime))
+}
+
+/// Fetches full media bytes and returns the raw base64 string with NO size cap,
+/// formatted without the data: prefix so Apple Shortcuts can decode it natively.
+pub async fn stream_thumbnail_base64(url: &str, referer: Option<&str>) -> Option<String> {
+    let (bytes, _mime) = stream_to_memory(url, referer).await.ok()?;
+    Some(STANDARD.encode(&bytes))
 }

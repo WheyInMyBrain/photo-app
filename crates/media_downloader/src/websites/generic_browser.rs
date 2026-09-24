@@ -215,23 +215,67 @@ pub async fn sniff(url: &str, config: Option<&DownloaderConfig>) -> Result<Extra
 
     let resolved_images = join_all(img_tasks).await;
 
-    for (img_url, probed) in resolved_images {
-        let mime = probed
-            .content_type
-            .unwrap_or_else(|| infer_image_mime(&img_url).to_string());
+    // Filter out 0-byte assets or tiny UI icons / tracking beacons (< 60px)
+    let mut valid_images: Vec<_> = resolved_images
+        .into_iter()
+        .filter(|(_, probed)| {
+            probed.file_size_bytes.unwrap_or(1) > 0
+                && probed
+                    .dimensions
+                    .as_ref()
+                    .map(|d| d.width >= 60 && d.height >= 60)
+                    .unwrap_or(true)
+        })
+        .collect();
 
-        items.push(MediaItem::new(
+    // Sort descending by area (w * h) or file size:
+    // First = Highest quality (Master)
+    // Last  = Lowest quality (Thumbnail)
+    valid_images.sort_by(|(_, a), (_, b)| {
+        let area_a = a.dimensions.as_ref().map(|d| d.width * d.height).unwrap_or(0);
+        let area_b = b.dimensions.as_ref().map(|d| d.width * d.height).unwrap_or(0);
+        area_b
+            .cmp(&area_a)
+            .then_with(|| b.file_size_bytes.unwrap_or(0).cmp(&a.file_size_bytes.unwrap_or(0)))
+    });
+
+    if !valid_images.is_empty() {
+        // 1. Highest quality variant
+        let (best_url, best_probed) = valid_images.first().cloned().unwrap();
+
+        // 2. Lowest quality variant (or same if only 1 exists)
+        let thumb_url = valid_images.last().map(|(u, _)| u.clone()).unwrap();
+
+        let mime = best_probed
+            .content_type
+            .clone()
+            .unwrap_or_else(|| infer_image_mime(&best_url).to_string());
+
+        let variants: Vec<crate::models::MediaVariant> = valid_images
+            .iter()
+            .map(|(u, p)| crate::models::MediaVariant {
+                url: u.clone(),
+                dimensions: p.dimensions.clone(),
+                file_size_bytes: p.file_size_bytes,
+                label: p.dimensions.as_ref().map(|d| format!("{}x{}", d.width, d.height)),
+            })
+            .collect();
+
+        let mut master_item = MediaItem::new(
             MediaType::Image,
             mime,
-            probed.dimensions,
-            probed.file_size_bytes,
-            img_url.clone(),
-            None,
+            best_probed.dimensions.clone(),
+            best_probed.file_size_bytes,
+            best_url.clone(),
+            Some(thumb_url),
             None,
             None,
             Some(url.to_string()),
-            img_url,
-        ));
+            best_url,
+        );
+
+        master_item.variants = variants;
+        items.push(master_item);
     }
 
     let host = reqwest::Url::parse(url)
