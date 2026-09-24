@@ -33,7 +33,7 @@ COPY backend ./backend
 RUN cargo build --release -p backend
 
 # Stage 2: Minimal runtime
-FROM debian:bookworm-slim
+FROM debian:trixie-slim
 WORKDIR /app
 
 RUN apt-get update && apt-get install -y \
