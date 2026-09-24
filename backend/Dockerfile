@@ -40,7 +40,7 @@ RUN apt-get update && apt-get install -y \
     ca-certificates \
     libsqlite3-0 \
     libde265-0 \
-    libx265-199 \
+    libx265-dev \
     curl \
     tar \
     xz-utils \
