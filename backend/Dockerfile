@@ -1,5 +1,5 @@
 # Stage 1: Build binary & libheif 1.23.5
-FROM rust:1.98.1-bookworm AS builder
+FROM rust:1.98.1-trixie AS builder
 WORKDIR /app
 
 RUN apt-get update && apt-get install -y \
