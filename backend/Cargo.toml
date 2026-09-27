@@ -34,3 +34,10 @@ uuid = { version = "1.26.0", features = ["v4", "fast-rng"] }
 db = { path = "../crates/db" }
 media_downloader = { path = "../crates/media_downloader" }
 media_processing = { path = "../crates/media_processing" }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true

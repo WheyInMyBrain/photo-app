@@ -1,12 +1,21 @@
 :80 {
-    # Reverse proxy API traffic to the backend container
+    # 1. Reverse proxy API calls to backend
     handle /api/* {
         reverse_proxy backend:3000 {
             flush_interval -1
         }
     }
 
-    # Reverse proxy all other traffic to the frontend container
+    # 2. Reverse proxy static user assets and thumbnails to backend
+    handle /users/* {
+        reverse_proxy backend:3000
+    }
+
+    handle /thumbs/* {
+        reverse_proxy backend:3000
+    }
+
+    # 3. Everything else goes to the frontend
     handle {
         reverse_proxy frontend:3000
     }
