@@ -11,7 +11,7 @@ pub mod tag_repo;
 pub mod ingestion_repo;
 pub mod backup_repo;
 
-pub use album_repo::AlbumRepo;
+pub use album_repo::{AlbumRecord, AlbumRepo, SubAlbumRecord};
 pub use asset_repo::AssetRepo;
 pub use auth_repo::{AuthRepo, UserCredentialsRecord, UserRecord};
 pub use cache_repo::{CacheRepo, RawClipRecord, RawClusterRecord};

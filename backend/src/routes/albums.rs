@@ -1,77 +1,55 @@
 use axum::{
-    extract::{Query, State},
+    extract::{Path, Query, State},
     response::Json,
 };
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use std::collections::BTreeSet;
 
-use db::{AlbumRepo};
+use db::{AlbumRecord, AlbumRepo};
 use crate::error::AppError;
+use crate::middleware::auth::AuthUser;
 use crate::AppState;
 
-#[derive(Deserialize)]
-pub struct FolderQuery {
-    pub path: Option<String>,
-    pub is_private: Option<bool>,
-}
-
-#[derive(Serialize)]
-pub struct SubAlbum {
-    pub name: String,
-    pub full_path: String,
-    pub media_count: i64,
-    pub cover_thumb: Option<String>,
-}
-
-#[derive(Serialize)]
-pub struct AlbumViewResponse {
-    pub current_path: String,
-    pub sub_albums: Vec<SubAlbum>,
-}
-
-/// GET /api/albums?path=vacation
-pub async fn get_album_contents(
-    State(state): State<AppState>,
-    Query(params): Query<FolderQuery>,
-) -> Result<Json<AlbumViewResponse>, AppError> {
-    let current_path = params.path.unwrap_or_default().trim_matches('/').to_string();
-    let privacy_level = if params.is_private.unwrap_or(false) { 1 } else { 0 };
-
-    let sub_albums_raw = AlbumRepo::get_sub_albums(&state.db, &current_path, privacy_level)
-        .await
-        .map_err(|e| AppError::Internal(e.to_string()))?;
-
-    let sub_albums = sub_albums_raw
-        .into_iter()
-        .map(|r| SubAlbum {
-            name: r.name,
-            full_path: r.full_path,
-            media_count: r.media_count,
-            cover_thumb: r.cover_thumb,
-        })
-        .collect();
-
-    Ok(Json(AlbumViewResponse {
-        current_path,
-        sub_albums,
-    }))
-}
+// ---------------------------------------------------------------------------
+// 1. Payloads & Query Models
+// ---------------------------------------------------------------------------
 
 #[derive(Deserialize)]
 pub struct SuggestionQuery {
     pub query: Option<String>,
-    pub is_private: Option<bool>,
 }
+
+#[derive(Deserialize)]
+pub struct CreateAlbumRequest {
+    pub title: String,
+    pub description: Option<String>,
+    pub album_type: Option<String>, // "MANUAL" or "SMART"
+    pub filter_criteria: Option<serde_json::Value>,
+}
+
+#[derive(Deserialize)]
+pub struct AlbumAssetActionRequest {
+    pub asset_ids: Vec<String>,
+}
+
+#[derive(Deserialize)]
+pub struct SetCoverRequest {
+    pub asset_id: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
+// 2. Folder Suggestions
+// ---------------------------------------------------------------------------
 
 /// GET /api/albums/suggestions?query=
 pub async fn get_folder_suggestions(
     State(state): State<AppState>,
+    auth_user: AuthUser,
     Query(params): Query<SuggestionQuery>,
 ) -> Result<Json<Vec<String>>, AppError> {
-    let privacy_level = if params.is_private.unwrap_or(false) { 1 } else { 0 };
     let filter = params.query.unwrap_or_default().trim().to_lowercase();
 
-    let raw_paths = AlbumRepo::get_all_folder_paths(&state.db, privacy_level)
+    let raw_paths = AlbumRepo::get_all_folder_paths(&state.db, &auth_user.id)
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?;
 
@@ -82,7 +60,11 @@ pub async fn get_folder_suggestions(
             continue;
         }
 
-        let segments: Vec<&str> = cleaned.split('/').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
+        let segments: Vec<&str> = cleaned
+            .split('/')
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .collect();
         let mut prefix = String::new();
         for (i, seg) in segments.iter().enumerate() {
             if i > 0 {
@@ -99,4 +81,150 @@ pub async fn get_folder_suggestions(
         .collect();
 
     Ok(Json(result))
+}
+
+// ---------------------------------------------------------------------------
+// 3. Custom Albums Endpoints
+// ---------------------------------------------------------------------------
+
+/// GET /api/albums
+pub async fn list_albums(
+    State(state): State<AppState>,
+    auth_user: AuthUser,
+) -> Result<Json<Vec<AlbumRecord>>, AppError> {
+    let albums = AlbumRepo::list_custom_albums(&state.db, &auth_user.id)
+        .await
+        .map_err(|e| {
+            tracing::error!("Error fetching custom albums: {e}");
+            AppError::Internal(e.to_string())
+        })?;
+
+    Ok(Json(albums))
+}
+
+/// GET /api/albums/{id}
+pub async fn get_album(
+    State(state): State<AppState>,
+    auth_user: AuthUser,
+    Path(album_id): Path<String>,
+) -> Result<Json<AlbumRecord>, AppError> {
+    let album = AlbumRepo::get_album_by_id(&state.db, &album_id, &auth_user.id)
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?
+        .ok_or_else(|| AppError::NotFound("Album not found".into()))?;
+
+    Ok(Json(album))
+}
+
+/// POST /api/albums
+pub async fn create_album(
+    State(state): State<AppState>,
+    auth_user: AuthUser,
+    Json(payload): Json<CreateAlbumRequest>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let title = payload.title.trim();
+    if title.is_empty() {
+        return Err(AppError::BadRequest("Album title cannot be empty".into()));
+    }
+
+    let album_type = payload.album_type.unwrap_or_else(|| "MANUAL".to_string());
+    let filter_criteria_str = payload.filter_criteria.map(|v| v.to_string());
+
+    let album_id = AlbumRepo::create_album(
+        &state.db,
+        &auth_user.id,
+        title,
+        payload.description.as_deref(),
+        &album_type,
+        filter_criteria_str.as_deref(),
+    )
+    .await
+    .map_err(|e| AppError::Internal(e.to_string()))?;
+
+    Ok(Json(serde_json::json!({
+        "status": "success",
+        "album_id": album_id
+    })))
+}
+
+/// POST /api/albums/{id}/assets
+pub async fn add_assets_to_album(
+    State(state): State<AppState>,
+    auth_user: AuthUser,
+    Path(album_id): Path<String>,
+    Json(payload): Json<AlbumAssetActionRequest>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    if payload.asset_ids.is_empty() {
+        return Err(AppError::BadRequest("No assets specified".into()));
+    }
+
+    let added = AlbumRepo::add_assets(&state.db, &album_id, &auth_user.id, &payload.asset_ids)
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+
+    Ok(Json(serde_json::json!({
+        "status": "success",
+        "added": added
+    })))
+}
+
+/// POST /api/albums/{id}/assets/remove
+pub async fn remove_assets_from_album(
+    State(state): State<AppState>,
+    auth_user: AuthUser,
+    Path(album_id): Path<String>,
+    Json(payload): Json<AlbumAssetActionRequest>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    if payload.asset_ids.is_empty() {
+        return Err(AppError::BadRequest("No assets specified".into()));
+    }
+
+    let removed = AlbumRepo::remove_assets(&state.db, &album_id, &auth_user.id, &payload.asset_ids)
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+
+    Ok(Json(serde_json::json!({
+        "status": "success",
+        "removed": removed
+    })))
+}
+
+/// POST /api/albums/{id}/cover
+pub async fn set_album_cover(
+    State(state): State<AppState>,
+    auth_user: AuthUser,
+    Path(album_id): Path<String>,
+    Json(payload): Json<SetCoverRequest>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let updated = AlbumRepo::set_cover(
+        &state.db,
+        &album_id,
+        &auth_user.id,
+        payload.asset_id.as_deref(),
+    )
+    .await
+    .map_err(|e| AppError::Internal(e.to_string()))?;
+
+    if !updated {
+        return Err(AppError::NotFound("Album not found".into()));
+    }
+
+    Ok(Json(serde_json::json!({ "status": "success" })))
+}
+
+/// POST /api/albums/{id}/delete
+pub async fn delete_album(
+    State(state): State<AppState>,
+    auth_user: AuthUser,
+    Path(album_id): Path<String>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let deleted = AlbumRepo::delete_album(&state.db, &album_id, &auth_user.id)
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+
+    if !deleted {
+        return Err(AppError::NotFound("Album not found".into()));
+    }
+
+    Ok(Json(serde_json::json!({ "status": "success" })))
 }

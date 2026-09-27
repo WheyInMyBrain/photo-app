@@ -9,6 +9,7 @@
   const dispatch = createEventDispatcher<{
     toggleDelete: void;
     purge: void;
+    addToAlbum: void;
     clear: void;
   }>();
 
@@ -19,7 +20,7 @@
   <aside
     transition:fly={{ y: 30, duration: 220 }}
     style="bottom: max(5.5rem, calc(var(--sab) + 4.5rem));"
-    class="fixed left-1/2 -translate-x-1/2 z-40 max-w-[92vw] sm:max-w-md w-full select-none"
+    class="fixed left-1/2 -translate-x-1/2 z-40 max-w-[92vw] sm:max-w-lg w-full select-none"
     aria-label="Bulk selection actions"
   >
     <div class="glass-pill px-4 py-2.5 rounded-2xl shadow-2xl flex items-center justify-between gap-3 border border-[var(--border-glass)]">
@@ -27,7 +28,7 @@
       <div class="flex items-center gap-2 min-w-0">
         <span class="w-2 h-2 rounded-full bg-purple-500 animate-pulse flex-shrink-0"></span>
         <span class="text-xs font-bold tracking-tight text-[var(--text-main)] truncate">
-          {count} {count === 1 ? 'selected' : 'selected'}
+          {count} selected
         </span>
       </div>
 
@@ -51,6 +52,18 @@
             Purge
           </button>
         {:else}
+          <!-- Add to Album Button -->
+          <button
+            type="button"
+            disabled={isActionLoading}
+            on:click={() => dispatch('addToAlbum')}
+            class="px-3 py-1.5 rounded-xl bg-purple-500/15 border border-purple-500/30 hover:bg-purple-500/25 text-purple-300 text-xs font-semibold transition-all spring-tap cursor-pointer disabled:opacity-40 flex items-center gap-1.5"
+          >
+            <span>📁</span>
+            <span>Add to Album</span>
+          </button>
+
+          <!-- Move to Trash Button -->
           <button
             type="button"
             disabled={isActionLoading}
@@ -58,7 +71,7 @@
             class="px-3 py-1.5 rounded-xl bg-red-500/15 border border-red-500/30 hover:bg-red-500/25 text-red-300 text-xs font-semibold transition-all spring-tap cursor-pointer disabled:opacity-40 flex items-center gap-1.5"
           >
             <span>🗑️</span>
-            <span>Move to Trash</span>
+            <span>Trash</span>
           </button>
         {/if}
 

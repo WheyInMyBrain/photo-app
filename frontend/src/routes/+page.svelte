@@ -1,8 +1,10 @@
+<!-- photo-app/frontend/src/routes/+page.svelte -->
 <script lang="ts">
   import { onMount, onDestroy } from 'svelte';
   import { fade } from 'svelte/transition';
 
   import { filterStore, filterQueryString } from '$lib/stores/filterStore';
+  import { albumStore } from '$lib/stores/albumStore';
   import { createMediaSelection } from '$lib/stores/mediaSelection';
   import { createTimelineStore } from '$lib/stores/timelineStore';
   import { gridDensity, DENSITY_PRESETS } from '$lib/stores/gridDensityStore';
@@ -17,13 +19,13 @@
     type Coords
   } from '$lib/utils/coordinateNav';
 
-  import FolderGrid from '$lib/components/FolderGrid.svelte';
   import BatchActionBar from '$lib/components/BatchActionBar.svelte';
   import PhotoModal from '$lib/components/PhotoModal.svelte';
   import TimelineScrubber from '$lib/components/TimelineScrubber.svelte';
+  import AddToAlbumModal from '$lib/components/AddToAlbumModal.svelte';
 
   const timeline = createTimelineStore();
-  const { sections, albums, isLoading, hasMore } = timeline;
+  const { sections, isLoading, hasMore } = timeline;
 
   const selection = createMediaSelection(() => timeline.fetchMedia($filterQueryString, true));
   const { selectedCount, isSelectionActive, isActionLoading } = selection;
@@ -34,13 +36,14 @@
   let observer: IntersectionObserver | null = null;
   let filterDebounceTimer: ReturnType<typeof setTimeout> | null = null;
   let sseSubscription: { close: () => void } | null = null;
+  let showAddToAlbumModal = false;
 
   $: selectedAsset = resolveAsset($sections, activeCoords);
   $: prevAsset = resolveAsset($sections, getPrevCoords($sections, activeCoords));$: nextAsset = resolveAsset($sections, getNextCoords($sections, activeCoords));
 
-  $: folderSegments =$filterStore.folder_path
-    ? $filterStore.folder_path.split('/').filter(Boolean)
-    : [];
+  $: currentAlbum =$filterStore.album_id
+    ? $albumStore.find((a) => a.id ===$filterStore.album_id)
+    : null;
 
   $: scrubMarkers =$sections.map((s, idx) => ({
     label: s.title.split(' ')[0],
@@ -49,6 +52,11 @@
   }));
 
   $: currentDensity = DENSITY_PRESETS[$gridDensity];
+
+  $: selectedAssetIds = Array.from(
+    (selection as any).selectedIds ??
+    (typeof (selection as any).getSelectedIds === 'function' ? (selection as any).getSelectedIds() : [])
+  );
 
   const pinchZoom = createPinchZoomHandler(
     () => gridDensity.zoomIn(),
@@ -125,7 +133,12 @@
   }
 
   onMount(() => {
-    const handleRefresh = () => timeline.fetchMedia($filterQueryString, true);
+    albumStore.load();
+
+    const handleRefresh = () => {
+      timeline.fetchMedia($filterQueryString, true);
+      albumStore.load();
+    };
     window.addEventListener('vault:refresh-timeline', handleRefresh);
     sseSubscription = initMediaEvents(handleRefresh);
 
@@ -173,27 +186,33 @@
 
 <div
   style="padding-bottom: max(2rem, calc(var(--sab) + 1.5rem));"
-  class="px-2 pt-14 md:px-6 md:pt-6 max-w-[1700px] mx-auto space-y-4 md:space-y-6 min-h-full flex flex-col select-none relative transition-all duration-300 ease-out {activeCoords !== null ? 'scale-[0.97] opacity-85 pointer-events-none' : 'scale-100 opacity-100'} {$isSelectionActive ? 'selection-active' : ''}"
+  class="px-2 pt-16 md:px-6 md:pt-16 max-w-[1700px] mx-auto space-y-5 md:space-y-6 min-h-full flex flex-col select-none relative transition-all duration-300 ease-out {activeCoords !== null ? 'scale-[0.97] opacity-85 pointer-events-none' : 'scale-100 opacity-100'} {$isSelectionActive ? 'selection-active' : ''}"
 >
+  <!-- Contextual Breadcrumb Bar -->
   <div class="flex items-center justify-between gap-2 px-1">
     <div class="flex items-center gap-1.5 text-xs text-[var(--text-muted)] overflow-x-auto no-scrollbar py-1">
       <button
         type="button"
-        on:click={() => filterStore.setFolderPath('')}
-        class="hover:text-[var(--text-main)] transition-colors cursor-pointer font-medium whitespace-nowrap"
+        on:click={() => filterStore.clearAlbum()}
+        class="hover:text-[var(--text-main)] transition-colors cursor-pointer font-medium whitespace-nowrap {!$filterStore.album_id ? 'text-[var(--text-main)] font-semibold' : ''}"
       >
-        Root
+        {$filterStore.view_mode === 'albums' ? 'All Albums' : 'Library'}
       </button>
-      {#each folderSegments as seg, i}
+
+      {#if $filterStore.album_id}
         <span class="opacity-40">/</span>
-        <button
-          type="button"
-          on:click={() => filterStore.setFolderPath(folderSegments.slice(0, i + 1).join('/'))}
-          class="hover:text-[var(--text-main)] transition-colors cursor-pointer whitespace-nowrap {i === folderSegments.length - 1 ? 'text-[var(--text-main)] font-semibold' : ''}"
-        >
-          {seg}
-        </button>
-      {/each}
+        <div class="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full bg-purple-500/15 border border-purple-500/30 text-purple-300 font-medium">
+          <span>📁 {currentAlbum?.title || 'Album'}</span>
+          <button
+            type="button"
+            on:click={() => filterStore.clearAlbum()}
+            class="hover:text-white transition-colors cursor-pointer ml-1 leading-none text-xs"
+            title="Exit album"
+          >
+            ✕
+          </button>
+        </div>
+      {/if}
     </div>
 
     {#if $filterStore.show_trash}
@@ -203,12 +222,81 @@
     {/if}
   </div>
 
-  <FolderGrid albums={$albums} />
+  <!-- ================================================================= -->
+  <!-- SINGLE UNIFIED ALBUMS SHELF (Shown only in Albums mode at root)   -->
+  <!-- ================================================================= -->
+  {#if $filterStore.view_mode === 'albums' && !$filterStore.album_id}
+    <div class="space-y-3" in:fade={{ duration: 150 }}>
+      <div class="flex items-center justify-between px-1">
+        <h3 class="text-xs font-semibold uppercase tracking-wider text-[var(--text-muted)]">
+          Albums
+        </h3>
+        <span class="text-[10px] text-[var(--text-muted)] font-mono">
+          {$albumStore.length} {$albumStore.length === 1 ? 'album' : 'albums'}
+        </span>
+      </div>
 
-  {#if $sections.length === 0 && $albums.length === 0 && !$isLoading}
+      {#if $albumStore.length === 0}
+        <div class="py-12 px-4 text-center border border-dashed border-[var(--border-glass)] rounded-2xl bg-white/[0.02]">
+          <div class="text-3xl mb-2 opacity-50">📁</div>
+          <p class="text-xs text-[var(--text-muted)]">No albums yet. Select photos to add them to an album, or upload into a folder.</p>
+        </div>
+      {:else}
+        <div class="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-6 gap-3">
+          {#each $albumStore as album (album.id)}
+            <button
+              type="button"
+              on:click={() => filterStore.setAlbumId(album.id)}
+              class="group text-left p-2.5 rounded-2xl bg-white/5 hover:bg-white/10 border border-[var(--border-glass)] hover:border-purple-500/40 transition-all cursor-pointer flex flex-col gap-2.5 spring-tap"
+            >
+              <!-- Album Cover Tile -->
+              <div class="w-full aspect-square rounded-xl overflow-hidden bg-black/25 flex items-center justify-center border border-white/5 relative">
+                {#if album.cover_thumb}
+                  <img
+                    src={album.cover_thumb.startsWith('/') ? album.cover_thumb : `/${album.cover_thumb}`}
+                    alt={album.title}
+                    class="w-full h-full object-cover group-hover:scale-105 transition-transform duration-300"
+                  />
+                {:else}
+                  <span class="text-3xl opacity-40">📁</span>
+                {/if}
+
+                <div class="absolute bottom-1.5 right-1.5 bg-black/60 backdrop-blur-md px-1.5 py-0.5 rounded-md text-[9px] text-white/90 font-mono">
+                  {album.media_count}
+                </div>
+              </div>
+
+              <!-- Title & Item Counter -->
+              <div class="min-w-0 px-0.5">
+                <div class="text-xs font-semibold truncate text-[var(--text-main)] group-hover:text-purple-400 transition-colors">
+                  {album.title}
+                </div>
+                <div class="text-[10px] text-[var(--text-muted)]">
+                  {album.media_count} {album.media_count === 1 ? 'photo' : 'photos'}
+                </div>
+              </div>
+            </button>
+          {/each}
+        </div>
+      {/if}
+    </div>
+  {/if}
+
+  <!-- ================================================================= -->
+  <!-- MEDIA TIMELINE GRID                                               -->
+  <!-- ================================================================= -->
+  {#if $sections.length === 0 && !$isLoading}
     <div in:fade={{ duration: 150 }} class="flex-1 flex flex-col items-center justify-center text-center py-24 text-[var(--text-muted)] text-xs">
-      <div class="text-4xl mb-3 opacity-60">{$filterStore.show_trash ? '🗑️' : '📷'}</div>
-      <p class="font-medium text-sm">{$filterStore.show_trash ? 'Trash is empty.' : 'No media found in this view.'}</p>
+      <div class="text-4xl mb-3 opacity-60">
+        {$filterStore.show_trash ? '🗑️' : $filterStore.album_id ? '📁' : '📷'}
+      </div>
+      <p class="font-medium text-sm">
+        {$filterStore.show_trash
+          ? 'Trash is empty.'
+          : $filterStore.album_id
+            ? 'No photos in this album.'
+            : 'No media found in library.'}
+      </p>
     </div>
   {:else}
     <div
@@ -254,7 +342,7 @@
                   alt={asset.file_name}
                   loading="lazy"
                   decoding="async"
-                  on:load={(e) => e.currentTarget.classList.add('loaded')}
+                  on:load={(e) => (e.currentTarget as HTMLElement).classList.add('loaded')}
                   class="tile-image w-full h-full object-cover pointer-events-none group-hover:scale-102"
                 />
 
@@ -313,14 +401,31 @@
   on:jump={(e) => scrollToSection(e.detail.index)}
 />
 
+<!-- Batch Action Bar with Add To Album Integration -->
 <BatchActionBar
   count={$selectedCount}
   isActionLoading={$isActionLoading}
   on:toggleDelete={selection.batchToggleDelete}
   on:purge={selection.batchPurge}
+  on:addToAlbum={() => (showAddToAlbumModal = true)}
   on:clear={selection.clearSelection}
 />
 
+<!-- Add To Custom Album Modal -->
+{#if showAddToAlbumModal}
+  <AddToAlbumModal
+    assetIds={selectedAssetIds}
+    on:close={() => (showAddToAlbumModal = false)}
+    on:completed={() => {
+      showAddToAlbumModal = false;
+      selection.clearSelection();
+      timeline.fetchMedia($filterQueryString, true);
+      albumStore.load();
+    }}
+  />
+{/if}
+
+<!-- Single Asset Lightbox / Viewer Modal -->
 {#if selectedAsset && activeCoords !== null}
   <PhotoModal
     asset={selectedAsset}

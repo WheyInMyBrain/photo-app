@@ -47,12 +47,29 @@ async fn persist_and_enqueue_bytes(
     if let Ok(Some(existing_id)) =
         AssetRepo::find_user_asset_by_sha256(&state.db, user_id, &sha256).await
     {
+        // If a specific folder/album is provided, associate the existing asset into the album tables
+        if !sanitized_folder.is_empty() && sanitized_folder != "root" {
+            if let Ok(mut tx) = state.db.begin().await {
+                if db::AlbumRepo::link_asset_to_folder_albums_tx(
+                    &mut tx,
+                    user_id,
+                    &existing_id,
+                    &sanitized_folder,
+                )
+                .await
+                .is_ok()
+                {
+                    let _ = tx.commit().await;
+                }
+            }
+        }
+
         return UploadItemResult {
             file_name: file_name.to_string(),
             status: "duplicate".to_string(),
             id: Some(existing_id),
             relative_path: None,
-            message: Some("File already exists in library".into()),
+            message: Some("File already exists in library (linked to album)".into()),
         };
     }
 
@@ -167,23 +184,41 @@ async fn persist_and_enqueue_staged_file(
     drop(file_to_hash);
 
     let sha256_hash = hex::encode(hasher.finalize());
+    let sanitized_folder = StorageService::sanitize_folder_path(folder);
 
     // 2. Duplicate Check (Scoped to authenticated user)
     if let Ok(Some(existing_id)) =
         AssetRepo::find_user_asset_by_sha256(&state.db, user_id, &sha256_hash).await
     {
         let _ = fs::remove_file(part_path).await;
+
+        // If a specific folder/album is provided, associate the existing asset into the album tables
+        if !sanitized_folder.is_empty() && sanitized_folder != "root" {
+            if let Ok(mut tx) = state.db.begin().await {
+                if db::AlbumRepo::link_asset_to_folder_albums_tx(
+                    &mut tx,
+                    user_id,
+                    &existing_id,
+                    &sanitized_folder,
+                )
+                .await
+                .is_ok()
+                {
+                    let _ = tx.commit().await;
+                }
+            }
+        }
+
         return Ok(UploadItemResult {
             file_name: file_name.to_string(),
             status: "duplicate".to_string(),
             id: Some(existing_id),
             relative_path: None,
-            message: Some("Duplicate file exists in your library".to_string()),
+            message: Some("Duplicate file exists in your library (linked to album)".to_string()),
         });
     }
 
     // 3. Resolve destination & move
-    let sanitized_folder = StorageService::sanitize_folder_path(folder);
     let target_dir = StorageService::resolve_upload_dir(
         &state.config.storage_root,
         user_id,

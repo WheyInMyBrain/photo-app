@@ -176,6 +176,15 @@ impl AssetRepo {
             }
         }
 
+        // --- CUSTOM ALBUM FILTER (USER-SCOPED) ---
+        if let Some(ref album_id) = q.album_id {
+            builder.push(" AND a.id IN (SELECT aa.asset_id FROM album_assets aa JOIN albums alb ON aa.album_id = alb.id WHERE alb.id = ");
+            builder.push_bind(album_id);
+            builder.push(" AND alb.user_id = ");
+            builder.push_bind(user_id);
+            builder.push(") ");
+        }
+
         if let Some(ref folder) = q.folder_path {
             builder.push(" AND a.folder_path = ");
             builder.push_bind(folder);
@@ -215,8 +224,8 @@ impl AssetRepo {
         }
         builder.push_bind(fetch_limit);
 
-        // Sub-album retrieval (scoped by user_id)
-        let albums = if q.cursor_id.is_none() && !show_trash {
+        // Sub-album retrieval (scoped by user_id and omitted when querying a custom album)
+        let albums = if q.cursor_id.is_none() && !show_trash && q.album_id.is_none() {
             let curr = q.folder_path.as_deref().unwrap_or("");
             Self::get_sub_albums(pool, user_id, curr, q.media_type.as_deref()).await.unwrap_or_default()
         } else {
@@ -254,7 +263,6 @@ impl AssetRepo {
         let show_trash = q.show_trash.unwrap_or(false);
         let fts_query = q.q.as_deref().and_then(Self::sanitize_query);
 
-        // Parse list params upfront so they can be reused across builder instantiations
         let pids: Vec<&str> = q
             .person_id
             .as_deref()
@@ -267,7 +275,6 @@ impl AssetRepo {
             .map(|s| s.split(',').map(|t| t.trim().to_lowercase()).filter(|t| !t.is_empty()).collect())
             .unwrap_or_default();
 
-        // Helper to construct a fresh CTE builder scoped strictly to user_id
         let build_cte = || {
             let mut builder: QueryBuilder<Sqlite> = QueryBuilder::new("WITH filtered AS (SELECT a.* FROM assets a ");
 
@@ -338,6 +345,14 @@ impl AssetRepo {
                 for t in &tags { sep.push_bind(t); }
                 sep.push_unseparated(") GROUP BY at.asset_id HAVING COUNT(DISTINCT LOWER(t.name)) = ");
                 builder.push_bind(count);
+                builder.push(") ");
+            }
+
+            if let Some(ref album_id) = q.album_id {
+                builder.push(" AND a.id IN (SELECT aa.asset_id FROM album_assets aa JOIN albums alb ON aa.album_id = alb.id WHERE alb.id = ");
+                builder.push_bind(album_id);
+                builder.push(" AND alb.user_id = ");
+                builder.push_bind(user_id);
                 builder.push(") ");
             }
 
@@ -420,7 +435,7 @@ impl AssetRepo {
             })
             .collect();
 
-        // 3. People breakdown (strictly user's named persons)
+        // 3. People breakdown
         let mut people_builder = build_cte();
         people_builder.push(
             r#"
@@ -450,7 +465,7 @@ impl AssetRepo {
             })
             .collect();
 
-        // 4. Tags breakdown (strictly user's dictionary)
+        // 4. Tags breakdown
         let mut tags_builder = build_cte();
         tags_builder.push(
             r#"

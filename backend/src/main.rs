@@ -131,8 +131,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Event Stream
         .route("/api/events", get(routes::events::stream_events))
 
-        // Folder Structure
-        .route("/api/albums", get(routes::albums::get_album_contents))
+        // Folder Structure Custom Albums & Collections
+        .route("/api/albums", get(routes::albums::list_albums).post(routes::albums::create_album))
+        .route("/api/albums/{id}", get(routes::albums::get_album))
+        .route("/api/albums/{id}/assets", post(routes::albums::add_assets_to_album))
+        .route("/api/albums/{id}/assets/remove", post(routes::albums::remove_assets_from_album))
+        .route("/api/albums/{id}/cover", post(routes::albums::set_album_cover))
+        .route("/api/albums/{id}/delete", post(routes::albums::delete_album))
         .route("/api/albums/suggestions", get(routes::albums::get_folder_suggestions))
 
         // People & Face Metadata

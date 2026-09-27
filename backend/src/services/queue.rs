@@ -9,7 +9,7 @@ use tracing::{error, info, warn};
 
 use db::domain::{DbJob, NewAssetRecord};
 use db::tag_repo::{IngestionTagInput, TagRepo};
-use db::{AssetRepo, IngestionRepo, JobRepo};
+use db::{AssetRepo, IngestionRepo, JobRepo, AlbumRepo};
 
 use crate::services::engine_coordinator::EngineCoordinator;
 use crate::WsMediaEvent;
@@ -430,6 +430,15 @@ impl QueueService {
         AssetRepo::insert_asset_tx(&mut *tx, &asset)
             .await
             .map_err(|e| e.to_string())?;
+
+        AlbumRepo::link_asset_to_folder_albums_tx(
+            &mut *tx,
+            &job.user_id,
+            &job.asset_id,
+            &job.folder_path,
+        )
+        .await
+        .map_err(|e| format!("Failed linking asset to album: {e}"))?;
 
         // 2. Commit scraped hashtags and author to tags and FTS5 index immediately
         if let Some(payload) = p {

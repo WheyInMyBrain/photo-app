@@ -1,3 +1,4 @@
+<!-- photo-app/frontend/src/lib/components/UploadModal.svelte -->
 <script lang="ts">
   import { createEventDispatcher, onMount } from 'svelte';
   import { authStore } from '$lib/stores/authStore';
@@ -17,7 +18,6 @@
     uploaded: { count: number };
   }>();
 
-  // Mode & Navigation
   let uploadMode: 'files' | 'link' = 'files';
   let folderPath = '';
   let isUploading = false;
@@ -26,11 +26,9 @@
   let inspectError = '';
   let existingFolders: string[] = [];
 
-  // File Upload State
   let stagedFiles: File[] = [];
   let fileInputEl: HTMLInputElement;
 
-  // Link Upload State
   let linkUrl = '';
   let linkPreview: InspectPreview | null = null;
   let selectedLinkItems: Set<string> = new Set();
@@ -104,7 +102,7 @@
     if (!linkUrl.trim() || isUploading) return;
     isUploading = true;
     inspectError = '';
-    statusMessage = 'Inspecting web link...';
+    statusMessage = 'Inspecting link...';
 
     try {
       const res = await fetch('/api/upload/inspect', {
@@ -134,7 +132,7 @@
         dispatch('uploaded', { count: data.Committed.total_uploaded || 1 });
         forceClose();
       } else {
-        throw new Error('No supported media found at this address.');
+        throw new Error('No supported media found.');
       }
     } catch (e: any) {
       inspectError = e.message || 'Inspection failed.';
@@ -201,7 +199,7 @@
         const file = stagedFiles[i];
         if (file.size > CHUNK_THRESHOLD_BYTES) {
           await uploadChunked(file, folderPath, (part, total) => {
-            statusMessage = `Streaming ${file.name} (chunk ${part}/${total})...`;
+            statusMessage = `Streaming ${file.name} (${part}/${total})...`;
           });
         } else {
           statusMessage = `Uploading ${file.name}...`;
@@ -210,7 +208,7 @@
         uploadProgress = Math.round(((i + 1) / totalCount) * 100);
       }
 
-      statusMessage = 'Upload completed successfully.';
+      statusMessage = 'Upload completed.';
       dispatch('uploaded', { count: totalCount });
       forceClose();
     } catch (e: any) {
@@ -246,54 +244,56 @@
 </datalist>
 
 {#if isOpen}
-  <!-- Backdrop -->
   <!-- svelte-ignore a11y_click_events_have_key_events -->
   <!-- svelte-ignore a11y_no_static_element_interactions -->
   <div
-    class="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-md p-3 sm:p-6 select-none"
+    class="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-md p-4 sm:p-6 select-none"
     role="dialog"
     aria-modal="true"
     tabindex="-1"
     on:click|self={() => { if (!isUploading) forceClose(); }}
   >
-    <!-- Modal Card Shell -->
+    <!-- Liquid-Glass Modal Card -->
     <div
-      class="glass-panel rounded-3xl w-full max-w-lg shadow-2xl flex flex-col max-h-[85vh] overflow-hidden border border-[var(--border-glass)] bg-[var(--bg-surface-elevated)]"
+      class="liquid-modal rounded-3xl w-full max-w-lg flex flex-col max-h-[85vh] overflow-hidden"
     >
-      <!-- Specular Header -->
-      <div class="px-6 py-4 border-b border-[var(--border-glass)] flex items-center justify-between">
+      <!-- Header -->
+      <div class="px-6 py-4.5 border-b border-white/[0.08] flex items-center justify-between">
         <div>
-          <h2 class="text-sm sm:text-base font-bold text-[var(--text-main)] flex items-center gap-2">
+          <h2 class="text-sm font-semibold tracking-tight text-white flex items-center gap-2">
             <span>Add Media</span>
           </h2>
-          <p class="text-[11px] text-[var(--text-muted)] mt-0.5">
-            Store raw originals with zero cloud compression.
+          <p class="text-[11px] text-white/45 mt-0.5 font-normal tracking-tight">
+            Original files preserved with full metadata.
           </p>
         </div>
         <button
           type="button"
           on:click={forceClose}
           disabled={isUploading}
-          class="w-7 h-7 flex items-center justify-center rounded-full glass-panel text-[var(--text-muted)] hover:text-[var(--text-main)] transition-colors spring-tap cursor-pointer disabled:opacity-30 text-xs"
-          title="Close (Esc)"
+          class="liquid-icon-btn w-7 h-7 flex items-center justify-center rounded-full text-white/50 hover:text-white transition-all spring-tap cursor-pointer disabled:opacity-30"
+          title="Close"
           aria-label="Close modal"
         >
-          ✕
+          <svg xmlns="http://www.w3.org/2000/svg" class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+            <line x1="18" y1="6" x2="6" y2="18"></line>
+            <line x1="6" y1="6" x2="18" y2="18"></line>
+          </svg>
         </button>
       </div>
 
-      <!-- Segmented Mode Selector -->
+      <!-- Segmented Mode Switcher -->
       <div class="px-6 pt-4">
-        <div class="flex p-1 rounded-xl glass-panel text-xs">
+        <div class="liquid-segmented p-0.5 rounded-xl flex text-xs">
           <button
-            class="flex-1 py-1.5 rounded-lg transition-all font-medium spring-tap cursor-pointer {uploadMode === 'files' ? 'bg-purple-600 text-white shadow-md' : 'text-[var(--text-muted)] hover:text-[var(--text-main)]'}"
+            class="flex-1 py-1.5 rounded-lg transition-all font-medium spring-tap cursor-pointer {uploadMode === 'files' ? 'liquid-seg-active text-white' : 'text-white/50 hover:text-white'}"
             on:click={() => { uploadMode = 'files'; inspectError = ''; }}
             disabled={isUploading}
           >
-            Device Files
+            Files
           </button>
           <button
-            class="flex-1 py-1.5 rounded-lg transition-all font-medium spring-tap cursor-pointer {uploadMode === 'link' ? 'bg-purple-600 text-white shadow-md' : 'text-[var(--text-muted)] hover:text-[var(--text-main)]'}"
+            class="flex-1 py-1.5 rounded-lg transition-all font-medium spring-tap cursor-pointer {uploadMode === 'link' ? 'liquid-seg-active text-white' : 'text-white/50 hover:text-white'}"
             on:click={() => { uploadMode = 'link'; inspectError = ''; }}
             disabled={isUploading}
           >
@@ -303,12 +303,12 @@
       </div>
 
       <!-- Scrollable Form Container -->
-      <div class="p-6 space-y-5 overflow-y-auto flex-1 no-scrollbar">
-        <!-- Destination Album Input -->
+      <div class="p-6 space-y-4 overflow-y-auto flex-1 no-scrollbar">
+        <!-- Destination Album / Folder Input -->
         <div class="space-y-1.5">
-          <label for="upload-folder-input" class="text-[10px] uppercase font-bold text-[var(--text-muted)] tracking-wider block pl-0.5">
-            Destination Album / Folder
-          </label>
+          <span class="text-[9px] uppercase tracking-wider font-semibold text-white/40 block pl-1">
+            Destination Album
+          </span>
           <input
             id="upload-folder-input"
             type="text"
@@ -316,24 +316,24 @@
             bind:value={folderPath}
             placeholder="root (e.g. 2026/holidays)..."
             disabled={isUploading || linkPreview !== null}
-            class="w-full bg-[var(--bg-surface)] border border-[var(--border-glass)] focus:ring-2 focus:ring-purple-500/50 rounded-xl px-3.5 py-2 text-xs text-[var(--text-main)] placeholder-[var(--text-muted)] outline-none transition-all disabled:opacity-50"
+            class="liquid-input w-full rounded-xl px-3.5 py-2 text-xs text-white placeholder-white/30 outline-none transition-all disabled:opacity-40"
           />
         </div>
 
         {#if uploadMode === 'files'}
           <!-- Local Files Section -->
           <div class="space-y-2.5">
-            <div class="flex items-center justify-between px-0.5">
-              <span class="text-[10px] uppercase font-bold text-[var(--text-muted)] tracking-wider">
-                Files ({stagedFiles.length})
+            <div class="flex items-center justify-between px-1">
+              <span class="text-[9px] uppercase tracking-wider font-semibold text-white/40">
+                Staged ({stagedFiles.length})
               </span>
               <button
                 type="button"
                 on:click={() => fileInputEl?.click()}
                 disabled={isUploading}
-                class="text-xs text-purple-400 hover:text-purple-300 font-medium cursor-pointer"
+                class="text-xs text-purple-300 hover:text-purple-200 font-medium cursor-pointer transition-colors"
               >
-                + Add files
+                + Add more
               </button>
             </div>
 
@@ -350,28 +350,28 @@
               <button
                 type="button"
                 on:click={() => fileInputEl?.click()}
-                class="w-full border border-dashed border-[var(--border-glass)] hover:border-purple-500/50 rounded-2xl p-8 flex flex-col items-center justify-center gap-2 text-center cursor-pointer transition-colors glass-panel"
+                class="liquid-dropzone w-full rounded-2xl p-8 flex flex-col items-center justify-center gap-2.5 text-center cursor-pointer transition-all spring-tap"
               >
-                <div class="w-11 h-11 rounded-2xl bg-purple-600/10 text-purple-400 flex items-center justify-center text-xl shadow-inner">
-                  📁
+                <div class="w-10 h-10 rounded-full liquid-icon-plate flex items-center justify-center text-white/70">
+                  <svg xmlns="http://www.w3.org/2000/svg" class="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4" />
+                  </svg>
                 </div>
-                <span class="text-xs font-semibold text-[var(--text-main)]">Tap to select photos & videos</span>
-                <span class="text-[10px] text-[var(--text-muted)]">Original EXIF, Live Photos, 4K videos & HEIC preserved</span>
+                <span class="text-xs font-medium text-white tracking-tight">Select photos or videos</span>
+                <span class="text-[10px] text-white/40">HEIC, RAW, 4K video, Live Photos preserved</span>
               </button>
             {:else}
-              <div class="space-y-2 max-h-56 overflow-y-auto pr-1 no-scrollbar">
+              <div class="space-y-1.5 max-h-52 overflow-y-auto pr-0.5 no-scrollbar">
                 {#each stagedFiles as file, idx}
-                  <div
-                    class="flex items-center justify-between p-2.5 glass-panel rounded-xl text-xs"
-                  >
+                  <div class="liquid-card flex items-center justify-between p-2.5 rounded-xl text-xs">
                     <div class="truncate mr-3">
-                      <div class="text-[var(--text-main)] font-medium truncate max-w-[280px] flex items-center gap-2">
+                      <div class="text-white/90 font-medium truncate max-w-[280px] flex items-center gap-2">
                         <span class="truncate">{file.name}</span>
                         {#if file.size > CHUNK_THRESHOLD_BYTES}
-                          <span class="text-[9px] bg-purple-500/20 text-purple-300 border border-purple-500/30 px-1.5 py-0.2 rounded font-mono font-bold">STREAM</span>
+                          <span class="text-[9px] liquid-tag px-1.5 py-0.2 rounded font-mono">STREAM</span>
                         {/if}
                       </div>
-                      <div class="text-[10px] text-[var(--text-muted)] mt-0.5 font-mono">
+                      <div class="text-[10px] text-white/40 mt-0.5 font-mono">
                         {formatBytes(file.size)} • {file.type || 'binary'}
                       </div>
                     </div>
@@ -379,10 +379,13 @@
                       <button
                         type="button"
                         on:click={() => removeFile(idx)}
-                        class="text-[var(--text-muted)] hover:text-red-400 p-1 cursor-pointer text-xs spring-tap"
+                        class="text-white/40 hover:text-white p-1 cursor-pointer transition-colors spring-tap"
                         title="Remove file"
                       >
-                        ✕
+                        <svg xmlns="http://www.w3.org/2000/svg" class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                          <line x1="18" y1="6" x2="6" y2="18"></line>
+                          <line x1="6" y1="6" x2="18" y2="18"></line>
+                        </svg>
                       </button>
                     {/if}
                   </div>
@@ -395,24 +398,24 @@
           {#if !linkPreview}
             <div class="space-y-3">
               <div class="space-y-1.5">
-                <label for="link-url-input" class="text-[10px] uppercase font-bold text-[var(--text-muted)] tracking-wider block pl-0.5">
-                  Post or Album URL
-                </label>
+                <span class="text-[9px] uppercase tracking-wider font-semibold text-white/40 block pl-1">
+                  Source URL
+                </span>
                 <div class="flex gap-2">
                   <input
                     id="link-url-input"
                     type="url"
                     bind:value={linkUrl}
-                    placeholder="https://instagram.com/p/... or https://reddit.com/r/..."
+                    placeholder="https://..."
                     disabled={isUploading}
                     on:keydown={(e) => e.key === 'Enter' && inspectLink()}
-                    class="flex-1 bg-[var(--bg-surface)] border border-[var(--border-glass)] focus:ring-2 focus:ring-purple-500/50 rounded-xl px-3.5 py-2 text-xs text-[var(--text-main)] placeholder-[var(--text-muted)] outline-none transition-all"
+                    class="liquid-input flex-1 rounded-xl px-3.5 py-2 text-xs text-white placeholder-white/30 outline-none transition-all"
                   />
                   <button
                     type="button"
                     on:click={inspectLink}
                     disabled={!linkUrl.trim() || isUploading}
-                    class="bg-purple-600 hover:bg-purple-500 text-white px-4 py-2 rounded-xl text-xs font-semibold transition-all disabled:opacity-40 cursor-pointer flex items-center gap-1.5 min-w-[80px] justify-center spring-tap shadow-md shadow-purple-600/20"
+                    class="liquid-btn-primary px-4 py-2 rounded-xl text-xs font-medium text-white transition-all disabled:opacity-40 cursor-pointer flex items-center gap-1.5 min-w-[76px] justify-center spring-tap"
                   >
                     {#if isUploading}
                       <span class="inline-block w-3 h-3 border-2 border-white/20 border-t-white rounded-full animate-spin"></span>
@@ -422,61 +425,62 @@
                   </button>
                 </div>
                 {#if inspectError}
-                  <p class="text-[11px] text-red-400 pt-1 leading-snug pl-0.5">{inspectError}</p>
+                  <p class="text-[11px] text-rose-300 pt-1 leading-snug pl-1">{inspectError}</p>
                 {/if}
               </div>
             </div>
           {:else}
             <!-- Link Candidate Grid -->
             <div class="space-y-3">
-              <div class="flex items-center justify-between text-xs px-0.5">
+              <div class="flex items-center justify-between text-xs px-1">
                 <div>
-                  <span class="text-[var(--text-main)] font-semibold">{linkPreview.author}</span>
-                  <span class="text-[var(--text-muted)]"> on {linkPreview.platform} ({linkPreview.items.length})</span>
+                  <span class="text-white font-medium">{linkPreview.author}</span>
+                  <span class="text-white/45"> on {linkPreview.platform} ({linkPreview.items.length})</span>
                 </div>
                 <button
                   type="button"
                   on:click={() => { linkPreview = null; inspectError = ''; }}
                   disabled={isUploading}
-                  class="text-purple-400 hover:text-purple-300 font-medium cursor-pointer text-xs"
+                  class="text-purple-300 hover:text-purple-200 font-medium cursor-pointer text-xs"
                 >
                   Change Link
                 </button>
               </div>
 
               {#if linkPreview.caption}
-                <p class="text-[11px] text-[var(--text-muted)] line-clamp-2 italic border-l-2 border-purple-500/50 pl-2.5">
+                <p class="text-[11px] text-white/60 line-clamp-2 italic border-l-2 border-white/20 pl-2.5">
                   "{linkPreview.caption}"
                 </p>
               {/if}
 
-              <div class="grid grid-cols-3 gap-2.5 max-h-56 overflow-y-auto pr-0.5 no-scrollbar">
+              <div class="grid grid-cols-3 gap-2 max-h-52 overflow-y-auto pr-0.5 no-scrollbar">
                 {#each linkPreview.items as item}
                   {@const isSelected = selectedLinkItems.has(item.id)}
                   <button
                     type="button"
                     disabled={isUploading}
                     on:click={() => toggleLinkItem(item.id)}
-                    class="relative aspect-square glass-panel rounded-xl overflow-hidden cursor-pointer group focus:outline-none transition-all spring-tap {isSelected ? 'ring-2 ring-purple-500' : 'opacity-50'}"
+                    class="relative aspect-square liquid-card rounded-xl overflow-hidden cursor-pointer group focus:outline-none transition-all spring-tap {isSelected ? 'ring-1.5 ring-white/70' : 'opacity-40'}"
                   >
                     {#if item.thumbnail_base64 || item.thumbnail_url}
                       <img
                         src={getThumbnailSrc(item)}
-                        alt="Preview thumbnail"
+                        alt="Preview"
                         class="w-full h-full object-cover pointer-events-none"
                       />
                     {:else}
-                      <div class="w-full h-full flex flex-col items-center justify-center text-[var(--text-muted)] text-xs gap-1">
-                        <span>{item.media_type === 'video' ? '🎬' : '🖼️'}</span>
-                        <span class="capitalize text-[10px]">{item.media_type}</span>
+                      <div class="w-full h-full flex flex-col items-center justify-center text-white/50 text-[10px] gap-1 font-mono uppercase">
+                        <span>{item.media_type}</span>
                       </div>
                     {/if}
 
-                    <div class="absolute top-1.5 left-1.5 w-5 h-5 rounded-full flex items-center justify-center transition-colors {isSelected ? 'bg-purple-600 text-white shadow-md' : 'bg-black/40 text-transparent border border-white/30'}">
-                      <span class="text-[10px] font-bold">✓</span>
+                    <div class="absolute top-1.5 left-1.5 w-4 h-4 rounded-full flex items-center justify-center transition-colors {isSelected ? 'bg-white text-black' : 'bg-black/50 text-transparent border border-white/30'}">
+                      <svg xmlns="http://www.w3.org/2000/svg" class="w-2.5 h-2.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3">
+                        <polyline points="20 6 9 17 4 12"></polyline>
+                      </svg>
                     </div>
 
-                    <span class="absolute bottom-1 right-1 text-[9px] uppercase px-1.5 py-0.5 rounded-full bg-black/60 backdrop-blur-md text-white font-mono tracking-tighter">
+                    <span class="absolute bottom-1 right-1 text-[8px] uppercase px-1.5 py-0.2 rounded-full bg-black/70 text-white/80 font-mono tracking-wider">
                       {item.media_type}
                     </span>
                   </button>
@@ -484,7 +488,7 @@
               </div>
 
               {#if inspectError}
-                <p class="text-[11px] text-red-400 pt-1 leading-snug pl-0.5">{inspectError}</p>
+                <p class="text-[11px] text-rose-300 pt-1 leading-snug pl-1">{inspectError}</p>
               {/if}
             </div>
           {/if}
@@ -492,14 +496,14 @@
 
         <!-- Stream / Upload Progress Indicator -->
         {#if isUploading && (uploadMode === 'files' || uploadProgress > 0)}
-          <div class="space-y-2 pt-2">
-            <div class="flex justify-between text-xs text-[var(--text-muted)]">
-              <span class="truncate max-w-[280px] font-mono">{statusMessage}</span>
-              <span class="font-mono font-bold text-purple-400">{uploadMode === 'files' ? `${uploadProgress}%` : ''}</span>
+          <div class="space-y-1.5 pt-1">
+            <div class="flex justify-between text-xs text-white/50">
+              <span class="truncate max-w-[280px] font-mono text-[11px]">{statusMessage}</span>
+              <span class="font-mono text-white/80 text-[11px]">{uploadMode === 'files' ? `${uploadProgress}%` : ''}</span>
             </div>
-            <div class="w-full bg-[var(--bg-surface)] rounded-full h-1.5 overflow-hidden border border-[var(--border-glass)]">
+            <div class="w-full bg-white/[0.06] rounded-full h-1 overflow-hidden border border-white/[0.08]">
               <div
-                class="bg-purple-600 h-full transition-all duration-300 ease-out rounded-full"
+                class="bg-white/80 h-full transition-all duration-300 ease-out rounded-full"
                 style="width: {uploadProgress > 0 ? uploadProgress : 100}%"
               ></div>
             </div>
@@ -508,12 +512,12 @@
       </div>
 
       <!-- Footer Actions -->
-      <div class="px-6 py-4 border-t border-[var(--border-glass)] flex justify-end gap-2.5 bg-[var(--bg-surface)]">
+      <div class="px-6 py-4 border-t border-white/[0.08] flex justify-end gap-2.5">
         <button
           type="button"
           on:click={forceClose}
           disabled={isUploading}
-          class="px-4 py-2 rounded-xl text-xs text-[var(--text-muted)] hover:text-[var(--text-main)] glass-panel transition-all spring-tap cursor-pointer disabled:opacity-40"
+          class="liquid-btn-secondary px-4 py-2 rounded-xl text-xs text-white/60 hover:text-white transition-all spring-tap cursor-pointer disabled:opacity-40"
         >
           Cancel
         </button>
@@ -521,7 +525,7 @@
           type="button"
           on:click={handleMasterUpload}
           disabled={!canUpload || isUploading}
-          class="px-5 py-2 rounded-xl text-xs font-semibold bg-purple-600 hover:bg-purple-500 text-white transition-all disabled:opacity-40 cursor-pointer flex items-center gap-2 spring-tap shadow-lg shadow-purple-600/25"
+          class="liquid-btn-primary px-5 py-2 rounded-xl text-xs font-medium text-white transition-all disabled:opacity-40 cursor-pointer flex items-center gap-2 spring-tap"
         >
           {#if isUploading}
             <span class="inline-block w-3.5 h-3.5 border-2 border-white/20 border-t-white rounded-full animate-spin"></span>
@@ -536,3 +540,109 @@
     </div>
   </div>
 {/if}
+
+<style>
+  /* Apple Liquid-Glass Modal Styling */
+  .liquid-modal {
+    background: rgba(18, 18, 22, 0.76);
+    border: 1px solid rgba(255, 255, 255, 0.13);
+    backdrop-filter: blur(40px) saturate(180%);
+    -webkit-backdrop-filter: blur(40px) saturate(180%);
+    box-shadow:
+      0 30px 70px rgba(0, 0, 0, 0.75),
+      inset 0 1px 0 0 rgba(255, 255, 255, 0.22),
+      inset 0 -1px 0 0 rgba(0, 0, 0, 0.4);
+  }
+
+  .liquid-dropzone {
+    background: rgba(255, 255, 255, 0.02);
+    border: 1px dashed rgba(255, 255, 255, 0.16);
+  }
+
+  .liquid-dropzone:hover {
+    background: rgba(255, 255, 255, 0.05);
+    border-color: rgba(255, 255, 255, 0.3);
+  }
+
+  .liquid-card {
+    background: rgba(255, 255, 255, 0.04);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    box-shadow: inset 0 1px 0 0 rgba(255, 255, 255, 0.1);
+  }
+
+  .liquid-input {
+    background: rgba(0, 0, 0, 0.35);
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.4);
+  }
+
+  .liquid-input:focus {
+    border-color: rgba(255, 255, 255, 0.25);
+    box-shadow: 
+      inset 0 1px 2px rgba(0, 0, 0, 0.4),
+      0 0 0 1px rgba(255, 255, 255, 0.15);
+  }
+
+  .liquid-segmented {
+    background: rgba(0, 0, 0, 0.4);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.4);
+  }
+
+  .liquid-seg-active {
+    background: rgba(255, 255, 255, 0.14);
+    border: 1px solid rgba(255, 255, 255, 0.18);
+    box-shadow:
+      0 2px 6px rgba(0, 0, 0, 0.25),
+      inset 0 1px 0 rgba(255, 255, 255, 0.3);
+  }
+
+  .liquid-icon-btn {
+    background: rgba(255, 255, 255, 0.05);
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.2);
+  }
+
+  .liquid-icon-btn:hover {
+    background: rgba(255, 255, 255, 0.12);
+    border-color: rgba(255, 255, 255, 0.2);
+  }
+
+  .liquid-icon-plate {
+    background: rgba(255, 255, 255, 0.08);
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.25);
+  }
+
+  .liquid-tag {
+    background: rgba(255, 255, 255, 0.1);
+    border: 1px solid rgba(255, 255, 255, 0.15);
+    color: rgba(255, 255, 255, 0.85);
+  }
+
+  .liquid-btn-primary {
+    background: rgba(255, 255, 255, 0.15);
+    border: 1px solid rgba(255, 255, 255, 0.24);
+    box-shadow:
+      0 4px 14px rgba(0, 0, 0, 0.3),
+      inset 0 1px 0 rgba(255, 255, 255, 0.35);
+  }
+
+  .liquid-btn-primary:hover:not(:disabled) {
+    background: rgba(255, 255, 255, 0.22);
+    border-color: rgba(255, 255, 255, 0.32);
+    box-shadow:
+      0 6px 18px rgba(0, 0, 0, 0.4),
+      inset 0 1px 0 rgba(255, 255, 255, 0.45);
+  }
+
+  .liquid-btn-secondary {
+    background: rgba(255, 255, 255, 0.04);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+  }
+
+  .liquid-btn-secondary:hover:not(:disabled) {
+    background: rgba(255, 255, 255, 0.08);
+    border-color: rgba(255, 255, 255, 0.14);
+  }
+</style>

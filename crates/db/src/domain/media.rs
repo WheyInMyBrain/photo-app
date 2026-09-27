@@ -89,6 +89,7 @@ pub struct NewAssetRecord {
 
 #[derive(Deserialize, Debug, Default, Clone)]
 pub struct MediaQuery {
+    pub album_id: Option<String>,
     pub q: Option<String>,
     pub media_type: Option<String>,
     pub is_favorite: Option<bool>,
