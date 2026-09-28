@@ -14,6 +14,7 @@
   import AuthScreen from '$lib/components/AuthScreen.svelte';
   import FilterSidebar from '$lib/components/FilterSidebar.svelte';
   import UploadModal from '$lib/components/UploadModal.svelte';
+  import UploadProgressWidget from '$lib/components/UploadProgressWidget.svelte';
   import PeopleModal from '$lib/components/PeopleModal.svelte';
   import PlacesMapModal from '$lib/components/PlacesMapModal.svelte';
 
@@ -164,13 +165,15 @@
       </div>
     {/if}
 
+    <!-- Persistent Floating Bottom-Right Upload Toast/Widget -->
+    <UploadProgressWidget />
+
     <!-- Modal Overlays via Declarative Store -->
     <UploadModal
       isOpen={$modalStore === 'upload'}
       initialFiles={droppedFiles}
       on:close={() => modalStore.close()}
       on:uploaded={() => {
-        modalStore.close();
         window.dispatchEvent(new CustomEvent('vault:refresh-timeline'));
         filterOptionsStore.scheduleRefresh($filterQueryString, 0);
       }}
@@ -193,7 +196,6 @@
 {/if}
 
 <style>
-  /* All variables (--dock-bg, --dock-border, etc.) resolve directly from app.css */
   .liquid-dock {
     background: var(--dock-bg);
     border: 1px solid var(--dock-border);

@@ -4,6 +4,7 @@
   import { fade, scale } from 'svelte/transition';
   import { fetchCustomAlbums } from '$lib/api/albums';
   import { uploadQueue } from '$lib/stores/uploadQueueStore';
+  import { uploadProgressStore } from '$lib/stores/uploadProgressStore';
   import { formatBytes } from '$lib/utils/uploader';
   import { normalizePath, getDirectChildren, type FolderNode } from '$lib/utils/folderHierarchy';
   import type { CandidateItem } from '$lib/types/upload';
@@ -35,6 +36,9 @@
       ? $uploadQueue.stagedFiles.length > 0
       : $uploadQueue.linkPreview !== null && $uploadQueue.selectedLinkItems.size > 0;
 
+  // Normalized folder path
+  $: cleanInputPath = normalizePath($uploadQueue.folderPath);
+
   // Fetch children under the folder we are currently browsing
   $: currentChildren = getDirectChildren(rawAlbumPaths, browsingDir);
 
@@ -45,7 +49,7 @@
       )
     : currentChildren;
 
-  // Split browsingDir into clickable breadcrumb steps: ["College", "2026"]
+  // Split browsingDir into clickable breadcrumb steps
   $: browsingCrumbs = (() => {
     if (!browsingDir) return [];
     const parts = browsingDir.split('/');
@@ -120,6 +124,29 @@
     selectDirectory(newFullPath);
   }
 
+  // Non-blocking handoff: Closes modal instantly and starts floating widget
+  function handleStartUpload() {
+    const state = $uploadQueue;
+    if (state.uploadMode === 'files' && state.stagedFiles.length > 0) {
+      const filesToUpload = [...state.stagedFiles];
+      const targetFolder = cleanInputPath;
+
+      // Close modal immediately
+      forceClose();
+
+      // Launch floating bottom-right persistent progress widget
+      uploadProgressStore.startBatch(filesToUpload, targetFolder, () => {
+        dispatch('uploaded', { count: filesToUpload.length });
+      });
+    } else {
+      // Web link import path
+      uploadQueue.executeUpload((count) => {
+        dispatch('uploaded', { count });
+        forceClose();
+      });
+    }
+  }
+
   function forceClose() {
     uploadQueue.reset();
     isFolderDropdownOpen = false;
@@ -129,7 +156,7 @@
   }
 
   function handleKeydown(e: KeyboardEvent) {
-    if (e.key === 'Escape' && !$uploadQueue.isUploading) forceClose();
+    if (e.key === 'Escape') forceClose();
   }
 </script>
 
@@ -143,7 +170,7 @@
     role="dialog"
     aria-modal="true"
     tabindex="-1"
-    on:click|self={() => { if (!$uploadQueue.isUploading) forceClose(); }}
+    on:click|self={forceClose}
   >
     <div
       transition:scale={{ start: 0.96, duration: 150 }}
@@ -162,10 +189,9 @@
         <button
           type="button"
           on:click={forceClose}
-          disabled={$uploadQueue.isUploading}
-          class="liquid-icon-btn w-7 h-7 flex items-center justify-center rounded-full text-[var(--text-muted)] hover:text-[var(--text-main)] transition-all spring-tap cursor-pointer disabled:opacity-30"
+          class="liquid-icon-btn w-7 h-7 flex items-center justify-center rounded-full text-[var(--text-muted)] hover:text-[var(--text-main)] transition-all spring-tap cursor-pointer"
           title="Close"
-          aria-label="Close modal"
+          aria-label="Close dialog"
         >
           <svg xmlns="http://www.w3.org/2000/svg" class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
             <line x1="18" y1="6" x2="6" y2="18"></line>
@@ -180,14 +206,12 @@
           <button
             class="flex-1 py-1.5 rounded-lg transition-all font-medium spring-tap cursor-pointer {$uploadQueue.uploadMode === 'files' ? 'liquid-seg-active text-[var(--text-main)] font-semibold' : 'text-[var(--text-muted)] hover:text-[var(--text-main)]'}"
             on:click={() => uploadQueue.setMode('files')}
-            disabled={$uploadQueue.isUploading}
           >
             Files
           </button>
           <button
             class="flex-1 py-1.5 rounded-lg transition-all font-medium spring-tap cursor-pointer {$uploadQueue.uploadMode === 'link' ? 'liquid-seg-active text-[var(--text-main)] font-semibold' : 'text-[var(--text-muted)] hover:text-[var(--text-main)]'}"
             on:click={() => uploadQueue.setMode('link')}
-            disabled={$uploadQueue.isUploading}
           >
             Web Link
           </button>
@@ -220,7 +244,7 @@
           <div class="relative">
             <button
               type="button"
-              disabled={$uploadQueue.isUploading || $uploadQueue.linkPreview !== null}
+              disabled={$uploadQueue.linkPreview !== null}
               on:click={() => (isFolderDropdownOpen = !isFolderDropdownOpen)}
               class="liquid-input w-full rounded-xl px-3.5 py-2 text-xs text-left text-[var(--text-main)] outline-none transition-all flex items-center justify-between gap-2 cursor-pointer disabled:opacity-40"
             >
@@ -238,7 +262,7 @@
             </button>
 
             <!-- Hierarchical Tree Navigation Drawer -->
-            {#if isFolderDropdownOpen && !$uploadQueue.isUploading}
+            {#if isFolderDropdownOpen}
               <div class="absolute left-0 right-0 top-full mt-1.5 z-50 liquid-dropdown rounded-2xl p-2.5 shadow-2xl max-h-64 overflow-y-auto no-scrollbar border border-[var(--border-glass)] flex flex-col gap-2">
                 
                 <!-- Tree Mini-Breadcrumb Bar -->
@@ -301,7 +325,6 @@
                   {:else}
                     {#each visibleNodes as node}
                       <div class="flex items-center justify-between rounded-lg hover:bg-[var(--dock-bg-hover)] px-2 py-1.5 group transition-colors">
-                        <!-- Click name: drill down into the subfolder -->
                         <button
                           type="button"
                           on:click={() => drillDown(node)}
@@ -320,7 +343,6 @@
                           {/if}
                         </button>
 
-                        <!-- Explicit Pick / Select button for this node -->
                         <div class="flex items-center gap-1">
                           <button
                             type="button"
@@ -360,7 +382,6 @@
               <button
                 type="button"
                 on:click={() => fileInputEl?.click()}
-                disabled={$uploadQueue.isUploading}
                 class="text-xs text-purple-600 dark:text-purple-400 hover:underline font-medium cursor-pointer transition-colors"
               >
                 + Add more
@@ -402,20 +423,18 @@
                         {formatBytes(file.size)} • {file.type || 'binary'}
                       </div>
                     </div>
-                    {#if !$uploadQueue.isUploading}
-                      <button
-                        type="button"
-                        on:click={() => uploadQueue.removeFile(idx)}
-                        class="text-[var(--text-muted)] hover:text-[var(--text-main)] p-1 cursor-pointer transition-colors spring-tap"
-                        title="Remove file"
-                        aria-label="Remove {file.name}"
-                      >
-                        <svg xmlns="http://www.w3.org/2000/svg" class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                          <line x1="18" y1="6" x2="6" y2="18"></line>
-                          <line x1="6" y1="6" x2="18" y2="18"></line>
-                        </svg>
-                      </button>
-                    {/if}
+                    <button
+                      type="button"
+                      on:click={() => uploadQueue.removeFile(idx)}
+                      class="text-[var(--text-muted)] hover:text-[var(--text-main)] p-1 cursor-pointer transition-colors spring-tap"
+                      title="Remove file"
+                      aria-label="Remove {file.name}"
+                    >
+                      <svg xmlns="http://www.w3.org/2000/svg" class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <line x1="18" y1="6" x2="6" y2="18"></line>
+                        <line x1="6" y1="6" x2="18" y2="18"></line>
+                      </svg>
+                    </button>
                   </div>
                 {/each}
               </div>
@@ -436,21 +455,16 @@
                     value={$uploadQueue.linkUrl}
                     on:input={(e) => uploadQueue.setLinkUrl(e.currentTarget.value)}
                     placeholder="https://..."
-                    disabled={$uploadQueue.isUploading}
                     on:keydown={(e) => e.key === 'Enter' && uploadQueue.inspectLink()}
                     class="liquid-input flex-1 rounded-xl px-3.5 py-2 text-xs text-[var(--text-main)] placeholder-[var(--text-muted)] outline-none transition-all"
                   />
                   <button
                     type="button"
                     on:click={() => uploadQueue.inspectLink()}
-                    disabled={!$uploadQueue.linkUrl.trim() || $uploadQueue.isUploading}
+                    disabled={!$uploadQueue.linkUrl.trim()}
                     class="liquid-btn-primary px-4 py-2 rounded-xl text-xs font-semibold text-white transition-all disabled:opacity-40 cursor-pointer flex items-center gap-1.5 min-w-[76px] justify-center spring-tap shadow-sm"
                   >
-                    {#if $uploadQueue.isUploading}
-                      <span class="inline-block w-3 h-3 border-2 border-white/20 border-t-white rounded-full animate-spin"></span>
-                    {:else}
-                      <span>Inspect</span>
-                    {/if}
+                    <span>Inspect</span>
                   </button>
                 </div>
               </div>
@@ -466,7 +480,6 @@
                 <button
                   type="button"
                   on:click={() => uploadQueue.clearLinkPreview()}
-                  disabled={$uploadQueue.isUploading}
                   class="text-purple-600 dark:text-purple-400 hover:underline font-medium cursor-pointer text-xs"
                 >
                   Change Link
@@ -484,7 +497,6 @@
                   {@const isSelected = $uploadQueue.selectedLinkItems.has(item.id)}
                   <button
                     type="button"
-                    disabled={$uploadQueue.isUploading}
                     on:click={() => uploadQueue.toggleLinkItem(item.id)}
                     class="relative aspect-square liquid-card rounded-xl overflow-hidden cursor-pointer group focus:outline-none transition-all spring-tap {isSelected ? 'ring-2 ring-purple-500 shadow-md' : 'opacity-50'}"
                   >
@@ -511,34 +523,6 @@
             </div>
           {/if}
         {/if}
-
-        <!-- Multi-Worker Aggregate Progress -->
-        {#if $uploadQueue.isUploading}
-          <div class="space-y-1.5 pt-2">
-            <div class="flex justify-between text-xs text-[var(--text-muted)] font-mono">
-              <span class="truncate max-w-[280px] text-[11px]">{$uploadQueue.statusMessage}</span>
-              <span class="text-[var(--text-main)] font-semibold text-[11px]">{$uploadQueue.uploadProgress}%</span>
-            </div>
-            <div class="w-full bg-[var(--pill-bg)] rounded-full h-1.5 overflow-hidden border border-[var(--border-glass)]">
-              <div
-                class="bg-gradient-to-r from-purple-600 to-emerald-500 h-full transition-all duration-150 ease-out rounded-full"
-                style="width: {$uploadQueue.uploadProgress}%"
-              ></div>
-            </div>
-          </div>
-        {/if}
-
-        <!-- Error Banner -->
-        {#if $uploadQueue.uploadError}
-          <div class="p-2.5 rounded-xl bg-rose-500/15 border border-rose-500/30 text-rose-600 dark:text-rose-200 text-xs flex items-start gap-2">
-            <svg xmlns="http://www.w3.org/2000/svg" class="w-4 h-4 flex-shrink-0 text-rose-500 mt-0.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-              <circle cx="12" cy="12" r="10"></circle>
-              <line x1="12" y1="8" x2="12" y2="12"></line>
-              <line x1="12" y1="16" x2="12.01" y2="16"></line>
-            </svg>
-            <span class="leading-snug">{$uploadQueue.uploadError}</span>
-          </div>
-        {/if}
       </div>
 
       <!-- Footer Buttons -->
@@ -546,24 +530,17 @@
         <button
           type="button"
           on:click={forceClose}
-          disabled={$uploadQueue.isUploading}
-          class="liquid-btn-secondary px-4 py-2 rounded-xl text-xs text-[var(--text-muted)] hover:text-[var(--text-main)] transition-all spring-tap cursor-pointer disabled:opacity-40"
+          class="liquid-btn-secondary px-4 py-2 rounded-xl text-xs text-[var(--text-muted)] hover:text-[var(--text-main)] transition-all spring-tap cursor-pointer"
         >
           Cancel
         </button>
         <button
           type="button"
-          on:click={() => uploadQueue.executeUpload((count) => {
-            dispatch('uploaded', { count });
-            forceClose();
-          })}
-          disabled={!canUpload || $uploadQueue.isUploading}
+          on:click={handleStartUpload}
+          disabled={!canUpload}
           class="liquid-btn-primary px-5 py-2 rounded-xl text-xs font-semibold text-white transition-all disabled:opacity-40 cursor-pointer flex items-center gap-2 spring-tap shadow-sm"
         >
-          {#if $uploadQueue.isUploading}
-            <span class="inline-block w-3.5 h-3.5 border-2 border-white/20 border-t-white rounded-full animate-spin"></span>
-            <span>Uploading...</span>
-          {:else if $uploadQueue.uploadMode === 'files'}
+          {#if $uploadQueue.uploadMode === 'files'}
             Upload {$uploadQueue.stagedFiles.length} item{$uploadQueue.stagedFiles.length === 1 ? '' : 's'}
           {:else}
             Import {$uploadQueue.selectedLinkItems.size} item{$uploadQueue.selectedLinkItems.size === 1 ? '' : 's'}
