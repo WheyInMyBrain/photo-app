@@ -49,7 +49,7 @@
 
   $: currentAlbumPath = currentAlbum
     ? (currentAlbum.title || '').replace(/^\/+|\/+$/g, '')
-    : ($filterStore.folder_path \vert{}\vert{} '').replace(/^\/+\vert{}\/+$/g, '');
+    : ($filterStore.folder_path || '').replace(/^\/+|\/+$/g, '');
 
   $: breadcrumbSegments = (() => {
     if (!currentAlbumPath) return [];
