@@ -167,8 +167,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/persons/names", get(routes::people::get_names_directory))
         .route("/api/faces/{face_id}/reassign", post(routes::people::reassign_face))
         .route("/api/faces/{face_id}/verify", post(routes::people::verify_face))
+        .route("/api/faces/{face_id}/unlink", post(routes::people::unlink_face))
         .route("/api/faces/{face_id}", delete(routes::people::delete_face))
         .route("/api/faces/{face_id}/delete", post(routes::people::delete_face))
+        .route("/api/faces/{face_id}/split-new", post(routes::people::split_face_to_new_person))
 
         // Locations & Map data
         .route("/api/media/locations", get(routes::media::get_media_locations))

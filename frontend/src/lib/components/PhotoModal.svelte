@@ -4,12 +4,10 @@
   import { filterStore } from '$lib/stores/filterStore';
   import { deleteFace } from '$lib/api/people';
   import {
-    fetchAssetObjects,
     fetchAssetPoses,
     fetchAssetTags,
     fetchSimilarAssets,
     toggleAssetFavorite,
-    type AssetObjectDetail,
     type AssetPoseDetail,
     type SimilarMediaItem
   } from '$lib/api/assets';
@@ -55,14 +53,12 @@
 
   // Layer Toggles (controlled from sidebar)
   let showFaces = false;
-  let showObjects = false;
   let showPoses = false;
 
   // Sidebar & Overlay Data
   let showMobileInfo = false;
   let isFavorite = false;
   let faces: FaceDetail[] = [];
-  let objects: AssetObjectDetail[] = [];
   let poses: AssetPoseDetail[] = [];
   let tags: TagItem[] = [];
   let similarItems: SimilarMediaItem[] = [];
@@ -144,11 +140,9 @@
     let h: number;
 
     if (cRatio > ratio) {
-      // Container is wider than photo: pillarbox (black bars on left & right)
       h = containerH;
       w = h * ratio;
     } else {
-      // Container is taller than photo: letterbox (black bars on top & bottom)
       w = containerW;
       h = w / ratio;
     }
@@ -222,22 +216,19 @@
     loadingSimilar = true;
 
     try {
-      const [fRes, oData, pData, tData, sData] = await Promise.all([
+      const [fRes, pData, tData, sData] = await Promise.all([
         fetch(`/api/assets/${id}/faces`, { signal: detailAbortCtrl.signal, credentials: 'include' }),
-        fetchAssetObjects(id, detailAbortCtrl.signal),
         fetchAssetPoses(id, detailAbortCtrl.signal),
         fetchAssetTags(id, detailAbortCtrl.signal),
         fetchSimilarAssets(id, detailAbortCtrl.signal)
       ]);
 
       faces = fRes.ok ? await fRes.json() : [];
-      objects = oData;
       poses = pData;
       tags = tData;
       similarItems = sData;
     } catch {
       faces = [];
-      objects = [];
       poses = [];
       tags = [];
       similarItems = [];
@@ -565,23 +556,7 @@
                   {/each}
                 {/if}
 
-                <!-- 2. YOLO Detected Objects (Segmentation Boxes) -->
-                {#if showObjects}
-                  {#each objects as obj (obj.id)}
-                    <div
-                      class="absolute border border-cyan-400/80 bg-cyan-500/15 rounded-lg pointer-events-none z-10 shadow-sm"
-                      style="left: {obj.bbox_x * 100}%; top: {obj.bbox_y * 100}%; width: {obj.bbox_w * 100}%; height: {obj.bbox_h * 100}%;"
-                    >
-                      <span
-                        class="absolute -top-5 left-0 liquid-tag text-[9px] text-cyan-600 dark:text-cyan-200 px-1.5 py-0.5 rounded-md shadow-md whitespace-nowrap font-mono tracking-tight"
-                      >
-                        {obj.label} {Math.round(obj.score * 100)}%
-                      </span>
-                    </div>
-                  {/each}
-                {/if}
-
-                <!-- 3. YOLO Human Pose Estimation (Anatomically Colored Bones & Joints) -->
+                <!-- 2. YOLO Human Pose Estimation (Anatomically Colored Bones & Joints) -->
                 {#if showPoses && poses.length > 0}
                   <svg
                     class="absolute inset-0 w-full h-full pointer-events-none z-20"
@@ -667,12 +642,35 @@
       {showMobileInfo}
       on:toggleFavorite={handleToggleFavorite}
       on:toggleFaces={() => (showFaces = !showFaces)}
-      on:toggleObjects={() => (showObjects = !showObjects)}
       on:togglePoses={() => (showPoses = !showPoses)}
       on:closeMobile={() => (showMobileInfo = false)}
       on:selectAsset={(e) => dispatch('selectAsset', e.detail)}
       on:saveFaceName={handleSaveFaceName}
       on:deleteFace={handleDeleteFace}
+      on:reassignFace={async (e) => {
+        const { faceId, targetPersonId } = e.detail;
+        await fetch(`/api/faces/${faceId}/reassign`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ target_person_id: targetPersonId })
+        });
+        loadDetails(asset.id);
+      }}
+      on:splitFace={async (e) => {
+        const { faceId } = e.detail;
+        await fetch(`/api/faces/${faceId}/split-new`, { method: 'POST' });
+        loadDetails(asset.id);
+      }}
+      on:unlinkFace={async (e) => {
+        const { faceId } = e.detail;
+        await fetch(`/api/faces/${faceId}/unlink`, { method: 'POST' });
+        loadDetails(asset.id);
+      }}
+      on:deleteFace={async (e) => {
+        const { faceId } = e.detail;
+        await fetch(`/api/faces/${faceId}`, { method: 'DELETE' });
+        loadDetails(asset.id);
+      }}
     />
   </div>
 {/if}

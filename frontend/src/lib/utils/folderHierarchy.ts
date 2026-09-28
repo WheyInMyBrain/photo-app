@@ -18,12 +18,6 @@ export function getDirectChildren(
   allAlbumPaths: string[],
   currentLevelPath: string
 ): FolderNode[] {
-  // ==========================================
-  // DEBUG LOGS: Inspect backend data received
-  // ==========================================
-  console.group('📁 [folderHierarchy:getDirectChildren]');
-  console.log('1. Raw items received from backend/store:', allAlbumPaths);
-  console.log('2. Current browsing directory level:', currentLevelPath ? `"${currentLevelPath}"` : '(ROOT)');
   
   const cleanCurrent = normalizePath(currentLevelPath);
   const prefix = cleanCurrent ? `${cleanCurrent}/` : '';
@@ -31,8 +25,6 @@ export function getDirectChildren(
   const cleanPaths = Array.from(
     new Set(allAlbumPaths.map((p) => normalizePath(p)))
   ).filter(Boolean);
-
-  console.log('3. Normalized unique paths:', cleanPaths);
 
   const directMap = new Map<string, { fullPath: string; deeperCount: number }>();
 
@@ -70,9 +62,6 @@ export function getDirectChildren(
       if (!a.hasChildren && b.hasChildren) return 1;
       return a.name.localeCompare(b.name);
     });
-
-  console.log('4. Computed children for this level:', result);
-  console.groupEnd();
 
   return result;
 }

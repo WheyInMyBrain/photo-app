@@ -351,7 +351,7 @@
                 on:dragover|preventDefault
                 on:drop={() => { if (source && source.id !== p.id) target = p; }}
                 on:click={() => handleCardClick(p)}
-                on:keydown={(e) => (e.key === 'Enter' || e.key === ' ') && handleCardClick(p)}
+                on:keydown={(e) => e.key === 'Enter' && handleCardClick(p)}
                 class="liquid-card group relative rounded-2xl p-3.5 flex flex-col items-center text-center cursor-pointer transition-all spring-tap {isSelected ? 'ring-2 ring-purple-500 shadow-md' : isFiltered ? 'liquid-card-filtered' : ''}"
               >
                 <!-- Selection Checkbox Button (Top Right) -->

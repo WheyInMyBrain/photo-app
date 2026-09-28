@@ -123,13 +123,32 @@ pub async fn verify_face(
 }
 
 /// DELETE /api/faces/{face_id} or POST /api/faces/{face_id}/delete
-/// Removes a stray face detection (e.g. background crowd or false positive)
+/// Removes a stray face detection entirely
 pub async fn delete_face(
     State(state): State<AppState>,
     auth_user: AuthUser,
     AxumPath(face_id): AxumPath<String>,
 ) -> Result<Json<bool>, AppError> {
     let (asset_id, _) = PersonRepo::delete_face(&state.db, &auth_user.id, &face_id)
+        .await
+        .map_err(|e| match e {
+            sqlx::Error::RowNotFound => AppError::NotFound("Face not found".into()),
+            _ => AppError::Internal(e.to_string()),
+        })?;
+
+    let _ = AssetRepo::sync_search_index(&state.db, &auth_user.id, &asset_id).await;
+
+    Ok(Json(true))
+}
+
+/// POST /api/faces/{face_id}/unlink
+/// Unlinks a face from its person cluster (sets person_id = NULL) without deleting the face
+pub async fn unlink_face(
+    State(state): State<AppState>,
+    auth_user: AuthUser,
+    AxumPath(face_id): AxumPath<String>,
+) -> Result<Json<bool>, AppError> {
+    let (asset_id, _) = PersonRepo::unlink_face(&state.db, &auth_user.id, &face_id)
         .await
         .map_err(|e| match e {
             sqlx::Error::RowNotFound => AppError::NotFound("Face not found".into()),
@@ -182,4 +201,25 @@ pub async fn get_names_directory(
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?;
     Ok(Json(names))
+}
+
+/// POST /api/faces/{face_id}/split-new
+pub async fn split_face_to_new_person(
+    State(state): State<AppState>,
+    auth_user: AuthUser,
+    AxumPath(face_id): AxumPath<String>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let (asset_id, new_person_id) = PersonRepo::split_face_to_new_person(&state.db, &auth_user.id, &face_id)
+        .await
+        .map_err(|e| match e {
+            sqlx::Error::RowNotFound => AppError::NotFound("Face not found".into()),
+            _ => AppError::Internal(e.to_string()),
+        })?;
+
+    let _ = AssetRepo::sync_search_index(&state.db, &auth_user.id, &asset_id).await;
+
+    Ok(Json(serde_json::json!({
+        "status": "success",
+        "new_person_id": new_person_id
+    })))
 }

@@ -2,6 +2,7 @@
 <script lang="ts">
   import { createEventDispatcher, onDestroy } from 'svelte';
   import { browser } from '$app/environment';
+  import { fade } from 'svelte/transition';
   import { modalStore } from '$lib/stores/modalStore';
   import type { FaceDetail, TagItem, PersonCandidate } from '$lib/types/modal';
   import type { AssetPoseDetail, SimilarMediaItem } from '$lib/api/assets';
@@ -22,7 +23,6 @@
   export let loadingDetails = false;
   export let loadingSimilar = false;
 
-  // Defaults to deselected / off for a clean initial view
   export let showFaces = false;
   export let showPoses = false;
   export let showMobileInfo = false;
@@ -34,10 +34,14 @@
     closeMobile: void;
     selectAsset: { id: string };
     saveFaceName: { face: FaceDetail; cleanName: string };
+    reassignFace: { faceId: string; targetPersonId: string };
+    splitFace: { faceId: string };
+    unlinkFace: { faceId: string };
     deleteFace: { faceId: string };
   }>();
 
   let editingFaceId: string | null = null;
+  let reassigningFaceId: string | null = null;
   let editingName = '';
 
   let miniMapContainer: HTMLDivElement | null = null;
@@ -238,63 +242,144 @@
       {:else}
         <div class="space-y-1.5">
           {#each faces as f (f.face_id)}
-            <div class="liquid-card group flex items-center gap-2.5 p-2 rounded-xl">
-              <img
-                src={resolveUrl(f.face_thumb_path)}
-                alt=""
-                class="w-7 h-7 rounded-full object-cover liquid-avatar-frame flex-shrink-0"
-              />
-              <div class="flex-1 min-w-0">
-                {#if editingFaceId === f.face_id}
-                  <input
-                    type="text"
-                    list="known-people-list"
-                    bind:value={editingName}
-                    placeholder="Name person..."
-                    on:blur={() => submitName(f)}
-                    on:keydown={(e) => {
-                      if (e.key === 'Enter') submitName(f);
-                      if (e.key === 'Escape') editingFaceId = null;
-                    }}
-                    use:focusInput
-                    class="liquid-input w-full text-xs text-[var(--text-main)] rounded-lg px-2 py-1 outline-none"
-                  />
-                {:else}
-                  <div class="flex items-center justify-between">
-                    <span class="text-xs font-medium text-[var(--text-main)] truncate">{f.person_name || 'Unnamed'}</span>
-                    <div class="flex items-center gap-1">
-                      <button
-                        type="button"
-                        on:click={() => {
-                          editingFaceId = f.face_id;
-                          editingName = f.person_name ?? '';
-                        }}
-                        class="text-[var(--text-muted)] hover:text-[var(--text-main)] cursor-pointer p-0.5 transition-colors spring-tap"
-                        title="Rename person"
-                        aria-label="Rename face"
-                      >
-                        <svg xmlns="http://www.w3.org/2000/svg" class="w-3 h-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                          <path d="M12 20h9"></path>
-                          <path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"></path>
-                        </svg>
-                      </button>
+            <div class="liquid-card group flex flex-col gap-2 p-2.5 rounded-xl">
+              <div class="flex items-center gap-2.5">
+                <img
+                  src={resolveUrl(f.face_thumb_path)}
+                  alt=""
+                  class="w-7 h-7 rounded-full object-cover liquid-avatar-frame flex-shrink-0"
+                />
+                <div class="flex-1 min-w-0">
+                  {#if editingFaceId === f.face_id}
+                    <input
+                      type="text"
+                      list="known-people-list"
+                      bind:value={editingName}
+                      placeholder="Name person..."
+                      on:blur={() => submitName(f)}
+                      on:keydown={(e) => {
+                        if (e.key === 'Enter') submitName(f);
+                        if (e.key === 'Escape') editingFaceId = null;
+                      }}
+                      use:focusInput
+                      class="liquid-input w-full text-xs text-[var(--text-main)] rounded-lg px-2 py-1 outline-none"
+                    />
+                  {:else}
+                    <div class="flex items-center justify-between">
+                      <span class="text-xs font-medium text-[var(--text-main)] truncate">{f.person_name || 'Unnamed'}</span>
+                      <div class="flex items-center gap-1">
+                        <!-- Rename -->
+                        <button
+                          type="button"
+                          on:click={() => {
+                            editingFaceId = f.face_id;
+                            reassigningFaceId = null;
+                            editingName = f.person_name ?? '';
+                          }}
+                          class="text-[var(--text-muted)] hover:text-[var(--text-main)] cursor-pointer p-0.5 transition-colors spring-tap"
+                          title="Rename person"
+                          aria-label="Rename face"
+                        >
+                          <svg xmlns="http://www.w3.org/2000/svg" class="w-3 h-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                            <path d="M12 20h9"></path>
+                            <path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"></path>
+                          </svg>
+                        </button>
 
-                      <button
-                        type="button"
-                        on:click={() => dispatch('deleteFace', { faceId: f.face_id })}
-                        class="text-[var(--text-muted)] hover:text-rose-500 cursor-pointer p-0.5 transition-colors spring-tap opacity-0 group-hover:opacity-100"
-                        title="Dismiss face detection"
-                        aria-label="Remove face detection"
-                      >
-                        <svg xmlns="http://www.w3.org/2000/svg" class="w-3 h-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
-                          <line x1="18" y1="6" x2="6" y2="18"></line>
-                          <line x1="6" y1="6" x2="18" y2="18"></line>
-                        </svg>
-                      </button>
+                        <!-- Reassign / Move to another person -->
+                        {#if knownPeople.length > 0}
+                          <button
+                            type="button"
+                            on:click={() => {
+                              reassigningFaceId = reassigningFaceId === f.face_id ? null : f.face_id;
+                              editingFaceId = null;
+                            }}
+                            class="text-[var(--text-muted)] hover:text-purple-500 cursor-pointer p-0.5 transition-colors spring-tap"
+                            title="Reassign to another person"
+                            aria-label="Reassign face"
+                          >
+                            <svg xmlns="http://www.w3.org/2000/svg" class="w-3 h-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                              <path d="M17 3l4 4-4 4"></path>
+                              <path d="M3 7h18"></path>
+                              <path d="M7 21l-4-4 4-4"></path>
+                              <path d="M21 17H3"></path>
+                            </svg>
+                          </button>
+                        {/if}
+
+                        <!-- Split to New Person -->
+                        <button
+                          type="button"
+                          on:click={() => dispatch('splitFace', { faceId: f.face_id })}
+                          class="text-[var(--text-muted)] hover:text-emerald-500 cursor-pointer p-0.5 transition-colors spring-tap"
+                          title="Split into a new person identity"
+                          aria-label="Split face to new person"
+                        >
+                          <svg xmlns="http://www.w3.org/2000/svg" class="w-3 h-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                            <path d="M16 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"></path>
+                            <circle cx="8.5" cy="7" r="4"></circle>
+                            <line x1="20" y1="8" x2="20" y2="14"></line>
+                            <line x1="23" y1="11" x2="17" y2="11"></line>
+                          </svg>
+                        </button>
+
+                        <!-- Unlink Face (Detach to unassigned) -->
+                        <button
+                          type="button"
+                          on:click={() => dispatch('unlinkFace', { faceId: f.face_id })}
+                          class="text-[var(--text-muted)] hover:text-amber-500 cursor-pointer p-0.5 transition-colors spring-tap"
+                          title="Unlink face from person"
+                          aria-label="Unlink face"
+                        >
+                          <svg xmlns="http://www.w3.org/2000/svg" class="w-3 h-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                            <path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"></path>
+                            <polyline points="15 3 21 3 21 9"></polyline>
+                            <line x1="10" y1="14" x2="21" y2="3"></line>
+                          </svg>
+                        </button>
+
+                        <!-- Delete Face Entirely -->
+                        <button
+                          type="button"
+                          on:click={() => dispatch('deleteFace', { faceId: f.face_id })}
+                          class="text-[var(--text-muted)] hover:text-rose-500 cursor-pointer p-0.5 transition-colors spring-tap opacity-0 group-hover:opacity-100"
+                          title="Dismiss face detection"
+                          aria-label="Remove face detection"
+                        >
+                          <svg xmlns="http://www.w3.org/2000/svg" class="w-3 h-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+                            <line x1="18" y1="6" x2="6" y2="18"></line>
+                            <line x1="6" y1="6" x2="18" y2="18"></line>
+                          </svg>
+                        </button>
+                      </div>
                     </div>
-                  </div>
-                {/if}
+                  {/if}
+                </div>
               </div>
+
+              <!-- Quick Reassignment Drawer -->
+              {#if reassigningFaceId === f.face_id}
+                <div class="pt-2 border-t border-[var(--border-glass)] flex flex-col gap-1.5" in:fade={{ duration: 120 }}>
+                  <span class="text-[9px] text-[var(--text-muted)] font-mono uppercase tracking-wider">Move face to:</span>
+                  <div class="max-h-28 overflow-y-auto space-y-1 no-scrollbar">
+                    {#each knownPeople as person (person.id)}
+                      {#if person.name && person.id !== f.person_id}
+                        <button
+                          type="button"
+                          on:click={() => {
+                            dispatch('reassignFace', { faceId: f.face_id, targetPersonId: person.id });
+                            reassigningFaceId = null;
+                          }}
+                          class="w-full text-left px-2 py-1 rounded-lg text-xs text-[var(--text-main)] hover:bg-[var(--dock-bg-hover)] transition-colors flex items-center justify-between cursor-pointer"
+                        >
+                          <span class="truncate">{person.name}</span>
+                          <span class="text-[9px] text-[var(--text-muted)] font-mono">{person.face_count}</span>
+                        </button>
+                      {/if}
+                    {/each}
+                  </div>
+                </div>
+              {/if}
             </div>
           {/each}
         </div>
@@ -331,7 +416,7 @@
       </div>
     {/if}
 
-    <!-- 3. Tags (Open-Vocabulary / General Tagging) -->
+    <!-- 3. Tags -->
     <div class="space-y-1.5">
       <span class="text-[9px] uppercase tracking-wider font-semibold text-[var(--text-muted)] block pl-0.5">Tags</span>
       {#if loadingDetails}

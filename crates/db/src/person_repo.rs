@@ -141,9 +141,6 @@ impl PersonRepo {
         Ok(affected_ids)
     }
 
-    /// Deletes a person identity completely.
-    /// Unlinks all associated faces and removes the person record.
-    /// Returns affected asset IDs for search re-indexing.
     pub async fn delete_person(
         pool: &SqlitePool,
         user_id: &str,
@@ -164,7 +161,6 @@ impl PersonRepo {
             return Err(sqlx::Error::RowNotFound);
         }
 
-        // Collect all assets associated with this person to refresh FTS indices
         let affected_asset_ids: Vec<String> = sqlx::query_scalar(
             r#"
             SELECT DISTINCT af.asset_id 
@@ -178,13 +174,11 @@ impl PersonRepo {
         .fetch_all(&mut *tx)
         .await?;
 
-        // Nullify person_id references on faces
         sqlx::query("UPDATE asset_faces SET person_id = NULL WHERE person_id = ?1")
             .bind(person_id)
             .execute(&mut *tx)
             .await?;
 
-        // Delete the person entry
         sqlx::query("DELETE FROM persons WHERE id = ?1 AND user_id = ?2")
             .bind(person_id)
             .bind(user_id)
@@ -195,7 +189,7 @@ impl PersonRepo {
         Ok(affected_asset_ids)
     }
 
-    /// Deletes a single face detection entry entirely (e.g. background person or false detection)
+    /// Deletes a single face detection entry entirely
     pub async fn delete_face(
         pool: &SqlitePool,
         user_id: &str,
@@ -221,20 +215,17 @@ impl PersonRepo {
         let person_id: Option<String> = row.get("person_id");
         let face_thumb_path: Option<String> = row.get("face_thumb_path");
 
-        // Delete from asset_faces
         sqlx::query("DELETE FROM asset_faces WHERE id = ?1")
             .bind(face_id)
             .execute(&mut *tx)
             .await?;
 
-        // Recompute cluster if it was linked to a person
         if let Some(ref pid) = person_id {
             Self::recompute_cluster_centroid(&mut tx, user_id, pid).await?;
         }
 
         tx.commit().await?;
 
-        // Best effort removal of physical face crop from disk
         if let Some(thumb) = face_thumb_path {
             let path = std::path::Path::new(&thumb);
             if path.exists() {
@@ -243,6 +234,102 @@ impl PersonRepo {
         }
 
         Ok((asset_id, person_id))
+    }
+
+    /// Unlinks a face from its person cluster, setting person_id to NULL
+    pub async fn unlink_face(
+        pool: &SqlitePool,
+        user_id: &str,
+        face_id: &str,
+    ) -> Result<(String, Option<String>), sqlx::Error> {
+        let mut tx = pool.begin().await?;
+
+        let row = sqlx::query(
+            r#"
+            SELECT af.asset_id, af.person_id 
+            FROM asset_faces af
+            JOIN assets a ON af.asset_id = a.id
+            WHERE af.id = ?1 AND a.user_id = ?2
+            "#,
+        )
+        .bind(face_id)
+        .bind(user_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or(sqlx::Error::RowNotFound)?;
+
+        let asset_id: String = row.get("asset_id");
+        let person_id: Option<String> = row.get("person_id");
+
+        sqlx::query("UPDATE asset_faces SET person_id = NULL WHERE id = ?1")
+            .bind(face_id)
+            .execute(&mut *tx)
+            .await?;
+
+        if let Some(ref pid) = person_id {
+            Self::recompute_cluster_centroid(&mut tx, user_id, pid).await?;
+        }
+
+        tx.commit().await?;
+        Ok((asset_id, person_id))
+    }
+
+    /// Detaches a face from its current cluster and spawns it as a brand-new Person identity
+    pub async fn split_face_to_new_person(
+        pool: &SqlitePool,
+        user_id: &str,
+        face_id: &str,
+    ) -> Result<(String, String), sqlx::Error> {
+        let mut tx = pool.begin().await?;
+
+        // 1. Fetch face details and its current person
+        let row = sqlx::query(
+            r#"
+            SELECT af.asset_id, af.person_id, af.embedding, af.face_thumb_path
+            FROM asset_faces af
+            JOIN assets a ON af.asset_id = a.id
+            WHERE af.id = ?1 AND a.user_id = ?2
+            "#,
+        )
+        .bind(face_id)
+        .bind(user_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or(sqlx::Error::RowNotFound)?;
+
+        let asset_id: String = row.get("asset_id");
+        let old_person_id: Option<String> = row.get("person_id");
+        let embedding_blob: Vec<u8> = row.get("embedding");
+
+        // 2. Create a brand-new person record for this single face
+        let new_person_id = uuid::Uuid::new_v4().to_string();
+        sqlx::query(
+            r#"
+            INSERT INTO persons (id, user_id, name, face_count, cover_face_id, centroid_embedding)
+            VALUES (?1, ?2, NULL, 1, ?3, ?4)
+            "#,
+        )
+        .bind(&new_person_id)
+        .bind(user_id)
+        .bind(face_id)
+        .bind(&embedding_blob)
+        .execute(&mut *tx)
+        .await?;
+
+        // 3. Point the face to the new person
+        sqlx::query("UPDATE asset_faces SET person_id = ?1, is_verified = 1 WHERE id = ?2")
+            .bind(&new_person_id)
+            .bind(face_id)
+            .execute(&mut *tx)
+            .await?;
+
+        // 4. Recalculate old cluster centroid if it came from someone else
+        if let Some(old_pid) = old_person_id {
+            Self::recompute_cluster_centroid(&mut tx, user_id, &old_pid).await?;
+        }
+
+        tx.commit().await?;
+        Ok((asset_id, new_person_id))
     }
 
     pub async fn verify_face(pool: &SqlitePool, user_id: &str, face_id: &str) -> Result<(), sqlx::Error> {
@@ -274,7 +361,6 @@ impl PersonRepo {
     ) -> Result<String, sqlx::Error> {
         let mut tx = pool.begin().await?;
 
-        // Ensure both the face and target person belong to the user
         let row = sqlx::query(
             r#"
             SELECT af.asset_id, af.person_id 
@@ -331,7 +417,6 @@ impl PersonRepo {
     ) -> Result<Vec<String>, sqlx::Error> {
         let mut tx = pool.begin().await?;
 
-        // Verify both persons belong to this user
         let valid_count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM persons WHERE user_id = ?1 AND id IN (?2, ?3)",
         )
@@ -359,17 +444,14 @@ impl PersonRepo {
         .fetch_all(&mut *tx)
         .await?;
 
-        // Reassign faces to the target identity
         sqlx::query("UPDATE asset_faces SET person_id = ?1 WHERE person_id = ?2")
             .bind(target_person_id)
             .bind(source_person_id)
             .execute(&mut *tx)
             .await?;
 
-        // Recalculate target centroid
         Self::recompute_cluster_centroid(&mut tx, user_id, target_person_id).await?;
 
-        // Delete the source person
         sqlx::query("DELETE FROM persons WHERE id = ?1 AND user_id = ?2")
             .bind(source_person_id)
             .bind(user_id)
@@ -466,7 +548,6 @@ impl PersonRepo {
         Ok(())
     }
 
-    /// Returns autocomplete name suggestions strictly for the authenticated user
     pub async fn get_name_directory(pool: &SqlitePool, user_id: &str) -> Result<Vec<PersonCard>, sqlx::Error> {
         let rows = sqlx::query(
             r#"
