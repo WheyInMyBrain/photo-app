@@ -2,6 +2,7 @@
 <script lang="ts">
   import { createEventDispatcher, onMount } from 'svelte';
   import { authStore } from '$lib/stores/authStore';
+  import { fetchCustomAlbums } from '$lib/api/albums';
   import type { CandidateItem, InspectPreview } from '$lib/types/upload';
   import {
     CHUNK_THRESHOLD_BYTES,
@@ -25,6 +26,7 @@
   let statusMessage = '';
   let inspectError = '';
   let existingFolders: string[] = [];
+  let isFolderDropdownOpen = false;
 
   let stagedFiles: File[] = [];
   let fileInputEl: HTMLInputElement;
@@ -44,18 +46,18 @@
       ? stagedFiles.length > 0
       : linkPreview !== null && selectedLinkItems.size > 0;
 
+  // Filter existing folders/albums as the user types
+  $: filteredFolders = existingFolders.filter((f) =>
+    f.toLowerCase().includes(folderPath.trim().toLowerCase()) && f.toLowerCase() !== folderPath.trim().toLowerCase()
+  );
+
   onMount(async () => {
     try {
-      const res = await fetch('/api/media/filters');
-      if (res.status === 401) {
-        authStore.checkStatus();
-        return;
-      }
-      if (res.ok) {
-        const data = await res.json();
-        if (Array.isArray(data.albums)) {
-          existingFolders = data.albums.map((a: any) => a.value || a.label).filter(Boolean);
-        }
+      const albums = await fetchCustomAlbums();
+      if (Array.isArray(albums)) {
+        existingFolders = albums
+          .map((a: any) => a.title || a.name || a.label || a.value)
+          .filter(Boolean);
       }
     } catch {
       existingFolders = [];
@@ -69,6 +71,11 @@
       document.body.style.overflow = originalOverflow;
     };
   });
+
+  function selectFolderSuggestion(folder: string) {
+    folderPath = folder;
+    isFolderDropdownOpen = false;
+  }
 
   function addFiles(files: FileList | File[]) {
     const valid = Array.from(files).filter(
@@ -227,6 +234,7 @@
     linkUrl = '';
     linkPreview = null;
     selectedLinkItems.clear();
+    isFolderDropdownOpen = false;
     dispatch('close');
   }
 
@@ -236,12 +244,6 @@
 </script>
 
 <svelte:window on:keydown={handleKeydown} />
-
-<datalist id="folder-suggestions">
-  {#each existingFolders as folder}
-    <option value={folder}>{folder}</option>
-  {/each}
-</datalist>
 
 {#if isOpen}
   <!-- svelte-ignore a11y_click_events_have_key_events -->
@@ -255,7 +257,7 @@
   >
     <!-- Liquid-Glass Modal Card -->
     <div
-      class="liquid-modal rounded-3xl w-full max-w-lg flex flex-col max-h-[85vh] overflow-hidden"
+      class="liquid-modal rounded-3xl w-full max-w-lg flex flex-col max-h-[85vh] overflow-visible"
     >
       <!-- Header -->
       <div class="px-6 py-4.5 border-b border-white/[0.08] flex items-center justify-between">
@@ -304,20 +306,42 @@
 
       <!-- Scrollable Form Container -->
       <div class="p-6 space-y-4 overflow-y-auto flex-1 no-scrollbar">
-        <!-- Destination Album / Folder Input -->
-        <div class="space-y-1.5">
+        <!-- Destination Album / Folder Input with Dynamic Suggestions -->
+        <div class="space-y-1.5 relative">
           <span class="text-[9px] uppercase tracking-wider font-semibold text-white/40 block pl-1">
             Destination Album
           </span>
-          <input
-            id="upload-folder-input"
-            type="text"
-            list="folder-suggestions"
-            bind:value={folderPath}
-            placeholder="root (e.g. 2026/holidays)..."
-            disabled={isUploading || linkPreview !== null}
-            class="liquid-input w-full rounded-xl px-3.5 py-2 text-xs text-white placeholder-white/30 outline-none transition-all disabled:opacity-40"
-          />
+          <div class="relative">
+            <input
+              id="upload-folder-input"
+              type="text"
+              autocomplete="off"
+              bind:value={folderPath}
+              on:focus={() => (isFolderDropdownOpen = true)}
+              on:blur={() => setTimeout(() => (isFolderDropdownOpen = false), 200)}
+              placeholder="root (e.g. 2026/holidays)..."
+              disabled={isUploading || linkPreview !== null}
+              class="liquid-input w-full rounded-xl px-3.5 py-2 text-xs text-white placeholder-white/30 outline-none transition-all disabled:opacity-40"
+            />
+
+            <!-- Interactive Suggestions Dropdown -->
+            {#if isFolderDropdownOpen && filteredFolders.length > 0 && !isUploading}
+              <div class="absolute left-0 right-0 top-full mt-1.5 z-50 liquid-dropdown rounded-xl p-1 shadow-2xl max-h-40 overflow-y-auto no-scrollbar">
+                {#each filteredFolders as folder}
+                  <button
+                    type="button"
+                    class="w-full text-left px-3 py-1.5 rounded-lg text-xs text-white/80 hover:text-white hover:bg-white/10 transition-colors flex items-center gap-2 cursor-pointer"
+                    on:mousedown|preventDefault={() => selectFolderSuggestion(folder)}
+                  >
+                    <svg xmlns="http://www.w3.org/2000/svg" class="w-3.5 h-3.5 text-white/40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                      <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path>
+                    </svg>
+                    <span class="truncate">{folder}</span>
+                  </button>
+                {/each}
+              </div>
+            {/if}
+          </div>
         </div>
 
         {#if uploadMode === 'files'}
@@ -542,7 +566,6 @@
 {/if}
 
 <style>
-  /* Apple Liquid-Glass Modal Styling */
   .liquid-modal {
     background: rgba(18, 18, 22, 0.76);
     border: 1px solid rgba(255, 255, 255, 0.13);
@@ -581,6 +604,14 @@
     box-shadow: 
       inset 0 1px 2px rgba(0, 0, 0, 0.4),
       0 0 0 1px rgba(255, 255, 255, 0.15);
+  }
+
+  .liquid-dropdown {
+    background: rgba(22, 22, 28, 0.94);
+    border: 1px solid rgba(255, 255, 255, 0.14);
+    backdrop-filter: blur(28px) saturate(180%);
+    -webkit-backdrop-filter: blur(28px) saturate(180%);
+    box-shadow: 0 12px 32px rgba(0, 0, 0, 0.6), inset 0 1px 0 rgba(255, 255, 255, 0.15);
   }
 
   .liquid-segmented {
