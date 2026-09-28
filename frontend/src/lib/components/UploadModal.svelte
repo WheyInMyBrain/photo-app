@@ -5,7 +5,7 @@
   import { fetchCustomAlbums } from '$lib/api/albums';
   import { uploadQueue } from '$lib/stores/uploadQueueStore';
   import { formatBytes } from '$lib/utils/uploader';
-  import { normalizePath, getParentPath, computeFolderSuggestions } from '$lib/utils/folderHierarchy';
+  import { normalizePath, getDirectChildren, type FolderNode } from '$lib/utils/folderHierarchy';
   import type { CandidateItem } from '$lib/types/upload';
 
   export let isOpen = false;
@@ -20,24 +20,49 @@
   let isFolderDropdownOpen = false;
   let fileInputEl: HTMLInputElement;
 
+  // Active directory level inside the folder tree browser (e.g. "" for root, "College" for College/)
+  let browsingDir = '';
+  let searchQuery = '';
+
   $: if (initialFiles && initialFiles.length > 0) {
     uploadQueue.setMode('files');
     uploadQueue.addFiles(initialFiles);
     initialFiles = [];
   }
 
-  $: canUpload =$uploadQueue.uploadMode === 'files'
+  $: canUpload =
+    $uploadQueue.uploadMode === 'files'
       ? $uploadQueue.stagedFiles.length > 0
-      : $uploadQueue.linkPreview !== null &&$uploadQueue.selectedLinkItems.size > 0;
+      : $uploadQueue.linkPreview !== null && $uploadQueue.selectedLinkItems.size > 0;
 
-  $: cleanInputPath = normalizePath($uploadQueue.folderPath);
-  $: parentPath = getParentPath(cleanInputPath);$: folderSuggestions = computeFolderSuggestions(rawAlbumPaths, cleanInputPath);
+  // Fetch children under the folder we are currently browsing
+  $: currentChildren = getDirectChildren(rawAlbumPaths, browsingDir);
+
+  // Filter children by live search query if typing
+  $: visibleNodes = searchQuery.trim()
+    ? currentChildren.filter((node) =>
+        node.name.toLowerCase().includes(searchQuery.trim().toLowerCase())
+      )
+    : currentChildren;
+
+  // Split browsingDir into clickable breadcrumb steps: ["College", "2026"]
+  $: browsingCrumbs = (() => {
+    if (!browsingDir) return [];
+    const parts = browsingDir.split('/');
+    let cumulative = '';
+    return parts.map((part) => {
+      cumulative = cumulative ? `${cumulative}/${part}` : part;
+      return { name: part, path: cumulative };
+    });
+  })();
 
   onMount(async () => {
     try {
       const albums = await fetchCustomAlbums();
       if (Array.isArray(albums)) {
-        rawAlbumPaths = albums.map((a: any) => a.title || a.name || a.label || a.value).filter(Boolean);
+        rawAlbumPaths = albums
+          .map((a: any) => a.title || a.name || a.label || a.value)
+          .filter(Boolean);
       }
     } catch {
       rawAlbumPaths = [];
@@ -72,9 +97,34 @@
     return item.thumbnail_url || '';
   }
 
+  function drillDown(node: FolderNode) {
+    browsingDir = node.fullPath;
+    searchQuery = '';
+  }
+
+  function jumpToDirectory(path: string) {
+    browsingDir = path;
+    searchQuery = '';
+  }
+
+  function selectDirectory(path: string) {
+    uploadQueue.setFolderPath(path);
+    isFolderDropdownOpen = false;
+    searchQuery = '';
+  }
+
+  function createSubFolder() {
+    const newName = searchQuery.trim();
+    if (!newName) return;
+    const newFullPath = browsingDir ? `${browsingDir}/${newName}` : newName;
+    selectDirectory(newFullPath);
+  }
+
   function forceClose() {
     uploadQueue.reset();
     isFolderDropdownOpen = false;
+    browsingDir = '';
+    searchQuery = '';
     dispatch('close');
   }
 
@@ -146,16 +196,19 @@
 
       <!-- Form Body -->
       <div class="p-6 space-y-4 overflow-y-auto flex-1 no-scrollbar">
-        <!-- Hierarchical Path Dropdown -->
+        <!-- Interactive Tree Album & Folder Selector -->
         <div class="space-y-1.5 relative">
           <div class="flex items-center justify-between px-1">
             <span class="text-[9px] uppercase tracking-wider font-semibold text-[var(--text-muted)] block">
               Destination Album
             </span>
-            {#if cleanInputPath}
+            {#if $uploadQueue.folderPath}
               <button
                 type="button"
-                on:click={() => uploadQueue.setFolderPath('')}
+                on:click={() => {
+                  uploadQueue.setFolderPath('');
+                  browsingDir = '';
+                }}
                 class="text-[10px] text-purple-600 dark:text-purple-400 hover:underline cursor-pointer"
               >
                 Clear to root
@@ -163,61 +216,136 @@
             {/if}
           </div>
 
+          <!-- Current Selection Box with Browse Trigger -->
           <div class="relative">
-            <input
-              id="upload-folder-input"
-              type="text"
-              autocomplete="off"
-              value={$uploadQueue.folderPath}
-              on:input={(e) => uploadQueue.setFolderPath(e.currentTarget.value)}
-              on:focus={() => (isFolderDropdownOpen = true)}
-              on:blur={() => setTimeout(() => (isFolderDropdownOpen = false), 220)}
-              placeholder="root (e.g. College/outings)..."
+            <button
+              type="button"
               disabled={$uploadQueue.isUploading || $uploadQueue.linkPreview !== null}
-              class="liquid-input w-full rounded-xl px-3.5 py-2 text-xs text-[var(--text-main)] placeholder-[var(--text-muted)] outline-none transition-all disabled:opacity-40"
-            />
+              on:click={() => (isFolderDropdownOpen = !isFolderDropdownOpen)}
+              class="liquid-input w-full rounded-xl px-3.5 py-2 text-xs text-left text-[var(--text-main)] outline-none transition-all flex items-center justify-between gap-2 cursor-pointer disabled:opacity-40"
+            >
+              <div class="flex items-center gap-2 truncate">
+                <svg xmlns="http://www.w3.org/2000/svg" class="w-3.5 h-3.5 text-purple-500/80 flex-shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path>
+                </svg>
+                <span class="truncate font-medium">
+                  {$uploadQueue.folderPath ? $uploadQueue.folderPath : 'root (no album)'}
+                </span>
+              </div>
+              <span class="text-[10px] text-[var(--text-muted)] opacity-60">
+                {isFolderDropdownOpen ? '▲' : '▼'}
+              </span>
+            </button>
 
+            <!-- Hierarchical Tree Navigation Drawer -->
             {#if isFolderDropdownOpen && !$uploadQueue.isUploading}
-              <div class="absolute left-0 right-0 top-full mt-1.5 z-50 liquid-dropdown rounded-2xl p-1.5 shadow-2xl max-h-48 overflow-y-auto no-scrollbar border border-[var(--border-glass)]">
-                {#if parentPath !== null}
+              <div class="absolute left-0 right-0 top-full mt-1.5 z-50 liquid-dropdown rounded-2xl p-2.5 shadow-2xl max-h-64 overflow-y-auto no-scrollbar border border-[var(--border-glass)] flex flex-col gap-2">
+                
+                <!-- Tree Mini-Breadcrumb Bar -->
+                <div class="flex items-center gap-1 text-[11px] text-[var(--text-muted)] overflow-x-auto no-scrollbar py-1 border-b border-[var(--border-glass)]">
                   <button
                     type="button"
-                    class="w-full text-left px-2.5 py-1.5 rounded-xl text-xs text-purple-600 dark:text-purple-400 hover:bg-[var(--dock-bg-hover)] transition-colors flex items-center gap-1.5 cursor-pointer font-medium mb-1 border-b border-[var(--border-glass)] pb-1.5"
-                    on:mousedown|preventDefault={() => uploadQueue.setFolderPath(parentPath ?? '')}
+                    on:click={() => jumpToDirectory('')}
+                    class="hover:text-[var(--text-main)] font-semibold cursor-pointer whitespace-nowrap {!browsingDir ? 'text-purple-500' : ''}"
                   >
-                    <svg xmlns="http://www.w3.org/2000/svg" class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
-                      <polyline points="15 18 9 12 15 6"></polyline>
-                    </svg>
-                    <span>{parentPath === '' ? 'Back to root' : `Up to ${parentPath}`}</span>
+                    root
                   </button>
-                {/if}
 
-                {#if folderSuggestions.length === 0}
-                  <div class="px-3 py-2 text-xs text-[var(--text-muted)] italic text-center">
-                    New folder "{cleanInputPath}" will be created
-                  </div>
-                {:else}
-                  {#each folderSuggestions as item}
+                  {#each browsingCrumbs as crumb, idx}
+                    <span class="opacity-40">/</span>
                     <button
                       type="button"
-                      class="w-full text-left px-2.5 py-1.5 rounded-xl text-xs text-[var(--text-main)] hover:bg-[var(--dock-bg-hover)] transition-colors flex items-center justify-between gap-2 cursor-pointer group"
-                      on:mousedown|preventDefault={() => {
-                        uploadQueue.setFolderPath(item.fullPath);
-                        if (!item.isFolder) isFolderDropdownOpen = false;
-                      }}
+                      on:click={() => jumpToDirectory(crumb.path)}
+                      class="hover:text-[var(--text-main)] truncate max-w-[110px] cursor-pointer whitespace-nowrap {idx === browsingCrumbs.length - 1 ? 'font-semibold text-purple-500' : ''}"
                     >
-                      <div class="flex items-center gap-2 truncate">
-                        <svg xmlns="http://www.w3.org/2000/svg" class="w-3.5 h-3.5 text-purple-500/70 group-hover:text-purple-500 flex-shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                          <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path>
-                        </svg>
-                        <span class="truncate font-medium">{item.displayName}</span>
-                      </div>
-                      {#if item.isFolder}
-                        <span class="text-[10px] text-[var(--text-muted)] opacity-60 font-mono">›</span>
-                      {/if}
+                      {crumb.name}
                     </button>
                   {/each}
-                {/if}
+                </div>
+
+                <!-- Fast Filter / New Subfolder Input -->
+                <div class="flex gap-1.5">
+                  <input
+                    type="text"
+                    bind:value={searchQuery}
+                    placeholder={browsingDir ? `Filter or name new subfolder...` : `Filter or create folder...`}
+                    class="liquid-input flex-1 rounded-lg px-2.5 py-1 text-xs text-[var(--text-main)] placeholder-[var(--text-muted)] outline-none"
+                  />
+                  {#if searchQuery.trim()}
+                    <button
+                      type="button"
+                      on:click={createSubFolder}
+                      class="px-2.5 py-1 rounded-lg bg-purple-600 hover:bg-purple-500 text-white text-[11px] font-medium transition cursor-pointer flex-shrink-0"
+                    >
+                      Use
+                    </button>
+                  {/if}
+                </div>
+
+                <!-- "Choose Current Directory" action row -->
+                <button
+                  type="button"
+                  on:click={() => selectDirectory(browsingDir)}
+                  class="w-full text-left px-2.5 py-1.5 rounded-lg text-xs bg-purple-500/10 hover:bg-purple-500/20 text-purple-600 dark:text-purple-300 font-medium transition-colors flex items-center justify-between cursor-pointer"
+                >
+                  <span class="truncate">Select "{browsingDir || 'root'}"</span>
+                  <span class="text-[10px] uppercase font-mono">Use Current</span>
+                </button>
+
+                <!-- Children Directory List -->
+                <div class="space-y-0.5 overflow-y-auto max-h-36 no-scrollbar">
+                  {#if visibleNodes.length === 0}
+                    <div class="py-3 text-center text-xs text-[var(--text-muted)] italic">
+                      No sub-albums here.
+                    </div>
+                  {:else}
+                    {#each visibleNodes as node}
+                      <div class="flex items-center justify-between rounded-lg hover:bg-[var(--dock-bg-hover)] px-2 py-1.5 group transition-colors">
+                        <!-- Click name: drill down into the subfolder -->
+                        <button
+                          type="button"
+                          on:click={() => drillDown(node)}
+                          class="flex items-center gap-2 min-w-0 flex-1 text-left cursor-pointer"
+                        >
+                          <svg xmlns="http://www.w3.org/2000/svg" class="w-3.5 h-3.5 text-purple-500/70 group-hover:text-purple-500 flex-shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                            <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path>
+                          </svg>
+                          <span class="truncate text-xs text-[var(--text-main)] font-medium">
+                            {node.name}
+                          </span>
+                          {#if node.hasChildren}
+                            <span class="text-[9px] text-[var(--text-muted)] font-mono opacity-60">
+                              ({node.childCount})
+                            </span>
+                          {/if}
+                        </button>
+
+                        <!-- Explicit Pick / Select button for this node -->
+                        <div class="flex items-center gap-1">
+                          <button
+                            type="button"
+                            on:click|stopPropagation={() => selectDirectory(node.fullPath)}
+                            class="text-[10px] px-2 py-0.5 rounded bg-[var(--card-bg)] hover:bg-purple-600 hover:text-white text-[var(--text-muted)] transition cursor-pointer"
+                            title="Choose {node.fullPath}"
+                          >
+                            Select
+                          </button>
+
+                          {#if node.hasChildren}
+                            <button
+                              type="button"
+                              on:click={() => drillDown(node)}
+                              class="text-xs text-[var(--text-muted)] hover:text-[var(--text-main)] px-1 cursor-pointer font-bold"
+                              title="Open folder"
+                            >
+                              ›
+                            </button>
+                          {/if}
+                        </div>
+                      </div>
+                    {/each}
+                  {/if}
+                </div>
               </div>
             {/if}
           </div>
@@ -384,7 +512,7 @@
           {/if}
         {/if}
 
-        <!-- Aggregate Progress -->
+        <!-- Multi-Worker Aggregate Progress -->
         {#if $uploadQueue.isUploading}
           <div class="space-y-1.5 pt-2">
             <div class="flex justify-between text-xs text-[var(--text-muted)] font-mono">
@@ -524,12 +652,6 @@
     background: var(--pill-bg);
     border: 1px solid var(--border-glass);
     box-shadow: inset 0 1px 0 var(--border-specular);
-  }
-
-  .liquid-tag {
-    background: var(--pill-bg);
-    border: 1px solid var(--border-glass);
-    color: var(--text-muted);
   }
 
   .liquid-btn-primary {

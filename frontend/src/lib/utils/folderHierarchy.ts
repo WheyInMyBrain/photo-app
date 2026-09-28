@@ -1,70 +1,78 @@
 // photo-app/frontend/src/lib/utils/folderHierarchy.ts
-import type { FolderSuggestion } from '$lib/types/upload';
+
+export interface FolderNode {
+  name: string;          // e.g. "outings"
+  fullPath: string;      // e.g. "College/outings"
+  hasChildren: boolean;  // true if it contains sub-albums
+  childCount: number;    // number of direct sub-albums
+}
 
 export function normalizePath(path: string): string {
-  return path.trim().replace(/^\/+|\/+$/g, '');
+  return (path || '').trim().replace(/^\/+|\/+$/g, '');
 }
 
-export function getParentPath(cleanPath: string): string | null {
-  if (!cleanPath) return null;
-  const parts = cleanPath.split('/');
-  if (parts.length <= 1) return '';
-  return parts.slice(0, -1).join('/');
-}
+/**
+ * Returns immediate children folders under `currentLevelPath`.
+ */
+export function getDirectChildren(
+  allAlbumPaths: string[],
+  currentLevelPath: string
+): FolderNode[] {
+  // ==========================================
+  // DEBUG LOGS: Inspect backend data received
+  // ==========================================
+  console.group('📁 [folderHierarchy:getDirectChildren]');
+  console.log('1. Raw items received from backend/store:', allAlbumPaths);
+  console.log('2. Current browsing directory level:', currentLevelPath ? `"${currentLevelPath}"` : '(ROOT)');
+  
+  const cleanCurrent = normalizePath(currentLevelPath);
+  const prefix = cleanCurrent ? `${cleanCurrent}/` : '';
 
-export function computeFolderSuggestions(
-  rawAlbumPaths: string[],
-  cleanInputPath: string
-): FolderSuggestion[] {
-  const rawUnique = Array.from(
-    new Set(rawAlbumPaths.map((p) => p.replace(/^\/+|\/+$/g, '')))
+  const cleanPaths = Array.from(
+    new Set(allAlbumPaths.map((p) => normalizePath(p)))
   ).filter(Boolean);
 
-  // 1. Root level suggestions when input is empty
-  if (!cleanInputPath) {
-    const roots = new Set<string>();
-    for (const p of rawUnique) {
-      const firstSegment = p.split('/')[0];
-      if (firstSegment) roots.add(firstSegment);
+  console.log('3. Normalized unique paths:', cleanPaths);
+
+  const directMap = new Map<string, { fullPath: string; deeperCount: number }>();
+
+  for (const p of cleanPaths) {
+    if (prefix && !p.startsWith(prefix)) continue;
+
+    const remainder = prefix ? p.slice(prefix.length) : p;
+    const segments = remainder.split('/');
+    const immediateName = segments[0];
+
+    if (!immediateName) continue;
+
+    const immediateFullPath = cleanCurrent
+      ? `${cleanCurrent}/${immediateName}`
+      : immediateName;
+
+    if (!directMap.has(immediateName)) {
+      directMap.set(immediateName, { fullPath: immediateFullPath, deeperCount: 0 });
     }
-    return Array.from(roots).map((r) => ({
-      fullPath: r,
-      displayName: r,
-      isFolder: rawUnique.some((p) => p.startsWith(`${r}/`))
-    }));
+
+    if (segments.length > 1) {
+      directMap.get(immediateName)!.deeperCount += 1;
+    }
   }
 
-  // 2. Direct sub-folder level inside this directory
-  const exactPrefix = `${cleanInputPath}/`;
-  const directChildren = rawUnique.filter((p) => p.startsWith(exactPrefix));
-
-  if (directChildren.length > 0) {
-    const subEntries = new Map<string, { fullPath: string; isFolder: boolean }>();
-    for (const child of directChildren) {
-      const remainder = child.slice(exactPrefix.length);
-      const nextSegment = remainder.split('/')[0];
-      const nextFullPath = `${cleanInputPath}/${nextSegment}`;
-      const hasDeeper = child.length > nextFullPath.length;
-      if (!subEntries.has(nextSegment)) {
-        subEntries.set(nextSegment, { fullPath: nextFullPath, isFolder: hasDeeper });
-      }
-    }
-
-    return Array.from(subEntries.entries()).map(([name, info]) => ({
+  const result = Array.from(directMap.entries())
+    .map(([name, info]) => ({
+      name,
       fullPath: info.fullPath,
-      displayName: name,
-      isFolder: info.isFolder
-    }));
-  }
+      hasChildren: info.deeperCount > 0,
+      childCount: info.deeperCount
+    }))
+    .sort((a, b) => {
+      if (a.hasChildren && !b.hasChildren) return -1;
+      if (!a.hasChildren && b.hasChildren) return 1;
+      return a.name.localeCompare(b.name);
+    });
 
-  // 3. Fuzzy search for manual typing
-  const query = cleanInputPath.toLowerCase();
-  return rawUnique
-    .filter((p) => p.toLowerCase().includes(query) && p.toLowerCase() !== query)
-    .slice(0, 8)
-    .map((p) => ({
-      fullPath: p,
-      displayName: p,
-      isFolder: false
-    }));
+  console.log('4. Computed children for this level:', result);
+  console.groupEnd();
+
+  return result;
 }

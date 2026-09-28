@@ -262,7 +262,7 @@ impl AlbumRepo {
         })
     }
 
-    /// Create a custom or smart album.
+    /// Create a custom or smart album with hierarchical support
     pub async fn create_album(
         pool: &SqlitePool,
         user_id: &str,
@@ -279,12 +279,18 @@ impl AlbumRepo {
         let segments: Vec<&str> = cleaned.split('/').filter(|s| !s.is_empty()).collect();
         let mut tx = pool.begin().await?;
         let mut leaf_album_id = String::new();
+        let mut accumulated_path = String::new();
 
         for (idx, seg) in segments.iter().enumerate() {
-            let is_leaf = idx == segments.len() - 1;
-            let album_title = *seg;
+            if idx > 0 {
+                accumulated_path.push('/');
+            }
+            accumulated_path.push_str(seg);
 
-            // Check if album with this name already exists for this user
+            let is_leaf = idx == segments.len() - 1;
+            // Store the full path (e.g. "college" on iteration 0, "college/love" on iteration 1)
+            let album_title = &accumulated_path;
+
             let existing: Option<String> = sqlx::query_scalar(
                 "SELECT id FROM albums WHERE user_id = ?1 AND title = ?2 LIMIT 1"
             )
@@ -295,7 +301,6 @@ impl AlbumRepo {
 
             let current_id = match existing {
                 Some(id) => {
-                    // If leaf node, optionally update description or metadata
                     if is_leaf && description.is_some() {
                         sqlx::query(
                             "UPDATE albums SET description = ?1, updated_at = CURRENT_TIMESTAMP WHERE id = ?2"
@@ -338,6 +343,74 @@ impl AlbumRepo {
 
         tx.commit().await?;
         Ok(leaf_album_id)
+    }
+
+    pub async fn link_asset_to_folder_albums_tx(
+        tx: &mut sqlx::SqliteConnection,
+        user_id: &str,
+        asset_id: &str,
+        folder_path: &str,
+    ) -> Result<(), sqlx::Error> {
+        let trimmed = folder_path.trim().trim_matches('/');
+        if trimmed.is_empty() || trimmed == "root" {
+            return Ok(());
+        }
+
+        let segments: Vec<&str> = trimmed.split('/').filter(|s| !s.is_empty()).collect();
+        let mut accumulated_path = String::new();
+
+        for (idx, seg) in segments.iter().enumerate() {
+            if idx > 0 {
+                accumulated_path.push('/');
+            }
+            accumulated_path.push_str(seg);
+
+            // FIX: Use `&accumulated_path`, NOT `seg`!
+            // When uploading to "college/love", this registers:
+            // 1. Parent album: "college"
+            // 2. Child album:  "college/love"
+            let album_title = &accumulated_path;
+
+            let album_id: String = match sqlx::query_scalar::<_, String>(
+                "SELECT id FROM albums WHERE user_id = ?1 AND title = ?2 LIMIT 1"
+            )
+            .bind(user_id)
+            .bind(album_title)
+            .fetch_optional(&mut *tx)
+            .await?
+            {
+                Some(id) => id,
+                None => {
+                    let new_id = uuid::Uuid::new_v4().to_string();
+                    sqlx::query(
+                        r#"
+                        INSERT INTO albums (id, user_id, title, album_type)
+                        VALUES (?1, ?2, ?3, 'MANUAL')
+                        "#,
+                    )
+                    .bind(&new_id)
+                    .bind(user_id)
+                    .bind(album_title)
+                    .execute(&mut *tx)
+                    .await?;
+                    new_id
+                }
+            };
+
+            sqlx::query(
+                r#"
+                INSERT INTO album_assets (album_id, asset_id, position)
+                VALUES (?1, ?2, 0)
+                ON CONFLICT(album_id, asset_id) DO NOTHING
+                "#,
+            )
+            .bind(&album_id)
+            .bind(asset_id)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        Ok(())
     }
 
     /// Add assets into an album
@@ -435,75 +508,6 @@ impl AlbumRepo {
         .await?;
 
         Ok(res.rows_affected() > 0)
-    }
-
-    pub async fn link_asset_to_folder_albums_tx(
-        tx: &mut sqlx::SqliteConnection,
-        user_id: &str,
-        asset_id: &str,
-        folder_path: &str,
-    ) -> Result<(), sqlx::Error> {
-        let trimmed = folder_path.trim().trim_matches('/');
-        if trimmed.is_empty() || trimmed == "root" {
-            return Ok(());
-        }
-
-        // Split "vacation/2026/japan" -> creates/links "vacation", "vacation/2026", "vacation/2026/japan"
-        // (or simply the full folder name and its leaf node)
-        let segments: Vec<&str> = trimmed.split('/').filter(|s| !s.is_empty()).collect();
-        let mut accumulated_path = String::new();
-
-        for (idx, seg) in segments.iter().enumerate() {
-            if idx > 0 {
-                accumulated_path.push('/');
-            }
-            accumulated_path.push_str(seg);
-
-            // We use the segment name or accumulated path as the album title
-            let album_title = seg;
-
-            // 1. Fetch or create the album row for this user
-            let album_id: String = match sqlx::query_scalar::<_, String>(
-                "SELECT id FROM albums WHERE user_id = ?1 AND title = ?2 LIMIT 1"
-            )
-            .bind(user_id)
-            .bind(album_title)
-            .fetch_optional(&mut *tx)
-            .await?
-            {
-                Some(id) => id,
-                None => {
-                    let new_id = uuid::Uuid::new_v4().to_string();
-                    sqlx::query(
-                        r#"
-                        INSERT INTO albums (id, user_id, title, album_type)
-                        VALUES (?1, ?2, ?3, 'MANUAL')
-                        "#,
-                    )
-                    .bind(&new_id)
-                    .bind(user_id)
-                    .bind(album_title)
-                    .execute(&mut *tx)
-                    .await?;
-                    new_id
-                }
-            };
-
-            // 2. Link this asset into album_assets
-            sqlx::query(
-                r#"
-                INSERT INTO album_assets (album_id, asset_id, position)
-                VALUES (?1, ?2, 0)
-                ON CONFLICT(album_id, asset_id) DO NOTHING
-                "#,
-            )
-            .bind(&album_id)
-            .bind(asset_id)
-            .execute(&mut *tx)
-            .await?;
-        }
-
-        Ok(())
     }
 
     pub async fn update_album(
