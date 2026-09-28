@@ -1,5 +1,30 @@
+// photo-app/frontend/src/lib/utils/uploader.ts
+
 export const CHUNK_THRESHOLD_BYTES = 75 * 1024 * 1024; // 75MB
 export const CHUNK_SIZE_BYTES = 20 * 1024 * 1024;      // 20MB
+
+// Universal RFC4122 v4 UUID generator (works on HTTP, HTTPS, and mobile Safari)
+export function generateUUID(): string {
+  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
+    try {
+      return crypto.randomUUID();
+    } catch {}
+  }
+
+  // Fallback for non-HTTPS local IP access & older mobile WebKit
+  if (typeof crypto !== 'undefined' && typeof crypto.getRandomValues === 'function') {
+    return (([1e7] as any) + -1e3 + -4e3 + -8e3 + -1e11).replace(/[018]/g, (c: number) =>
+      (c ^ (crypto.getRandomValues(new Uint8Array(1))[0] & (15 >> (c / 4)))).toString(16)
+    );
+  }
+
+  // Pure Math.random fallback
+  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) => {
+    const r = (Math.random() * 16) | 0;
+    const v = c === 'x' ? r : (r & 0x3) | 0x8;
+    return v.toString(16);
+  });
+}
 
 export function formatBytes(bytes: number): string {
   if (bytes === 0) return '0 B';
@@ -24,7 +49,8 @@ export async function uploadChunked(
   folderPath: string,
   onProgress?: (part: number, total: number) => void
 ): Promise<void> {
-  const uploadId = crypto.randomUUID();
+  // Use safe UUID generator instead of raw crypto.randomUUID()
+  const uploadId = generateUUID();
   const totalChunks = Math.ceil(file.size / CHUNK_SIZE_BYTES);
 
   for (let chunkIdx = 0; chunkIdx < totalChunks; chunkIdx++) {

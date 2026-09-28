@@ -47,6 +47,58 @@
     ? $albumStore.find((a) => a.id ===$filterStore.album_id)
     : null;
 
+  $: currentAlbumPath = currentAlbum
+    ? (currentAlbum.title || '').replace(/^\/+|\/+$/g, '')
+    : ($filterStore.folder_path \vert{}\vert{} '').replace(/^\/+\vert{}\/+$/g, '');
+
+  $: breadcrumbSegments = (() => {
+    if (!currentAlbumPath) return [];
+    const parts = currentAlbumPath.split('/');
+    let cumulative = '';
+    return parts.map((part) => {
+      cumulative = cumulative ? `${cumulative}/${part}` : part;
+      const matchedAlbum = $albumStore.find(
+        (a) => (a.title || '').replace(/^\/+|\/+$/g, '') === cumulative
+      );
+      return {
+        name: part,
+        path: cumulative,
+        albumId: matchedAlbum?.id ?? null
+      };
+    });
+  })();
+
+  $: rootAlbums =$albumStore
+    .map((alb) => {
+      const clean = (alb.title || '').replace(/^\/+|\/+$/g, '');
+      const parts = clean.split('/');
+      return { ...alb, cleanPath: clean, rootName: parts[0] };
+    })
+    .filter((alb) => !currentAlbumPath && alb.cleanPath === alb.rootName);
+
+  $: childAlbums = (() => {
+    if (!currentAlbumPath) return [];
+    const prefix = `${currentAlbumPath}/`;
+    return $albumStore
+      .filter((alb) => {
+        const clean = (alb.title || '').replace(/^\/+|\/+$/g, '');
+        return clean.startsWith(prefix) && clean !== currentAlbumPath;
+      })
+      .map((alb) => {
+        const clean = (alb.title || '').replace(/^\/+|\/+$/g, '');
+        const remainder = clean.slice(prefix.length);
+        const directSubName = remainder.split('/')[0];
+        return {
+          ...alb,
+          directSubName,
+          displayTitle: directSubName
+        };
+      })
+      .filter((item, index, self) =>
+        index === self.findIndex((t) => t.directSubName === item.directSubName)
+      );
+  })();
+
   $: scrubMarkers =$sections.map((s, idx) => ({
     label: s.title.split(' ')[0],
     year: s.title.split(' ')[1] || '',
@@ -80,7 +132,6 @@
   }
 
   function handleContainerClick(e: MouseEvent) {
-    // If the user was just dragging or held to select, suppress the click event so modal doesn't open
     if (dragSelect.isDragging()) return;
 
     const target = e.target as HTMLElement;
@@ -123,6 +174,23 @@
 
     clickedCardRect = card.getBoundingClientRect();
     activeCoords = [secIdx, itemIdx];
+  }
+
+  function navigateToAlbumSegment(seg: { name: string; path: string; albumId: string | null }) {
+    if (seg.albumId) {
+      filterStore.setAlbumId(seg.albumId);
+    } else {
+      filterStore.setFolderPath(seg.path);
+    }
+  }
+
+  function openChildAlbum(album: any) {
+    if (album.id) {
+      filterStore.setAlbumId(album.id);
+    } else {
+      const targetPath = `${currentAlbumPath}/${album.directSubName}`;
+      filterStore.setFolderPath(targetPath);
+    }
   }
 
   async function handleRemoveFromAlbum() {
@@ -204,165 +272,185 @@
 
 <div
   style="padding-bottom: max(2rem, calc(var(--sab) + 1.5rem));"
-  class="px-2 pt-16 md:px-6 md:pt-16 max-w-[1700px] mx-auto space-y-5 md:space-y-6 min-h-full flex flex-col select-none relative transition-all duration-300 ease-out {activeCoords !== null ? 'scale-[0.97] opacity-85 pointer-events-none' : 'scale-100 opacity-100'} {$isSelectionActive ? 'selection-active' : ''}"
+  class="px-2 pt-16 md:px-6 md:pt-16 max-w-[1700px] mx-auto space-y-4 md:space-y-5 min-h-full flex flex-col select-none relative transition-all duration-300 ease-out {activeCoords !== null ? 'scale-[0.97] opacity-85 pointer-events-none' : 'scale-100 opacity-100'} {$isSelectionActive ? 'selection-active' : ''}"
 >
-  <!-- Contextual Breadcrumb Bar -->
-  <div class="flex items-center justify-between gap-2 px-1">
-    <div class="flex items-center gap-1.5 text-xs text-[var(--text-muted)] overflow-x-auto no-scrollbar py-1">
+  <!-- Minimal Header Bar -->
+  <div class="flex items-center justify-between gap-2 px-1 min-h-[32px]">
+    <div class="flex items-center gap-1.5 text-xs text-[var(--text-muted)] overflow-x-auto no-scrollbar py-0.5">
+      <!-- Root Icon Button -->
       <button
         type="button"
-        on:click={() => filterStore.clearAlbum()}
-        class="hover:text-[var(--text-main)] transition-colors cursor-pointer font-medium whitespace-nowrap {!$filterStore.album_id ? 'text-[var(--text-main)] font-semibold' : ''}"
+        on:click={() => {
+          filterStore.clearAlbum();
+          filterStore.setFolderPath('');
+        }}
+        class="w-7 h-7 rounded-full flex items-center justify-center transition-colors cursor-pointer {!currentAlbumPath ? 'bg-[var(--card-bg)] text-[var(--text-main)] shadow-sm border border-[var(--border-glass)]' : 'text-[var(--text-muted)] hover:text-[var(--text-main)]'}"
+        title="All Photos"
+        aria-label="Root view"
       >
-        {$filterStore.view_mode === 'albums' ? 'All Albums' : 'Library'}
+        <svg xmlns="http://www.w3.org/2000/svg" class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect>
+          <circle cx="8.5" cy="8.5" r="1.5"></circle>
+          <polyline points="21 15 16 10 5 21"></polyline>
+        </svg>
       </button>
 
-      {#if $filterStore.album_id}
-        <span class="opacity-40">/</span>
-        <div class="inline-flex items-center gap-2 px-3 py-1 rounded-full liquid-breadcrumb text-[var(--text-main)] text-xs">
-          <span class="font-medium truncate max-w-[180px] sm:max-w-[260px]">
-            {currentAlbum?.title || 'Album'}
-          </span>
+      <!-- Path Badges -->
+      {#if breadcrumbSegments.length > 0}
+        {#each breadcrumbSegments as seg, idx (seg.path)}
+          <span class="opacity-30 text-[10px]">/</span>
+          {@const isLast = idx === breadcrumbSegments.length - 1}
 
-          <button
-            type="button"
-            on:click={() => (showManageAlbumModal = true)}
-            class="text-[var(--text-muted)] hover:text-[var(--text-main)] px-1 tracking-widest font-bold cursor-pointer transition-colors"
-            title="Album options"
-            aria-label="Album options"
-          >
-            <svg xmlns="http://www.w3.org/2000/svg" class="w-3.5 h-3.5 inline" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-              <circle cx="12" cy="12" r="1"></circle>
-              <circle cx="19" cy="12" r="1"></circle>
-              <circle cx="5" cy="12" r="1"></circle>
-            </svg>
-          </button>
+          <div class="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full liquid-breadcrumb text-[var(--text-main)] text-xs">
+            <button
+              type="button"
+              on:click={() => navigateToAlbumSegment(seg)}
+              class="font-medium truncate max-w-[130px] sm:max-w-[200px] hover:text-purple-500 dark:hover:text-purple-400 transition-colors cursor-pointer {isLast ? 'font-semibold text-purple-600 dark:text-purple-300' : ''}"
+            >
+              {seg.name}
+            </button>
 
-          <button
-            type="button"
-            on:click={() => filterStore.clearAlbum()}
-            class="text-[var(--text-muted)] hover:text-[var(--text-main)] cursor-pointer ml-0.5 leading-none"
-            title="Exit album"
-            aria-label="Exit album"
-          >
-            <svg xmlns="http://www.w3.org/2000/svg" class="w-3 h-3 inline" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-              <line x1="18" y1="6" x2="6" y2="18"></line>
-              <line x1="6" y1="6" x2="18" y2="18"></line>
-            </svg>
-          </button>
-        </div>
+            {#if isLast}
+              <button
+                type="button"
+                on:click={() => (showManageAlbumModal = true)}
+                class="text-[var(--text-muted)] hover:text-[var(--text-main)] px-0.5 cursor-pointer transition-colors"
+                title="Options"
+                aria-label="Album options"
+              >
+                <svg xmlns="http://www.w3.org/2000/svg" class="w-3 h-3 inline" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                  <circle cx="12" cy="12" r="1"></circle>
+                  <circle cx="19" cy="12" r="1"></circle>
+                  <circle cx="5" cy="12" r="1"></circle>
+                </svg>
+              </button>
+
+              <button
+                type="button"
+                on:click={() => {
+                  if (idx === 0) {
+                    filterStore.clearAlbum();
+                    filterStore.setFolderPath('');
+                  } else {
+                    navigateToAlbumSegment(breadcrumbSegments[idx - 1]);
+                  }
+                }}
+                class="text-[var(--text-muted)] hover:text-[var(--text-main)] cursor-pointer leading-none"
+                title="Back"
+                aria-label="Back"
+              >
+                <svg xmlns="http://www.w3.org/2000/svg" class="w-2.5 h-2.5 inline" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+                  <line x1="18" y1="6" x2="6" y2="18"></line>
+                  <line x1="6" y1="6" x2="18" y2="18"></line>
+                </svg>
+              </button>
+            {/if}
+          </div>
+        {/each}
       {/if}
     </div>
 
+    <!-- Minimal Trash Icon Indicator -->
     {#if $filterStore.show_trash}
-      <span class="text-[10px] bg-red-500/15 border border-red-500/30 text-red-500 dark:text-red-400 px-2.5 py-0.5 rounded-full font-mono font-medium whitespace-nowrap flex-shrink-0 flex items-center gap-1.5">
+      <div class="w-6 h-6 rounded-full bg-red-500/15 border border-red-500/30 text-red-500 dark:text-red-400 flex items-center justify-center flex-shrink-0" title="Viewing Trash">
         <svg xmlns="http://www.w3.org/2000/svg" class="w-3 h-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
           <polyline points="3 6 5 6 21 6"></polyline>
           <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path>
         </svg>
-        <span>Trash: 30d Auto-Purge</span>
-      </span>
+      </div>
     {/if}
   </div>
 
-  <!-- Single Unified Albums Shelf -->
-  {#if $filterStore.view_mode === 'albums' && !$filterStore.album_id}
-    <div class="space-y-3" in:fade={{ duration: 150 }}>
-      <div class="flex items-center justify-between px-1">
-        <h3 class="text-xs font-semibold uppercase tracking-wider text-[var(--text-muted)]">
-          Albums
-        </h3>
-        <span class="text-[10px] text-[var(--text-muted)] font-mono">
-          {$albumStore.length} {$albumStore.length === 1 ? 'album' : 'albums'}
-        </span>
-      </div>
-
-      {#if $albumStore.length === 0}
-        <div class="py-12 px-4 text-center border border-dashed border-[var(--border-glass)] rounded-2xl bg-[var(--card-bg)]">
-          <div class="w-8 h-8 mx-auto mb-2 text-[var(--text-muted)] opacity-60">
-            <svg xmlns="http://www.w3.org/2000/svg" class="w-full h-full" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
-              <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path>
-            </svg>
+  <!-- 1. ROOT ALBUMS (Quiet Grid) -->
+  {#if $filterStore.view_mode === 'albums' && !currentAlbumPath && rootAlbums.length > 0}
+    <div class="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-6 gap-2.5" in:fade={{ duration: 150 }}>
+      {#each rootAlbums as album (album.id)}
+        <button
+          type="button"
+          on:click={() => filterStore.setAlbumId(album.id)}
+          class="group text-left p-1.5 rounded-2xl bg-[var(--card-bg)] hover:bg-[var(--dock-bg-hover)] border border-[var(--border-glass)] hover:border-purple-500/40 transition-all cursor-pointer flex flex-col gap-1.5 spring-tap"
+        >
+          <div class="w-full aspect-square rounded-xl overflow-hidden bg-black/10 dark:bg-black/40 flex items-center justify-center border border-[var(--border-glass)] relative">
+            {#if album.cover_thumb}
+              <img
+                src={album.cover_thumb.startsWith('/') ? album.cover_thumb : `/${album.cover_thumb}`}
+                alt={album.title}
+                class="w-full h-full object-cover group-hover:scale-105 transition-transform duration-300"
+              />
+            {:else}
+              <div class="w-7 h-7 text-[var(--text-muted)] opacity-40">
+                <svg xmlns="http://www.w3.org/2000/svg" class="w-full h-full" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path>
+                </svg>
+              </div>
+            {/if}
+            <div class="absolute bottom-1 right-1 bg-black/65 backdrop-blur-md px-1.5 py-0.2 rounded-md text-[9px] text-white font-mono">
+              {album.media_count}
+            </div>
           </div>
-          <p class="text-xs text-[var(--text-muted)]">No albums yet. Select photos to add them to an album, or upload into a folder.</p>
-        </div>
-      {:else}
-        <div class="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-6 gap-3">
-          {#each $albumStore as album (album.id)}
-            <button
-              type="button"
-              on:click={() => filterStore.setAlbumId(album.id)}
-              class="group text-left p-2.5 rounded-2xl bg-[var(--card-bg)] hover:bg-[var(--dock-bg-hover)] border border-[var(--border-glass)] hover:border-purple-500/40 transition-all cursor-pointer flex flex-col gap-2.5 spring-tap"
-            >
-              <div class="w-full aspect-square rounded-xl overflow-hidden bg-black/10 dark:bg-black/40 flex items-center justify-center border border-[var(--border-glass)] relative">
-                {#if album.cover_thumb}
-                  <img
-                    src={album.cover_thumb.startsWith('/') ? album.cover_thumb : `/${album.cover_thumb}`}
-                    alt={album.title}
-                    class="w-full h-full object-cover group-hover:scale-105 transition-transform duration-300"
-                  />
-                {:else}
-                  <div class="w-8 h-8 text-[var(--text-muted)] opacity-50">
-                    <svg xmlns="http://www.w3.org/2000/svg" class="w-full h-full" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
-                      <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path>
-                    </svg>
-                  </div>
-                {/if}
 
-                <div class="absolute bottom-1.5 right-1.5 bg-black/60 dark:bg-black/75 backdrop-blur-md px-1.5 py-0.5 rounded-md text-[9px] text-white font-mono">
-                  {album.media_count}
-                </div>
-              </div>
-
-              <div class="min-w-0 px-0.5">
-                <div class="text-xs font-semibold truncate text-[var(--text-main)] group-hover:text-purple-500 dark:group-hover:text-purple-400 transition-colors">
-                  {album.title}
-                </div>
-                <div class="text-[10px] text-[var(--text-muted)]">
-                  {album.media_count} {album.media_count === 1 ? 'photo' : 'photos'}
-                </div>
-              </div>
-            </button>
-          {/each}
-        </div>
-      {/if}
+          <div class="px-1 truncate text-xs font-semibold text-[var(--text-main)] group-hover:text-purple-500 dark:group-hover:text-purple-400 transition-colors">
+            {album.rootName}
+          </div>
+        </button>
+      {/each}
     </div>
   {/if}
 
-  <!-- Media Timeline Grid -->
+  <!-- 2. SUB-ALBUMS SHELF (No Section Headers, Pure Minimal Tiles) -->
+  {#if currentAlbumPath && childAlbums.length > 0}
+    <div class="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-6 gap-2.5 pb-1" in:fade={{ duration: 150 }}>
+      {#each childAlbums as subAlbum (subAlbum.id || subAlbum.directSubName)}
+        <button
+          type="button"
+          on:click={() => openChildAlbum(subAlbum)}
+          class="group text-left p-1.5 rounded-2xl bg-[var(--card-bg)] hover:bg-[var(--dock-bg-hover)] border border-[var(--border-glass)] hover:border-purple-500/40 transition-all cursor-pointer flex flex-col gap-1.5 spring-tap shadow-sm"
+        >
+          <div class="w-full aspect-square rounded-xl overflow-hidden bg-black/10 dark:bg-black/40 flex items-center justify-center border border-[var(--border-glass)] relative">
+            {#if subAlbum.cover_thumb}
+              <img
+                src={subAlbum.cover_thumb.startsWith('/') ? subAlbum.cover_thumb : `/${subAlbum.cover_thumb}`}
+                alt={subAlbum.displayTitle}
+                class="w-full h-full object-cover group-hover:scale-105 transition-transform duration-300"
+              />
+            {:else}
+              <div class="w-6 h-6 text-[var(--text-muted)] opacity-40">
+                <svg xmlns="http://www.w3.org/2000/svg" class="w-full h-full" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                  <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path>
+                </svg>
+              </div>
+            {/if}
+            <div class="absolute bottom-1 right-1 bg-black/65 backdrop-blur-md px-1.5 py-0.2 rounded-md text-[9px] text-white font-mono">
+              {subAlbum.media_count}
+            </div>
+          </div>
+
+          <div class="px-1 truncate text-xs font-semibold text-[var(--text-main)] group-hover:text-purple-500 dark:group-hover:text-purple-400 transition-colors">
+            {subAlbum.displayTitle}
+          </div>
+        </button>
+      {/each}
+    </div>
+  {/if}
+
+  <!-- 3. MEDIA TIMELINE GRID -->
   {#if $sections.length === 0 && !$isLoading}
-    <div in:fade={{ duration: 150 }} class="flex-1 flex flex-col items-center justify-center text-center py-24 text-[var(--text-muted)] text-xs">
-      <div class="w-10 h-10 mb-3 text-[var(--text-muted)] opacity-60">
-        {#if $filterStore.show_trash}
-          <svg xmlns="http://www.w3.org/2000/svg" class="w-full h-full" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
-            <polyline points="3 6 5 6 21 6"></polyline>
-            <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path>
-          </svg>
-        {:else if $filterStore.album_id}
-          <svg xmlns="http://www.w3.org/2000/svg" class="w-full h-full" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
-            <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path>
-          </svg>
-        {:else}
-          <svg xmlns="http://www.w3.org/2000/svg" class="w-full h-full" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
-            <path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"></path>
-            <circle cx="12" cy="13" r="4"></circle>
-          </svg>
-        {/if}
+    <div in:fade={{ duration: 150 }} class="flex-1 flex flex-col items-center justify-center text-center py-20 text-[var(--text-muted)]">
+      <div class="w-8 h-8 opacity-40 mb-2">
+        <svg xmlns="http://www.w3.org/2000/svg" class="w-full h-full" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
+          <rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect>
+          <circle cx="8.5" cy="8.5" r="1.5"></circle>
+          <polyline points="21 15 16 10 5 21"></polyline>
+        </svg>
       </div>
-      <p class="font-medium text-sm text-[var(--text-main)]">
-        {$filterStore.show_trash
-          ? 'Trash is empty.'
-          : $filterStore.album_id
-            ? 'No photos in this album.'
-            : 'No media found in library.'}
-      </p>
+      <p class="text-xs font-medium">Empty</p>
     </div>
   {:else}
     <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
     <div
       role="region"
-      aria-label="Media timeline grid"
-      class="space-y-6 md:space-y-8 select-none {$isSelectionActive ? 'touch-none' : 'touch-pan-y'}"
+      aria-label="Media grid"
+      class="space-y-4 md:space-y-6 select-none {$isSelectionActive ? 'touch-none' : 'touch-pan-y'}"
       style="--grid-cols: {currentDensity.cols}; --grid-cols-mobile: {currentDensity.colsMobile};"
       on:click={handleContainerClick}
       on:keydown={handleContainerKeydown}
@@ -373,12 +461,13 @@
     >
       {#each $sections as section, secIdx (section.title)}
         <section id="section-marker-{secIdx}" class="section-container">
-          <div class="sticky top-0 z-20 py-2.5 px-1 flex items-center justify-between backdrop-blur-xl bg-[var(--bg-primary)]/85 border-b border-[var(--border-glass)] mb-2.5">
-            <h2 class="text-xs md:text-sm font-semibold tracking-tight text-[var(--text-main)]">
+          <!-- Minimal Sticky Timeline Header -->
+          <div class="sticky top-0 z-20 py-1.5 px-1 flex items-baseline justify-between backdrop-blur-xl bg-[var(--bg-primary)]/80 mb-1.5">
+            <h2 class="text-xs font-semibold tracking-tight text-[var(--text-main)]">
               {section.title}
             </h2>
-            <span class="text-[10px] text-[var(--text-muted)] font-mono tracking-wide">
-              {section.items.length} {section.items.length === 1 ? 'item' : 'items'}
+            <span class="text-[10px] text-[var(--text-muted)] font-mono">
+              {section.items.length}
             </span>
           </div>
 
@@ -410,8 +499,8 @@
                   type="button"
                   data-select-btn
                   class="select-btn absolute top-1.5 left-1.5 w-5 h-5 md:w-6 md:h-6 rounded-full flex items-center justify-center transition-all z-30 cursor-pointer bg-black/40 backdrop-blur-md opacity-0 group-hover:opacity-100 text-white hover:text-white border border-white/20"
-                  title="Select media"
-                  aria-label="Select {asset.file_name}"
+                  title="Select"
+                  aria-label="Select"
                 >
                   <svg xmlns="http://www.w3.org/2000/svg" class="w-3 h-3 text-white pointer-events-none" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round">
                     <polyline points="20 6 9 17 4 12"></polyline>
@@ -428,14 +517,10 @@
 
                 {#if asset.days_remaining !== null && asset.days_remaining !== undefined && $gridDensity > 0}
                   <div class="absolute bottom-1.5 left-1.5 bg-red-500/30 backdrop-blur-md border border-red-500/40 px-1.5 py-0.5 rounded-full text-[9px] text-red-200 font-mono font-medium z-20 pointer-events-none shadow-sm flex items-center gap-1">
-                    <svg xmlns="http://www.w3.org/2000/svg" class="w-2.5 h-2.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                      <polyline points="3 6 5 6 21 6"></polyline>
-                      <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path>
-                    </svg>
                     <span>{asset.days_remaining}d</span>
                   </div>
                 {:else if asset.mime_type === 'image/gif' && $gridDensity > 0}
-                  <div class="absolute bottom-1.5 left-1.5 bg-black/60 backdrop-blur-md border border-white/15 px-2 py-0.5 rounded-full text-[8px] text-white font-mono font-bold tracking-wider z-20 pointer-events-none">
+                  <div class="absolute bottom-1.5 left-1.5 bg-black/60 backdrop-blur-md border border-white/15 px-1.5 py-0.5 rounded-md text-[8px] text-white font-mono font-bold tracking-wider z-20 pointer-events-none">
                     GIF
                   </div>
                 {/if}
@@ -456,12 +541,9 @@
     </div>
   {/if}
 
-  <div bind:this={scrollTrigger} class="py-8 text-center text-xs text-[var(--text-muted)] min-h-[3rem]">
+  <div bind:this={scrollTrigger} class="py-6 text-center text-xs text-[var(--text-muted)] min-h-[2.5rem]">
     {#if $isLoading}
-      <div class="inline-flex items-center gap-2 font-mono">
-        <div class="w-4 h-4 border-2 border-purple-500/20 border-t-purple-500 rounded-full animate-spin"></div>
-        <span>Loading library...</span>
-      </div>
+      <div class="w-4 h-4 border-2 border-purple-500/20 border-t-purple-500 rounded-full animate-spin mx-auto"></div>
     {/if}
   </div>
 </div>
@@ -542,7 +624,7 @@
     background: var(--dock-bg);
     border: 1px solid var(--dock-border);
     backdrop-filter: blur(20px) saturate(180%);
-    box-shadow: 0 4px 14px var(--dock-shadow), inset 0 1px 0 var(--dock-highlight);
+    box-shadow: 0 2px 8px var(--dock-shadow), inset 0 1px 0 var(--dock-highlight);
   }
 
   .section-container {
@@ -568,7 +650,7 @@
     width: 100%;
     aspect-ratio: var(--ratio, 1);
     contain: layout paint;
-    -webkit-touch-callout: none; /* Prevents iOS native callout menu on long-press */
+    -webkit-touch-callout: none;
   }
 
   :global(.tile-card[aria-pressed="true"]) {
