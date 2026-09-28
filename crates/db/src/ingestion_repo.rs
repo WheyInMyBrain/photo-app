@@ -78,7 +78,6 @@ pub struct AiEnrichmentPayload {
     pub new_persons: Vec<IngestionNewPerson>,
     pub updated_clusters: Vec<IngestionUpdatedCluster>,
     pub detected_faces: Vec<IngestionDetectedFace>,
-    pub objects: Vec<IngestionDetectedObject>,
     pub poses: Vec<IngestionDetectedPose>,
     pub tags: Vec<IngestionTagInput>,
 }
@@ -452,34 +451,7 @@ impl IngestionRepo {
             .await?;
         }
 
-        // 5. Batch insert detected objects (YOLO seg boxes)
-        if !payload.objects.is_empty() {
-            // Delete prior detections on this asset to maintain idempotency
-            sqlx::query("DELETE FROM asset_objects WHERE asset_id = ?")
-                .bind(&payload.asset_id)
-                .execute(&mut *tx)
-                .await?;
-
-            let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new(
-                "INSERT INTO asset_objects (id, asset_id, class_id, label, score, bbox_x, bbox_y, bbox_w, bbox_h) ",
-            );
-
-            qb.push_values(payload.objects, |mut b, obj| {
-                b.push_bind(obj.id)
-                    .push_bind(&payload.asset_id)
-                    .push_bind(obj.class_id)
-                    .push_bind(obj.label)
-                    .push_bind(obj.score)
-                    .push_bind(obj.bbox_x)
-                    .push_bind(obj.bbox_y)
-                    .push_bind(obj.bbox_w)
-                    .push_bind(obj.bbox_h);
-            });
-
-            qb.build().execute(&mut *tx).await?;
-        }
-
-        // 6. Batch insert detected poses (YOLO pose keypoints)
+        // 5. Batch insert detected poses (YOLO pose keypoints)
         if !payload.poses.is_empty() {
             // Delete prior poses on this asset to maintain idempotency
             sqlx::query("DELETE FROM asset_poses WHERE asset_id = ?")

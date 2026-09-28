@@ -246,7 +246,6 @@ impl MediaEngine {
             new_persons: faces_res.new_persons,
             tags: tag_predictions,
             clip_embedding,
-            objects: Vec::new(),
             poses,
         })
     }
@@ -322,7 +321,6 @@ impl MediaEngine {
             new_persons: faces_res.new_persons,
             tags,
             clip_embedding,
-            objects: Vec::new(),
             poses: all_poses,
         })
     }

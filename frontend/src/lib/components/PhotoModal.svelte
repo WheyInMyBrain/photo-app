@@ -54,9 +54,9 @@
   let naturalH = 0;
 
   // Layer Toggles (controlled from sidebar)
-  let showFaces = true;
-  let showObjects = true;
-  let showPoses = true;
+  let showFaces = false;
+  let showObjects = false;
+  let showPoses = false;
 
   // Sidebar & Overlay Data
   let showMobileInfo = false;

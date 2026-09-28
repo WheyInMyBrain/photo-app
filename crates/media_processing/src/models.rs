@@ -116,7 +116,6 @@ pub struct AiEnrichmentResult {
     pub new_persons: Vec<NewPersonRecord>,
     pub tags: Vec<TagPrediction>,
     pub clip_embedding: Option<Vec<f32>>,
-    pub objects: Vec<DetectedObject>,
     pub poses: Vec<DetectedPose>,
 }
 
