@@ -16,3 +16,11 @@ export interface InspectPreview {
   total_items: number;
   items: CandidateItem[];
 }
+
+export interface FolderSuggestion {
+  fullPath: string;
+  displayName: string;
+  isFolder: boolean;
+}
+
+export type UploadMode = 'files' | 'link';
