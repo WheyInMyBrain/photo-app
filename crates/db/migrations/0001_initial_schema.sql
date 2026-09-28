@@ -240,7 +240,48 @@ CREATE INDEX IF NOT EXISTS idx_asset_faces_person_seek
 CREATE INDEX IF NOT EXISTS idx_asset_faces_asset_lookup 
     ON asset_faces(asset_id, bbox_x ASC);
 
+-- ============================================================================
+-- 3.1 DETECTED OBJECTS & INSTANCE SEGMENTATION (USER-SCOPED)
+-- ============================================================================
+CREATE TABLE IF NOT EXISTS asset_objects (
+    id TEXT PRIMARY KEY NOT NULL,
+    asset_id TEXT NOT NULL REFERENCES assets(id) ON DELETE CASCADE,
+    class_id INTEGER NOT NULL,
+    label TEXT NOT NULL,
+    score REAL NOT NULL,
+    bbox_x REAL NOT NULL,
+    bbox_y REAL NOT NULL,
+    bbox_w REAL NOT NULL,
+    bbox_h REAL NOT NULL,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
 
+CREATE INDEX IF NOT EXISTS idx_asset_objects_asset_lookup 
+    ON asset_objects(asset_id, bbox_x ASC);
+
+CREATE INDEX IF NOT EXISTS idx_asset_objects_label_score 
+    ON asset_objects(label COLLATE NOCASE, score DESC);
+
+
+-- ============================================================================
+-- 3.2 HUMAN POSES & SKELETON KEYPOINTS (USER-SCOPED)
+-- ============================================================================
+CREATE TABLE IF NOT EXISTS asset_poses (
+    id TEXT PRIMARY KEY NOT NULL,
+    asset_id TEXT NOT NULL REFERENCES assets(id) ON DELETE CASCADE,
+    score REAL NOT NULL,
+    bbox_x REAL NOT NULL,
+    bbox_y REAL NOT NULL,
+    bbox_w REAL NOT NULL,
+    bbox_h REAL NOT NULL,
+    keypoints JSON NOT NULL, -- Serialized JSON array: [{"x": 0.5, "y": 0.2, "score": 0.9}, ...]
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_asset_poses_asset 
+    ON asset_poses(asset_id);
+
+    
 -- ============================================================================
 -- 4. ALBUMS TABLES (USER-SCOPED)
 -- ============================================================================

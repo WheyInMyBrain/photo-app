@@ -418,17 +418,6 @@ impl AlbumRepo {
         Ok(removed as usize)
     }
 
-    /// Delete an album (cascade removes join rows)
-    pub async fn delete_album(pool: &SqlitePool, album_id: &str, user_id: &str) -> Result<bool> {
-        let res = sqlx::query("DELETE FROM albums WHERE id = ?1 AND user_id = ?2")
-            .bind(album_id)
-            .bind(user_id)
-            .execute(pool)
-            .await?;
-
-        Ok(res.rows_affected() > 0)
-    }
-
     /// Set an explicit cover photo for an album
     pub async fn set_cover(
         pool: &SqlitePool,
@@ -515,5 +504,200 @@ impl AlbumRepo {
         }
 
         Ok(())
+    }
+
+    pub async fn update_album(
+        pool: &SqlitePool,
+        user_id: &str,
+        album_id: &str,
+        title: &str,
+        description: Option<&str>,
+    ) -> Result<bool, sqlx::Error> {
+        let rows = sqlx::query(
+            r#"
+            UPDATE albums
+            SET title = ?1, description = ?2, updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?3 AND user_id = ?4
+            "#,
+        )
+        .bind(title.trim())
+        .bind(description)
+        .bind(album_id)
+        .bind(user_id)
+        .execute(pool)
+        .await?;
+
+        Ok(rows.rows_affected() > 0)
+    }
+
+    /// Set an explicit cover photo asset for an album
+    pub async fn set_cover_asset(
+        pool: &SqlitePool,
+        user_id: &str,
+        album_id: &str,
+        asset_id: &str,
+    ) -> Result<bool, sqlx::Error> {
+        let rows = sqlx::query(
+            r#"
+            UPDATE albums
+            SET cover_asset_id = ?1, updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?2 AND user_id = ?3
+            "#,
+        )
+        .bind(asset_id)
+        .bind(album_id)
+        .bind(user_id)
+        .execute(pool)
+        .await?;
+
+        Ok(rows.rows_affected() > 0)
+    }
+
+    /// Remove specific assets from an album (only removes the link in album_assets)
+    pub async fn remove_assets_from_album(
+        pool: &SqlitePool,
+        user_id: &str,
+        album_id: &str,
+        asset_ids: &[String],
+    ) -> Result<u64, sqlx::Error> {
+        if asset_ids.is_empty() {
+            return Ok(0);
+        }
+
+        // Verify user owns the album
+        let owner: Option<String> = sqlx::query_scalar(
+            "SELECT id FROM albums WHERE id = ?1 AND user_id = ?2"
+        )
+        .bind(album_id)
+        .bind(user_id)
+        .fetch_optional(pool)
+        .await?;
+
+        if owner.is_none() {
+            return Ok(0);
+        }
+
+        let mut tx = pool.begin().await?;
+        let mut removed = 0u64;
+
+        for id in asset_ids {
+            let res = sqlx::query(
+                "DELETE FROM album_assets WHERE album_id = ?1 AND asset_id = ?2"
+            )
+            .bind(album_id)
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+            removed += res.rows_affected();
+        }
+
+        // If the removed asset was the explicit cover, clear cover_asset_id
+        sqlx::query(
+            r#"
+            UPDATE albums
+            SET cover_asset_id = NULL
+            WHERE id = ?1 AND cover_asset_id IN (SELECT value FROM json_each(?2))
+            "#
+        )
+        .bind(album_id)
+        .bind(serde_json::to_string(asset_ids).unwrap_or_default())
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+        Ok(removed)
+    }
+
+    /// Reorder assets in an album by writing index positions
+    pub async fn reorder_album_assets(
+        pool: &SqlitePool,
+        user_id: &str,
+        album_id: &str,
+        ordered_asset_ids: &[String],
+    ) -> Result<(), sqlx::Error> {
+        let is_owner: Option<String> = sqlx::query_scalar(
+            "SELECT id FROM albums WHERE id = ?1 AND user_id = ?2"
+        )
+        .bind(album_id)
+        .bind(user_id)
+        .fetch_optional(pool)
+        .await?;
+
+        if is_owner.is_none() {
+            return Err(sqlx::Error::RowNotFound);
+        }
+
+        let mut tx = pool.begin().await?;
+        for (idx, asset_id) in ordered_asset_ids.iter().enumerate() {
+            sqlx::query(
+                r#"
+                UPDATE album_assets
+                SET position = ?1
+                WHERE album_id = ?2 AND asset_id = ?3
+                "#,
+            )
+            .bind(idx as i64)
+            .bind(album_id)
+            .bind(asset_id)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Delete an album.
+    /// If `delete_media` is true, moves all contained assets to trash (is_deleted = 1).
+    pub async fn delete_album(
+        pool: &SqlitePool,
+        user_id: &str,
+        album_id: &str,
+        delete_media: bool,
+    ) -> Result<bool, sqlx::Error> {
+        let mut tx = pool.begin().await?;
+
+        let owner_check: Option<String> = sqlx::query_scalar(
+            "SELECT id FROM albums WHERE id = ?1 AND user_id = ?2"
+        )
+        .bind(album_id)
+        .bind(user_id)
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        if owner_check.is_none() {
+            return Ok(false);
+        }
+
+        if delete_media {
+            // Mark all items in this album as deleted (moves them to trash)
+            sqlx::query(
+                r#"
+                UPDATE assets
+                SET is_deleted = 1, deleted_at = CURRENT_TIMESTAMP
+                WHERE user_id = ?1 AND id IN (
+                    SELECT asset_id FROM album_assets WHERE album_id = ?2
+                )
+                "#,
+            )
+            .bind(user_id)
+            .bind(album_id)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        // Delete linkages and album entry
+        sqlx::query("DELETE FROM album_assets WHERE album_id = ?1")
+            .bind(album_id)
+            .execute(&mut *tx)
+            .await?;
+
+        let res = sqlx::query("DELETE FROM albums WHERE id = ?1 AND user_id = ?2")
+            .bind(album_id)
+            .bind(user_id)
+            .execute(&mut *tx)
+            .await?;
+
+        tx.commit().await?;
+        Ok(res.rows_affected() > 0)
     }
 }

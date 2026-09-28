@@ -521,6 +521,42 @@ impl QueueService {
             .map(|t| IngestionTagInput::new_ai(t.name, t.confidence))
             .collect();
 
+        // 1. Map YOLO detected segmentation bounding boxes
+        let objects = res
+            .objects
+            .into_iter()
+            .map(|obj| db::ingestion_repo::IngestionDetectedObject {
+                id: uuid::Uuid::new_v4().to_string(),
+                class_id: obj.class_id as i32,
+                label: obj.label,
+                score: obj.score,
+                bbox_x: obj.x,
+                bbox_y: obj.y,
+                bbox_w: obj.w,
+                bbox_h: obj.h,
+            })
+            .collect();
+
+        // 2. Map YOLO detected human poses & keypoints
+        let poses = res
+            .poses
+            .into_iter()
+            .map(|pose| {
+                let keypoints_json = serde_json::to_string(&pose.keypoints)
+                    .unwrap_or_else(|_| "[]".to_string());
+
+                db::ingestion_repo::IngestionDetectedPose {
+                    id: uuid::Uuid::new_v4().to_string(),
+                    score: pose.score,
+                    bbox_x: pose.x,
+                    bbox_y: pose.y,
+                    bbox_w: pose.w,
+                    bbox_h: pose.h,
+                    keypoints_json,
+                }
+            })
+            .collect();
+
         let payload = db::AiEnrichmentPayload {
             asset_id: job.asset_id.clone(),
             user_id: job.user_id.clone(),
@@ -558,6 +594,8 @@ impl QueueService {
                     embedding: face.embedding,
                 })
                 .collect(),
+            objects,
+            poses,
             tags: ai_tags,
         };
 

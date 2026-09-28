@@ -1,6 +1,19 @@
+<!-- photo-app/frontend/src/lib/components/PhotoModal.svelte -->
 <script lang="ts">
   import { onMount, onDestroy, createEventDispatcher } from 'svelte';
-  import type { FaceDetail, TagItem, SimilarItem, PersonCandidate } from '$lib/types/modal';
+  import { filterStore } from '$lib/stores/filterStore';
+  import { deleteFace } from '$lib/api/people';
+  import {
+    fetchAssetObjects,
+    fetchAssetPoses,
+    fetchAssetTags,
+    fetchSimilarAssets,
+    toggleAssetFavorite,
+    type AssetObjectDetail,
+    type AssetPoseDetail,
+    type SimilarMediaItem
+  } from '$lib/api/assets';
+  import type { FaceDetail, TagItem, PersonCandidate } from '$lib/types/modal';
   import { createModalGestureController } from '$lib/utils/modalGestures';
   import PhotoDetailsSheet from './PhotoDetailsSheet.svelte';
 
@@ -14,6 +27,7 @@
     is_favorite?: boolean | number;
     latitude?: number | null;
     longitude?: number | null;
+    aspect_ratio?: number | null;
   } | null = null;
 
   export let hasPrev = false;
@@ -26,26 +40,135 @@
     next: void;
     toggleFavorite: { id: string; is_favorite: boolean };
     selectAsset: { id: string };
+    setAsCover: { id: string; thumb_path: string };
   }>();
 
   let isMorphing = Boolean(initialRect);
   let isHighResLoaded = false;
   let viewportEl: HTMLDivElement;
 
-  // Sidebar Data
+  // Viewport & Image Sizing (for pixel-accurate stage alignment)
+  let containerW = 0;
+  let containerH = 0;
+  let naturalW = 0;
+  let naturalH = 0;
+
+  // Layer Toggles (controlled from sidebar)
+  let showFaces = true;
+  let showObjects = true;
+  let showPoses = true;
+
+  // Sidebar & Overlay Data
   let showMobileInfo = false;
   let isFavorite = false;
   let faces: FaceDetail[] = [];
+  let objects: AssetObjectDetail[] = [];
+  let poses: AssetPoseDetail[] = [];
   let tags: TagItem[] = [];
-  let similarItems: SimilarItem[] = [];
+  let similarItems: SimilarMediaItem[] = [];
   let knownPeople: PersonCandidate[] = [];
   let loadingDetails = true;
   let loadingSimilar = true;
-  let showBoxes = true;
   let detailAbortCtrl: AbortController | null = null;
+
+  // =========================================================================
+  // COCO 17 Keypoints Anatomical Color Palette
+  // =========================================================================
+  // Keypoint Indices:
+  // 0: Nose, 1: L-Eye, 2: R-Eye, 3: L-Ear, 4: R-Ear
+  // 5: L-Shoulder, 6: R-Shoulder, 7: L-Elbow, 8: R-Elbow, 9: L-Wrist, 10: R-Wrist
+  // 11: L-Hip, 12: R-Hip, 13: L-Knee, 14: R-Knee, 15: L-Ankle, 16: R-Ankle
+
+  const KEYPOINT_COLORS: Record<number, string> = {
+    0: '#f59e0b', // Nose (Amber)
+    1: '#fbbf24', // Left Eye (Amber Light)
+    2: '#fbbf24', // Right Eye
+    3: '#fde68a', // Left Ear
+    4: '#fde68a', // Right Ear
+    5: '#06b6d4', // Left Shoulder (Cyan)
+    6: '#3b82f6', // Right Shoulder (Blue)
+    7: '#22d3ee', // Left Elbow
+    8: '#60a5fa', // Right Elbow
+    9: '#67e8f9', // Left Wrist
+    10: '#93c5fd', // Right Wrist
+    11: '#f43f5e', // Left Hip (Rose)
+    12: '#a855f7', // Right Hip (Purple)
+    13: '#fb7185', // Left Knee
+    14: '#c084fc', // Right Knee
+    15: '#fda4af', // Left Ankle
+    16: '#e9d5ff'  // Right Ankle
+  };
+
+  // Structured Anatomical Bones: [start_index, end_index, stroke_color]
+  const SKELETON_BONES: Array<[number, number, string]> = [
+    // Head / Facial Features (Amber)
+    [0, 1, '#fbbf24'],
+    [0, 2, '#fbbf24'],
+    [1, 3, '#f59e0b'],
+    [2, 4, '#f59e0b'],
+    [1, 2, '#fcd34d'],
+
+    // Torso Frame (Emerald)
+    [5, 6, '#10b981'],
+    [5, 11, '#10b981'],
+    [6, 12, '#10b981'],
+    [11, 12, '#059669'],
+
+    // Left Arm (Cyan / Teal)
+    [5, 7, '#06b6d4'],
+    [7, 9, '#22d3ee'],
+
+    // Right Arm (Electric Blue)
+    [6, 8, '#3b82f6'],
+    [8, 10, '#60a5fa'],
+
+    // Left Leg (Crimson / Rose)
+    [11, 13, '#f43f5e'],
+    [13, 15, '#fb7185'],
+
+    // Right Leg (Purple / Violet)
+    [12, 14, '#a855f7'],
+    [14, 16, '#c084fc']
+  ];
 
   $: isMotionMedia =
     Boolean(asset?.mime_type?.startsWith('video/')) || asset?.mime_type === 'image/gif';
+
+  // Compute the exact sub-rect where the image is drawn within the letterboxed container
+  $: imageStage = (() => {
+    if (!containerW || !containerH) {
+      return { width: 0, height: 0, left: 0, top: 0, ready: false };
+    }
+
+    const ratio = naturalW > 0 && naturalH > 0
+      ? naturalW / naturalH
+      : (asset?.aspect_ratio && asset.aspect_ratio > 0 ? asset.aspect_ratio : 1.0);
+
+    const cRatio = containerW / containerH;
+    let w: number;
+    let h: number;
+
+    if (cRatio > ratio) {
+      // Container is wider than photo: pillarbox (black bars on left & right)
+      h = containerH;
+      w = h * ratio;
+    } else {
+      // Container is taller than photo: letterbox (black bars on top & bottom)
+      w = containerW;
+      h = w / ratio;
+    }
+
+    const left = (containerW - w) / 2;
+    const top = (containerH - h) / 2;
+
+    return {
+      width: Math.round(w),
+      height: Math.round(h),
+      left: Math.round(left),
+      top: Math.round(top),
+      ready: true
+    };
+  })();
 
   const gestures = createModalGestureController({
     onPrev: () => dispatch('prev'),
@@ -67,6 +190,8 @@
     isFavorite = Boolean(asset.is_favorite);
     showMobileInfo = false;
     isHighResLoaded = false;
+    naturalW = 0;
+    naturalH = 0;
     gestures.resetZoom();
     loadDetails(asset.id);
   }
@@ -81,7 +206,7 @@
       });
     }
 
-    fetch('/api/persons/names')
+    fetch('/api/persons/names', { credentials: 'include' })
       .then((res) => (res.ok ? res.json() : []))
       .then((data) => (knownPeople = data))
       .catch(() => {});
@@ -102,16 +227,23 @@
     loadingSimilar = true;
 
     try {
-      const [fRes, tRes, sRes] = await Promise.all([
-        fetch(`/api/assets/${id}/faces`, { signal: detailAbortCtrl.signal }),
-        fetch(`/api/assets/${id}/tags`, { signal: detailAbortCtrl.signal }),
-        fetch(`/api/assets/${id}/similar`, { signal: detailAbortCtrl.signal })
+      const [fRes, oData, pData, tData, sData] = await Promise.all([
+        fetch(`/api/assets/${id}/faces`, { signal: detailAbortCtrl.signal, credentials: 'include' }),
+        fetchAssetObjects(id, detailAbortCtrl.signal),
+        fetchAssetPoses(id, detailAbortCtrl.signal),
+        fetchAssetTags(id, detailAbortCtrl.signal),
+        fetchSimilarAssets(id, detailAbortCtrl.signal)
       ]);
+
       faces = fRes.ok ? await fRes.json() : [];
-      tags = tRes.ok ? await tRes.json() : [];
-      similarItems = sRes.ok ? await sRes.json() : [];
+      objects = oData;
+      poses = pData;
+      tags = tData;
+      similarItems = sData;
     } catch {
       faces = [];
+      objects = [];
+      poses = [];
       tags = [];
       similarItems = [];
     } finally {
@@ -120,18 +252,16 @@
     }
   }
 
-  async function toggleFavorite() {
+  async function handleToggleFavorite() {
     if (!asset) return;
+    const prev = isFavorite;
     isFavorite = !isFavorite;
     try {
-      const res = await fetch(`/api/assets/${asset.id}/favorite`, { method: 'POST' });
-      if (res.ok) {
-        const data = await res.json();
-        isFavorite = Boolean(data.is_favorite);
-        dispatch('toggleFavorite', { id: asset.id, is_favorite: isFavorite });
-      }
+      const data = await toggleAssetFavorite(asset.id);
+      isFavorite = Boolean(data.is_favorite);
+      dispatch('toggleFavorite', { id: asset.id, is_favorite: isFavorite });
     } catch {
-      isFavorite = !isFavorite;
+      isFavorite = prev;
     }
   }
 
@@ -143,6 +273,7 @@
       const res = await fetch(`/api/faces/${face.face_id}/reassign`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
+        credentials: 'include',
         body: JSON.stringify({ target_person_id: matched.id })
       });
       if (res.ok) {
@@ -154,6 +285,7 @@
       const res = await fetch(`/api/persons/${face.person_id}/name`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
+        credentials: 'include',
         body: JSON.stringify({ name: cleanName })
       });
       if (res.ok) {
@@ -163,6 +295,16 @@
           knownPeople = [...knownPeople, { id: face.person_id, name: cleanName }];
         }
       }
+    }
+  }
+
+  async function handleDeleteFace(e: CustomEvent<{ faceId: string }>) {
+    const { faceId } = e.detail;
+    try {
+      await deleteFace(faceId);
+      faces = faces.filter((f) => f.face_id !== faceId);
+    } catch (err) {
+      console.error('Failed to delete face:', err);
     }
   }
 
@@ -176,7 +318,7 @@
     } else if (key === 'arrowright' && hasNext) {
       dispatch('next');
     } else if (key === 'f') {
-      toggleFavorite();
+      handleToggleFavorite();
     } else if (key === '0') {
       gestures.resetZoom();
     }
@@ -208,10 +350,10 @@
 
 {#if asset}
   <div
-    class="fixed inset-0 z-50 flex flex-col md:flex-row select-none overflow-hidden backdrop-blur-2xl transition-colors duration-300 bg-[var(--bg-primary)]/90 text-[var(--text-main)]"
+    class="fixed inset-0 z-50 flex flex-col md:flex-row select-none overflow-hidden backdrop-blur-2xl transition-colors duration-300 bg-[var(--bg-primary)]/92 text-[var(--text-main)]"
     style="opacity: {Math.max(0.15, 1 - gestures.getDismissProgress() * 0.85)};"
   >
-    <!-- Top Action Bar -->
+    <!-- Top Floating Glass Navigation Header -->
     <div
       class="absolute top-0 inset-x-0 z-30 flex items-center justify-between px-4 py-3 pt-[max(0.75rem,var(--sat))] bg-gradient-to-b from-[var(--bg-primary)] via-[var(--bg-primary)]/40 to-transparent pointer-events-none transition-opacity duration-150"
       style="opacity: {1 - gestures.getDismissProgress() * 1.5};"
@@ -219,19 +361,35 @@
       <button
         type="button"
         on:click={() => dispatch('close')}
-        class="pointer-events-auto glass-panel text-[var(--text-main)] p-2.5 rounded-full spring-tap cursor-pointer shadow-lg"
+        class="pointer-events-auto liquid-icon-btn w-9 h-9 rounded-full flex items-center justify-center text-white/70 hover:text-white spring-tap cursor-pointer"
         title="Close (Esc)"
-        aria-label="Close photo preview"
+        aria-label="Close preview"
       >
-        ✕
+        <svg xmlns="http://www.w3.org/2000/svg" class="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+          <line x1="18" y1="6" x2="6" y2="18"></line>
+          <line x1="6" y1="6" x2="18" y2="18"></line>
+        </svg>
       </button>
 
       <div class="pointer-events-auto flex items-center gap-2">
+        {#if $filterStore.album_id}
+          <button
+            type="button"
+            on:click={() => {
+              if (asset) dispatch('setAsCover', { id: asset.id, thumb_path: asset.thumb_path });
+            }}
+            class="liquid-btn text-xs px-3 py-1.5 rounded-full text-white/80 hover:text-white transition-all spring-tap cursor-pointer"
+            title="Make this photo the album cover"
+          >
+            Set as Cover
+          </button>
+        {/if}
+
         {#if gestures.getScale() > 1.05}
           <button
             type="button"
             on:click={() => gestures.resetZoom()}
-            class="glass-panel text-xs px-3 py-1.5 rounded-full text-[var(--text-main)] font-mono shadow-lg cursor-pointer"
+            class="liquid-btn text-xs px-3 py-1.5 rounded-full text-white/80 font-mono cursor-pointer"
           >
             {Math.round(gestures.getScale() * 100)}%
           </button>
@@ -239,21 +397,27 @@
 
         <button
           type="button"
-          on:click={toggleFavorite}
-          class="glass-panel text-sm p-2.5 rounded-full spring-tap cursor-pointer shadow-lg {isFavorite ? 'text-amber-400' : 'text-[var(--text-muted)] hover:text-[var(--text-main)]'}"
+          on:click={handleToggleFavorite}
+          class="liquid-icon-btn w-9 h-9 rounded-full flex items-center justify-center spring-tap cursor-pointer {isFavorite ? 'text-amber-300 liquid-fav-active' : 'text-white/60 hover:text-white'}"
           title="Toggle Favorite"
           aria-label="Toggle Favorite"
         >
-          ★
+          <svg xmlns="http://www.w3.org/2000/svg" class="w-4 h-4 {isFavorite ? 'fill-amber-300 stroke-amber-300' : 'fill-none stroke-current'}" viewBox="0 0 24 24" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"></polygon>
+          </svg>
         </button>
 
         <button
           type="button"
           on:click={() => (showMobileInfo = !showMobileInfo)}
-          class="md:hidden glass-panel text-xs font-serif font-bold p-2.5 rounded-full text-[var(--text-main)] spring-tap cursor-pointer w-9 h-9 flex items-center justify-center shadow-lg {showMobileInfo ? 'text-purple-500 border-purple-500/80' : ''}"
+          class="md:hidden liquid-icon-btn w-9 h-9 rounded-full flex items-center justify-center text-white/80 spring-tap cursor-pointer {showMobileInfo ? 'border-white/30 bg-white/15' : ''}"
           aria-label="Toggle photo details"
         >
-          ℹ
+          <svg xmlns="http://www.w3.org/2000/svg" class="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <circle cx="12" cy="12" r="10"></circle>
+            <line x1="12" y1="16" x2="12" y2="12"></line>
+            <line x1="12" y1="8" x2="12.01" y2="8"></line>
+          </svg>
         </button>
       </div>
     </div>
@@ -271,15 +435,17 @@
       on:touchend={gestures.handleTouchEnd}
       on:dblclick={(e) => gestures.handleDoubleTap(e.clientX, e.clientY, viewportEl.getBoundingClientRect())}
     >
-      <!-- Desktop & Tablet Chevron Buttons -->
+      <!-- Navigation Chevrons -->
       {#if hasPrev && gestures.getDismissOffsetY() === 0}
         <button
           type="button"
           on:click|stopPropagation={() => dispatch('prev')}
-          class="hidden md:flex absolute left-6 z-30 text-[var(--text-main)] glass-panel p-3.5 rounded-full spring-tap cursor-pointer shadow-xl items-center justify-center"
+          class="hidden md:flex absolute left-6 z-30 liquid-icon-btn w-11 h-11 rounded-full text-white/80 hover:text-white spring-tap cursor-pointer items-center justify-center"
           aria-label="Previous photo"
         >
-          ‹
+          <svg xmlns="http://www.w3.org/2000/svg" class="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2.5">
+            <polyline points="15 18 9 12 15 6"></polyline>
+          </svg>
         </button>
       {/if}
 
@@ -287,14 +453,16 @@
         <button
           type="button"
           on:click|stopPropagation={() => dispatch('next')}
-          class="hidden md:flex absolute right-6 z-30 text-[var(--text-main)] glass-panel p-3.5 rounded-full spring-tap cursor-pointer shadow-xl items-center justify-center"
+          class="hidden md:flex absolute right-6 z-30 liquid-icon-btn w-11 h-11 rounded-full text-white/80 hover:text-white spring-tap cursor-pointer items-center justify-center"
           aria-label="Next photo"
         >
-          ›
+          <svg xmlns="http://www.w3.org/2000/svg" class="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2.5">
+            <polyline points="9 18 15 12 9 6"></polyline>
+          </svg>
         </button>
       {/if}
 
-      <!-- Mobile Tap Zones (Left 20% / Right 20%) -->
+      <!-- Mobile Tap Zones -->
       {#if gestures.getScale() <= 1.05 && gestures.getDismissOffsetY() === 0}
         {#if hasPrev}
           <div
@@ -319,7 +487,7 @@
         {/if}
       {/if}
 
-      <!-- Full-Screen Media Canvas Container -->
+      <!-- Media Canvas Container -->
       <div
         class="w-full h-full flex items-center justify-center {isMorphing ? 'transition-all duration-300 ease-[cubic-bezier(0.32,0.72,0,1)]' : ''}"
         style={heroStyle}
@@ -338,12 +506,23 @@
             <track kind="captions" />
           </video>
         {:else}
-          <div class="relative w-full h-full flex items-center justify-center">
-            <!-- Layer 1: Instant Cached Thumbnail Base -->
+          <!-- Letterbox Canvas Area with Client Rect Observer -->
+          <div
+            class="relative w-full h-full flex items-center justify-center overflow-hidden"
+            bind:clientWidth={containerW}
+            bind:clientHeight={containerH}
+          >
+            <!-- Layer 1: Instant Cached Base -->
             <img
               src={resolveUrl(asset.thumb_path)}
               alt=""
               aria-hidden="true"
+              on:load={(e) => {
+                if (!naturalW) {
+                  naturalW = e.currentTarget.naturalWidth;
+                  naturalH = e.currentTarget.naturalHeight;
+                }
+              }}
               class="w-full h-full object-contain block select-none pointer-events-none"
             />
 
@@ -352,49 +531,190 @@
               src="/api/assets/{asset.id}/stream"
               alt={asset.file_name}
               decoding="async"
-              on:load={() => (isHighResLoaded = true)}
+              on:load={(e) => {
+                isHighResLoaded = true;
+                naturalW = e.currentTarget.naturalWidth;
+                naturalH = e.currentTarget.naturalHeight;
+              }}
               class="absolute inset-0 w-full h-full object-contain select-none pointer-events-none transition-opacity duration-300 ease-out {isHighResLoaded ? 'opacity-100' : 'opacity-0'}"
             />
 
-            {#if showBoxes && gestures.getScale() <= 1.05 && gestures.getDismissOffsetY() === 0}
-              {#each faces as f (f.face_id)}
-                <button
-                  type="button"
-                  class="absolute border border-purple-400/90 bg-purple-400/15 rounded-md cursor-pointer group z-10 hover:border-purple-300 hover:bg-purple-400/25 transition-colors shadow-sm"
-                  style="left: {f.bbox_x * 100}%; top: {f.bbox_y * 100}%; width: {f.bbox_w * 100}%; height: {f.bbox_h * 100}%;"
-                  on:click|stopPropagation={() => (showMobileInfo = true)}
-                  aria-label="View face details for {f.person_name || 'Unnamed'}"
-                >
-                  <span
-                    class="absolute -bottom-6 left-1/2 -translate-x-1/2 glass-panel text-[10px] text-purple-400 px-2 py-0.5 rounded-full shadow-lg whitespace-nowrap opacity-90 group-hover:opacity-100 font-medium pointer-events-none"
+            <!-- ================================================================= -->
+            <!-- AI OVERLAYS: Strictly Locked to the Rendered Photo Rect           -->
+            <!-- ================================================================= -->
+            {#if imageStage.ready && gestures.getScale() <= 1.05 && gestures.getDismissOffsetY() === 0}
+              <div
+                class="absolute pointer-events-none overflow-hidden"
+                style="width: {imageStage.width}px; height: {imageStage.height}px; left: {imageStage.left}px; top: {imageStage.top}px;"
+              >
+                <!-- 1. Detected Faces -->
+                {#if showFaces}
+                  {#each faces as f (f.face_id)}
+                    <button
+                      type="button"
+                      class="absolute pointer-events-auto border border-purple-400/90 bg-purple-500/15 rounded-lg cursor-pointer group z-10 hover:border-purple-300 hover:bg-purple-500/25 transition-all shadow-sm"
+                      style="left: {f.bbox_x * 100}%; top: {f.bbox_y * 100}%; width: {f.bbox_w * 100}%; height: {f.bbox_h * 100}%;"
+                      on:click|stopPropagation={() => (showMobileInfo = true)}
+                      aria-label="View face details for {f.person_name || 'Unnamed'}"
+                    >
+                      <span
+                        class="absolute -bottom-6 left-1/2 -translate-x-1/2 liquid-tag text-[10px] text-purple-200 px-2 py-0.5 rounded-full shadow-lg whitespace-nowrap opacity-90 group-hover:opacity-100 font-medium pointer-events-none font-mono"
+                      >
+                        👤 {f.person_name || 'Unnamed'}
+                      </span>
+                    </button>
+                  {/each}
+                {/if}
+
+                <!-- 2. YOLO Detected Objects (Segmentation Boxes) -->
+                {#if showObjects}
+                  {#each objects as obj (obj.id)}
+                    <div
+                      class="absolute border border-cyan-400/80 bg-cyan-500/15 rounded-lg pointer-events-none z-10 shadow-sm"
+                      style="left: {obj.bbox_x * 100}%; top: {obj.bbox_y * 100}%; width: {obj.bbox_w * 100}%; height: {obj.bbox_h * 100}%;"
+                    >
+                      <span
+                        class="absolute -top-5 left-0 liquid-tag text-[9px] text-cyan-200 px-1.5 py-0.5 rounded-md shadow-md whitespace-nowrap font-mono tracking-tight"
+                      >
+                        {obj.label} {Math.round(obj.score * 100)}%
+                      </span>
+                    </div>
+                  {/each}
+                {/if}
+
+                <!-- 3. YOLO Human Pose Estimation (Anatomically Colored Bones & Joints) -->
+                {#if showPoses && poses.length > 0}
+                  <svg
+                    class="absolute inset-0 w-full h-full pointer-events-none z-20"
+                    viewBox="0 0 100 100"
+                    preserveAspectRatio="none"
                   >
-                    {f.person_name || 'Unnamed'}
-                  </span>
-                </button>
-              {/each}
+                    <defs>
+                      <filter id="bone-glow" x="-20%" y="-20%" width="140%" height="140%">
+                        <feDropShadow dx="0" dy="0" stdDeviation="0.25" flood-color="#000" flood-opacity="0.8" />
+                      </filter>
+                    </defs>
+
+                    {#each poses as pose (pose.id)}
+                      <!-- Anatomically Grouped Bone Connections -->
+                      {#each SKELETON_BONES as [i, j, boneColor]}
+                        {#if pose.keypoints[i] && pose.keypoints[j] && pose.keypoints[i].score > 0.35 && pose.keypoints[j].score > 0.35}
+                          <!-- Dark drop-shadow bone backing for high contrast on any background -->
+                          <line
+                            x1={pose.keypoints[i].x * 100}
+                            y1={pose.keypoints[i].y * 100}
+                            x2={pose.keypoints[j].x * 100}
+                            y2={pose.keypoints[j].y * 100}
+                            stroke="rgba(0, 0, 0, 0.65)"
+                            stroke-width="0.8"
+                            stroke-linecap="round"
+                          />
+                          <!-- Foreground Color Bone -->
+                          <line
+                            x1={pose.keypoints[i].x * 100}
+                            y1={pose.keypoints[i].y * 100}
+                            x2={pose.keypoints[j].x * 100}
+                            y2={pose.keypoints[j].y * 100}
+                            stroke={boneColor}
+                            stroke-width="0.45"
+                            stroke-linecap="round"
+                            filter="url(#bone-glow)"
+                          />
+                        {/if}
+                      {/each}
+
+                      <!-- Anatomically Grouped Joint Keypoints -->
+                      {#each pose.keypoints as kp, idx}
+                        {#if kp.score > 0.35}
+                          <!-- Joint Outer Ring -->
+                          <circle
+                            cx={kp.x * 100}
+                            cy={kp.y * 100}
+                            r="0.75"
+                            fill={KEYPOINT_COLORS[idx] || '#ffffff'}
+                            stroke="rgba(0, 0, 0, 0.75)"
+                            stroke-width="0.18"
+                          />
+                          <!-- Joint Core Highlight -->
+                          <circle
+                            cx={kp.x * 100}
+                            cy={kp.y * 100}
+                            r="0.25"
+                            fill="#ffffff"
+                          />
+                        {/if}
+                      {/each}
+                    {/each}
+                  </svg>
+                {/if}
+              </div>
             {/if}
           </div>
         {/if}
       </div>
     </div>
 
-    <!-- Metadata Details Sheet -->
+    <!-- Metadata Details Sheet / Sidebar -->
     <PhotoDetailsSheet
       {asset}
       {isFavorite}
       {faces}
+      {objects}
+      {poses}
       {tags}
       {similarItems}
       {knownPeople}
       {loadingDetails}
       {loadingSimilar}
-      {showBoxes}
+      {showFaces}
+      {showObjects}
+      {showPoses}
       {showMobileInfo}
-      on:toggleFavorite={toggleFavorite}
-      on:toggleBoxes={() => (showBoxes = !showBoxes)}
+      on:toggleFavorite={handleToggleFavorite}
+      on:toggleFaces={() => (showFaces = !showFaces)}
+      on:toggleObjects={() => (showObjects = !showObjects)}
+      on:togglePoses={() => (showPoses = !showPoses)}
       on:closeMobile={() => (showMobileInfo = false)}
       on:selectAsset={(e) => dispatch('selectAsset', e.detail)}
       on:saveFaceName={handleSaveFaceName}
+      on:deleteFace={handleDeleteFace}
     />
   </div>
 {/if}
+
+<style>
+  .liquid-btn {
+    background: rgba(255, 255, 255, 0.08);
+    border: 1px solid rgba(255, 255, 255, 0.14);
+    box-shadow: 0 4px 14px rgba(0, 0, 0, 0.3), inset 0 1px 0 rgba(255, 255, 255, 0.25);
+  }
+
+  .liquid-btn:hover {
+    background: rgba(255, 255, 255, 0.14);
+    border-color: rgba(255, 255, 255, 0.24);
+  }
+
+  .liquid-icon-btn {
+    background: rgba(20, 20, 24, 0.6);
+    border: 1px solid rgba(255, 255, 255, 0.14);
+    backdrop-filter: blur(20px) saturate(180%);
+    box-shadow: 0 4px 14px rgba(0, 0, 0, 0.35), inset 0 1px 0 rgba(255, 255, 255, 0.25);
+  }
+
+  .liquid-icon-btn:hover {
+    background: rgba(255, 255, 255, 0.12);
+    border-color: rgba(255, 255, 255, 0.25);
+  }
+
+  .liquid-fav-active {
+    background: rgba(245, 158, 11, 0.15);
+    border-color: rgba(245, 158, 11, 0.35);
+    box-shadow: 0 4px 14px rgba(245, 158, 11, 0.2), inset 0 1px 0 rgba(255, 255, 255, 0.3);
+  }
+
+  .liquid-tag {
+    background: rgba(15, 15, 20, 0.88);
+    border: 1px solid rgba(255, 255, 255, 0.18);
+    backdrop-filter: blur(14px);
+  }
+</style>

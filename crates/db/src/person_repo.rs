@@ -141,6 +141,110 @@ impl PersonRepo {
         Ok(affected_ids)
     }
 
+    /// Deletes a person identity completely.
+    /// Unlinks all associated faces and removes the person record.
+    /// Returns affected asset IDs for search re-indexing.
+    pub async fn delete_person(
+        pool: &SqlitePool,
+        user_id: &str,
+        person_id: &str,
+    ) -> Result<Vec<String>, sqlx::Error> {
+        let mut tx = pool.begin().await?;
+
+        let person_exists: bool = sqlx::query_scalar::<_, i64>(
+            "SELECT 1 FROM persons WHERE id = ?1 AND user_id = ?2"
+        )
+        .bind(person_id)
+        .bind(user_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .is_some();
+
+        if !person_exists {
+            return Err(sqlx::Error::RowNotFound);
+        }
+
+        // Collect all assets associated with this person to refresh FTS indices
+        let affected_asset_ids: Vec<String> = sqlx::query_scalar(
+            r#"
+            SELECT DISTINCT af.asset_id 
+            FROM asset_faces af
+            JOIN assets a ON af.asset_id = a.id
+            WHERE af.person_id = ?1 AND a.user_id = ?2
+            "#
+        )
+        .bind(person_id)
+        .bind(user_id)
+        .fetch_all(&mut *tx)
+        .await?;
+
+        // Nullify person_id references on faces
+        sqlx::query("UPDATE asset_faces SET person_id = NULL WHERE person_id = ?1")
+            .bind(person_id)
+            .execute(&mut *tx)
+            .await?;
+
+        // Delete the person entry
+        sqlx::query("DELETE FROM persons WHERE id = ?1 AND user_id = ?2")
+            .bind(person_id)
+            .bind(user_id)
+            .execute(&mut *tx)
+            .await?;
+
+        tx.commit().await?;
+        Ok(affected_asset_ids)
+    }
+
+    /// Deletes a single face detection entry entirely (e.g. background person or false detection)
+    pub async fn delete_face(
+        pool: &SqlitePool,
+        user_id: &str,
+        face_id: &str,
+    ) -> Result<(String, Option<String>), sqlx::Error> {
+        let mut tx = pool.begin().await?;
+
+        let row = sqlx::query(
+            r#"
+            SELECT af.asset_id, af.person_id, af.face_thumb_path
+            FROM asset_faces af
+            JOIN assets a ON af.asset_id = a.id
+            WHERE af.id = ?1 AND a.user_id = ?2
+            "#,
+        )
+        .bind(face_id)
+        .bind(user_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or(sqlx::Error::RowNotFound)?;
+
+        let asset_id: String = row.get("asset_id");
+        let person_id: Option<String> = row.get("person_id");
+        let face_thumb_path: Option<String> = row.get("face_thumb_path");
+
+        // Delete from asset_faces
+        sqlx::query("DELETE FROM asset_faces WHERE id = ?1")
+            .bind(face_id)
+            .execute(&mut *tx)
+            .await?;
+
+        // Recompute cluster if it was linked to a person
+        if let Some(ref pid) = person_id {
+            Self::recompute_cluster_centroid(&mut tx, user_id, pid).await?;
+        }
+
+        tx.commit().await?;
+
+        // Best effort removal of physical face crop from disk
+        if let Some(thumb) = face_thumb_path {
+            let path = std::path::Path::new(&thumb);
+            if path.exists() {
+                let _ = tokio::fs::remove_file(path).await;
+            }
+        }
+
+        Ok((asset_id, person_id))
+    }
+
     pub async fn verify_face(pool: &SqlitePool, user_id: &str, face_id: &str) -> Result<(), sqlx::Error> {
         let res = sqlx::query(
             r#"

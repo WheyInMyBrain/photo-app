@@ -212,3 +212,28 @@ pub struct MapLocationsQuery {
     pub max_lng: Option<f64>,
     pub folder_path: Option<String>,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct AssetObjectDetail {
+    pub id: String,
+    pub asset_id: String,
+    pub class_id: i32,
+    pub label: String,
+    pub score: f32,
+    pub bbox_x: f32,
+    pub bbox_y: f32,
+    pub bbox_w: f32,
+    pub bbox_h: f32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct AssetPoseDetail {
+    pub id: String,
+    pub asset_id: String,
+    pub score: f32,
+    pub bbox_x: f32,
+    pub bbox_y: f32,
+    pub bbox_w: f32,
+    pub bbox_h: f32,
+    pub keypoints: serde_json::Value,
+}

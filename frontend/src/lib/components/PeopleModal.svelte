@@ -4,6 +4,15 @@
   import { browser } from '$app/environment';
   import { filterStore } from '$lib/stores/filterStore';
   import { authStore } from '$lib/stores/authStore';
+  import {
+    fetchPeopleOverview,
+    fetchNamesDirectory,
+    renamePerson,
+    mergePersons,
+    deletePerson,
+    type PersonCard,
+    type NameDirectoryItem
+  } from '$lib/api/people';
 
   export let isOpen = false;
 
@@ -12,46 +21,33 @@
     selectPerson: { personId: string };
   }>();
 
-  interface PersonCard {
-    id: string;
-    name: string | null;
-    face_count: number;
-    avatar_thumb: string | null;
-  }
-
-  interface NameDirectoryItem {
-    id: string;
-    name: string | null;
-  }
-
   let people: PersonCard[] = [];
   let nameDirectory: NameDirectoryItem[] = [];
   let isLoading = true;
   let editingId: string | null = null;
   let editingName = '';
 
+  // Drag & drop merge state
   let source: PersonCard | null = null;
   let target: PersonCard | null = null;
   let isMerging = false;
+
+  // Delete person state
+  let personPendingDelete: PersonCard | null = null;
+  let isDeleting = false;
 
   async function loadPeople() {
     if (!browser || !$authStore.isAuthenticated) return;
     isLoading = true;
     try {
-      const [pRes, nRes] = await Promise.all([
-        fetch('/api/smart-albums/people'),
-        fetch('/api/persons/names')
+      const [peopleData, namesData] = await Promise.all([
+        fetchPeopleOverview(),
+        fetchNamesDirectory()
       ]);
-
-      if (pRes.status === 401 || nRes.status === 401) {
-        authStore.checkStatus();
-        return;
-      }
-
-      if (pRes.ok) people = await pRes.json();
-      if (nRes.ok) nameDirectory = await nRes.json();
+      people = peopleData;
+      nameDirectory = namesData;
     } catch (e) {
-      console.error('Failed loading people', e);
+      console.error('Failed loading people:', e);
     } finally {
       isLoading = false;
     }
@@ -72,29 +68,21 @@
 
     if (matched) {
       try {
-        const res = await fetch('/api/persons/merge', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ source_person_id: person.id, target_person_id: matched.id })
-        });
-        if (res.ok) {
-          await loadPeople();
-        }
+        await mergePersons(person.id, matched.id);
+        await loadPeople();
       } catch (err) {
         console.error('Auto-merge failed:', err);
       }
     } else {
-      const res = await fetch(`/api/persons/${person.id}/name`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name: clean })
-      });
-      if (res.ok) {
+      try {
+        await renamePerson(person.id, clean);
         person.name = clean;
         people = [...people];
         if (!nameDirectory.some((n) => n.id === person.id)) {
           nameDirectory = [...nameDirectory, { id: person.id, name: clean }];
         }
+      } catch (err) {
+        console.error('Rename failed:', err);
       }
     }
   }
@@ -103,18 +91,29 @@
     if (!source || !target) return;
     isMerging = true;
     try {
-      const res = await fetch('/api/persons/merge', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ source_person_id: source.id, target_person_id: target.id })
-      });
-      if (res.ok) {
-        source = null;
-        target = null;
-        await loadPeople();
-      }
+      await mergePersons(source.id, target.id);
+      source = null;
+      target = null;
+      await loadPeople();
+    } catch (err) {
+      console.error('Merge failed:', err);
     } finally {
       isMerging = false;
+    }
+  }
+
+  async function confirmDeletePerson() {
+    if (!personPendingDelete) return;
+    isDeleting = true;
+    try {
+      await deletePerson(personPendingDelete.id);
+      people = people.filter((p) => p.id !== personPendingDelete?.id);
+      nameDirectory = nameDirectory.filter((n) => n.id !== personPendingDelete?.id);
+      personPendingDelete = null;
+    } catch (err) {
+      console.error('Delete person failed:', err);
+    } finally {
+      isDeleting = false;
     }
   }
 
@@ -131,7 +130,9 @@
   function handleKeydown(e: KeyboardEvent) {
     if (!isOpen) return;
     if (e.key === 'Escape') {
-      if (source || target) {
+      if (personPendingDelete) {
+        personPendingDelete = null;
+      } else if (source || target) {
         source = null;
         target = null;
       } else if (editingId) {
@@ -174,7 +175,7 @@
             <span>People & Faces</span>
           </h2>
           <p class="text-[11px] text-white/45 mt-0.5 tracking-tight font-normal">
-            Select to filter timeline. Drag a card onto another to merge identities.
+            Select to filter. Drag a card onto another to merge. Tap delete on unwanted background faces.
           </p>
         </div>
 
@@ -221,8 +222,22 @@
                 on:drop={() => { if (source && source.id !== p.id) target = p; }}
                 on:click={() => handleSelect(p)}
                 on:keydown={(e) => e.key === 'Enter' && handleSelect(p)}
-                class="liquid-card rounded-2xl p-3.5 flex flex-col items-center text-center cursor-pointer transition-all spring-tap {isFiltered ? 'liquid-card-selected' : ''}"
+                class="liquid-card group relative rounded-2xl p-3.5 flex flex-col items-center text-center cursor-pointer transition-all spring-tap {isFiltered ? 'liquid-card-selected' : ''}"
               >
+                <!-- Card Actions: Dismiss / Delete Button (Top Right) -->
+                <button
+                  type="button"
+                  on:click|stopPropagation={() => (personPendingDelete = p)}
+                  class="absolute top-2 right-2 w-5 h-5 rounded-full liquid-delete-btn flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity text-white/40 hover:text-rose-300"
+                  title="Remove this identity"
+                  aria-label="Remove identity {p.name || 'Unnamed'}"
+                >
+                  <svg xmlns="http://www.w3.org/2000/svg" class="w-2.5 h-2.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+                    <line x1="18" y1="6" x2="6" y2="18"></line>
+                    <line x1="6" y1="6" x2="18" y2="18"></line>
+                  </svg>
+                </button>
+
                 <!-- Avatar Circle -->
                 <div class="w-16 h-16 sm:w-20 sm:h-20 rounded-full overflow-hidden liquid-avatar-frame mb-2.5 flex items-center justify-center">
                   {#if p.avatar_thumb}
@@ -331,6 +346,46 @@
   </div>
 {/if}
 
+<!-- Delete Confirmation Overlay -->
+{#if personPendingDelete}
+  <div class="fixed inset-0 bg-black/70 backdrop-blur-md flex items-center justify-center p-4 z-[60]">
+    <div class="liquid-modal rounded-3xl p-6 max-w-xs w-full space-y-3.5 text-center">
+      <div class="w-10 h-10 rounded-full liquid-icon-plate flex items-center justify-center text-rose-300 mx-auto">
+        <svg xmlns="http://www.w3.org/2000/svg" class="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <polyline points="3 6 5 6 21 6"></polyline>
+          <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path>
+        </svg>
+      </div>
+
+      <h3 class="text-sm font-semibold tracking-tight text-white">Remove Identity?</h3>
+      <p class="text-xs text-white/60 leading-relaxed">
+        Remove <span class="text-white font-medium">{personPendingDelete.name || 'Unnamed Person'}</span>?
+      </p>
+      <p class="text-[10px] text-white/40 font-mono">
+        Original photos will NOT be deleted. Only this identity group and face bindings are removed.
+      </p>
+
+      <div class="flex justify-end gap-2 pt-2">
+        <button
+          type="button"
+          on:click={() => (personPendingDelete = null)}
+          class="liquid-btn-secondary px-3.5 py-1.5 rounded-xl text-xs text-white/60 hover:text-white transition-all spring-tap cursor-pointer"
+        >
+          Cancel
+        </button>
+        <button
+          type="button"
+          on:click={confirmDeletePerson}
+          disabled={isDeleting}
+          class="liquid-btn-danger px-4 py-1.5 rounded-xl text-xs font-medium text-rose-200 transition-all spring-tap cursor-pointer disabled:opacity-40"
+        >
+          {isDeleting ? 'Removing...' : 'Remove'}
+        </button>
+      </div>
+    </div>
+  </div>
+{/if}
+
 <style>
   /* Apple Liquid-Glass Framework */
   .liquid-modal {
@@ -361,6 +416,16 @@
     box-shadow:
       0 4px 16px rgba(0, 0, 0, 0.4),
       inset 0 1px 0 rgba(255, 255, 255, 0.35);
+  }
+
+  .liquid-delete-btn {
+    background: rgba(0, 0, 0, 0.5);
+    border: 1px solid rgba(255, 255, 255, 0.12);
+  }
+
+  .liquid-delete-btn:hover {
+    background: rgba(244, 63, 94, 0.25);
+    border-color: rgba(244, 63, 94, 0.4);
   }
 
   .liquid-avatar-frame {
@@ -406,6 +471,19 @@
     box-shadow:
       0 6px 18px rgba(0, 0, 0, 0.4),
       inset 0 1px 0 rgba(255, 255, 255, 0.45);
+  }
+
+  .liquid-btn-danger {
+    background: rgba(244, 63, 94, 0.2);
+    border: 1px solid rgba(244, 63, 94, 0.35);
+    box-shadow:
+      0 4px 14px rgba(0, 0, 0, 0.3),
+      inset 0 1px 0 rgba(255, 255, 255, 0.2);
+  }
+
+  .liquid-btn-danger:hover:not(:disabled) {
+    background: rgba(244, 63, 94, 0.32);
+    border-color: rgba(244, 63, 94, 0.5);
   }
 
   .liquid-btn-secondary {

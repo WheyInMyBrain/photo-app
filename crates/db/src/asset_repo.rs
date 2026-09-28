@@ -6,6 +6,7 @@ use crate::domain::media::{
     AssetStorageInfo, MediaPageResponse, MediaQuery, SubAlbum, MediaSection,
     NewAssetRecord, DynamicFiltersResponse, FilterOption, AssetCacheMetadata,
     RawMediaRow, MediaItemSummary, MapLocationPoint, MapLocationsQuery,
+    AssetObjectDetail, AssetPoseDetail, 
 };
 
 pub struct AssetRepo;
@@ -1110,5 +1111,92 @@ impl AssetRepo {
             .await?;
 
         Ok(points)
+    }
+
+    /// Query detected YOLO objects for a specific asset scoped to the user
+    pub async fn get_asset_objects(
+        pool: &sqlx::SqlitePool,
+        user_id: &str,
+        asset_id: &str,
+    ) -> Result<Vec<AssetObjectDetail>, sqlx::Error> {
+        let rows = sqlx::query_as::<_, AssetObjectDetail>(
+            r#"
+            SELECT 
+                ao.id,
+                ao.asset_id,
+                ao.class_id,
+                ao.label,
+                ao.score,
+                ao.bbox_x,
+                ao.bbox_y,
+                ao.bbox_w,
+                ao.bbox_h
+            FROM asset_objects ao
+            JOIN assets a ON ao.asset_id = a.id
+            WHERE ao.asset_id = ?1
+              AND a.user_id = ?2
+              AND a.deleted_at IS NULL
+            ORDER BY ao.score DESC
+            "#,
+        )
+        .bind(asset_id)
+        .bind(user_id)
+        .fetch_all(pool)
+        .await?;
+
+        Ok(rows)
+    }
+
+    /// Query detected human poses with keypoints for a specific asset scoped to the user
+    pub async fn get_asset_poses(
+        pool: &sqlx::SqlitePool,
+        user_id: &str,
+        asset_id: &str,
+    ) -> Result<Vec<AssetPoseDetail>, sqlx::Error> {
+        let rows = sqlx::query(
+            r#"
+            SELECT 
+                ap.id,
+                ap.asset_id,
+                ap.score,
+                ap.bbox_x,
+                ap.bbox_y,
+                ap.bbox_w,
+                ap.bbox_h,
+                ap.keypoints
+            FROM asset_poses ap
+            JOIN assets a ON ap.asset_id = a.id
+            WHERE ap.asset_id = ?1
+              AND a.user_id = ?2
+              AND a.deleted_at IS NULL
+            ORDER BY ap.score DESC
+            "#,
+        )
+        .bind(asset_id)
+        .bind(user_id)
+        .fetch_all(pool)
+        .await?;
+
+        let poses = rows
+            .into_iter()
+            .map(|r| {
+                let keypoints_raw: String = r.get("keypoints");
+                let keypoints_json: serde_json::Value =
+                    serde_json::from_str(&keypoints_raw).unwrap_or_else(|_| serde_json::json!([]));
+
+                AssetPoseDetail {
+                    id: r.get("id"),
+                    asset_id: r.get("asset_id"),
+                    score: r.get("score"),
+                    bbox_x: r.get("bbox_x"),
+                    bbox_y: r.get("bbox_y"),
+                    bbox_w: r.get("bbox_w"),
+                    bbox_h: r.get("bbox_h"),
+                    keypoints: keypoints_json,
+                }
+            })
+            .collect();
+
+        Ok(poses)
     }
 }

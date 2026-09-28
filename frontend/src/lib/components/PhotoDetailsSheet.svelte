@@ -1,9 +1,10 @@
-<!-- photo-app/frontend/src/lib/components/PhotoDetailsSidebar.svelte -->
+<!-- photo-app/frontend/src/lib/components/PhotoDetailsSheet.svelte -->
 <script lang="ts">
   import { createEventDispatcher, onDestroy } from 'svelte';
   import { browser } from '$app/environment';
   import { modalStore } from '$lib/stores/modalStore';
-  import type { FaceDetail, TagItem, SimilarItem, PersonCandidate } from '$lib/types/modal';
+  import type { FaceDetail, TagItem, PersonCandidate } from '$lib/types/modal';
+  import type { AssetPoseDetail, SimilarMediaItem } from '$lib/api/assets';
 
   export let asset: {
     id: string;
@@ -14,20 +15,26 @@
   };
   export let isFavorite = false;
   export let faces: FaceDetail[] = [];
+  export let poses: AssetPoseDetail[] = [];
   export let tags: TagItem[] = [];
-  export let similarItems: SimilarItem[] = [];
+  export let similarItems: SimilarMediaItem[] = [];
   export let knownPeople: PersonCandidate[] = [];
   export let loadingDetails = false;
   export let loadingSimilar = false;
-  export let showBoxes = true;
+
+  // Defaults to deselected / off for a clean initial view
+  export let showFaces = false;
+  export let showPoses = false;
   export let showMobileInfo = false;
 
   const dispatch = createEventDispatcher<{
     toggleFavorite: void;
-    toggleBoxes: void;
+    toggleFaces: void;
+    togglePoses: void;
     closeMobile: void;
     selectAsset: { id: string };
     saveFaceName: { face: FaceDetail; cleanName: string };
+    deleteFace: { faceId: string };
   }>();
 
   let editingFaceId: string | null = null;
@@ -126,7 +133,7 @@
 <aside
   class="
     fixed md:static inset-x-0 bottom-0 z-50 md:z-auto
-    w-full md:w-84 h-[74vh] md:h-full
+    w-full md:w-88 h-[75vh] md:h-full
     liquid-sidebar
     p-5 pb-[max(1.5rem,var(--sab))]
     flex flex-col justify-between overflow-y-auto space-y-5 flex-shrink-0
@@ -196,17 +203,29 @@
       </div>
     {/if}
 
-    <!-- Detected People & Faces -->
+    <!-- 1. Detected People & Faces -->
     <div class="space-y-2">
       <div class="flex items-center justify-between px-0.5">
-        <span class="text-[9px] uppercase tracking-wider font-semibold text-white/40">People</span>
+        <div class="flex items-center gap-1.5">
+          <span class="text-[9px] uppercase tracking-wider font-semibold text-white/40">People & Faces</span>
+          {#if faces.length > 0}
+            <span class="text-[9px] font-mono px-1.5 py-0.2 rounded-full bg-purple-500/20 text-purple-300 border border-purple-500/30">
+              {faces.length}
+            </span>
+          {/if}
+        </div>
+
         {#if faces.length > 0}
           <button
             type="button"
-            on:click={() => dispatch('toggleBoxes')}
-            class="text-[10px] text-white/50 hover:text-white transition-colors cursor-pointer"
+            role="switch"
+            aria-checked={showFaces}
+            on:click={() => dispatch('toggleFaces')}
+            class="switch-track {showFaces ? 'switch-active-purple' : ''}"
+            title={showFaces ? 'Hide face boxes' : 'Show face boxes'}
+            aria-label="Toggle face bounding boxes"
           >
-            {showBoxes ? 'Hide markers' : 'Show markers'}
+            <span class="switch-thumb {showFaces ? 'translate-x-3.5 bg-purple-200' : 'translate-x-0.5 bg-white/40'}"></span>
           </button>
         {/if}
       </div>
@@ -218,7 +237,7 @@
       {:else}
         <div class="space-y-1.5">
           {#each faces as f (f.face_id)}
-            <div class="liquid-card flex items-center gap-2.5 p-2 rounded-xl">
+            <div class="liquid-card group flex items-center gap-2.5 p-2 rounded-xl">
               <img
                 src={resolveUrl(f.face_thumb_path)}
                 alt=""
@@ -242,21 +261,36 @@
                 {:else}
                   <div class="flex items-center justify-between">
                     <span class="text-xs font-medium text-white/90 truncate">{f.person_name || 'Unnamed'}</span>
-                    <button
-                      type="button"
-                      on:click={() => {
-                        editingFaceId = f.face_id;
-                        editingName = f.person_name ?? '';
-                      }}
-                      class="text-white/40 hover:text-white ml-1 cursor-pointer p-0.5 transition-colors spring-tap"
-                      title="Rename"
-                      aria-label="Rename face"
-                    >
-                      <svg xmlns="http://www.w3.org/2000/svg" class="w-3 h-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                        <path d="M12 20h9"></path>
-                        <path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"></path>
-                      </svg>
-                    </button>
+                    <div class="flex items-center gap-1">
+                      <button
+                        type="button"
+                        on:click={() => {
+                          editingFaceId = f.face_id;
+                          editingName = f.person_name ?? '';
+                        }}
+                        class="text-white/40 hover:text-white cursor-pointer p-0.5 transition-colors spring-tap"
+                        title="Rename person"
+                        aria-label="Rename face"
+                      >
+                        <svg xmlns="http://www.w3.org/2000/svg" class="w-3 h-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                          <path d="M12 20h9"></path>
+                          <path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"></path>
+                        </svg>
+                      </button>
+
+                      <button
+                        type="button"
+                        on:click={() => dispatch('deleteFace', { faceId: f.face_id })}
+                        class="text-white/30 hover:text-rose-300 cursor-pointer p-0.5 transition-colors spring-tap opacity-0 group-hover:opacity-100"
+                        title="Dismiss face detection"
+                        aria-label="Remove face detection"
+                      >
+                        <svg xmlns="http://www.w3.org/2000/svg" class="w-3 h-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+                          <line x1="18" y1="6" x2="6" y2="18"></line>
+                          <line x1="6" y1="6" x2="18" y2="18"></line>
+                        </svg>
+                      </button>
+                    </div>
                   </div>
                 {/if}
               </div>
@@ -266,7 +300,37 @@
       {/if}
     </div>
 
-    <!-- AI & Ingested Tags -->
+    <!-- 2. Human Pose Skeletons -->
+    {#if poses.length > 0}
+      <div class="space-y-1.5">
+        <div class="flex items-center justify-between px-0.5">
+          <div class="flex items-center gap-1.5">
+            <span class="text-[9px] uppercase tracking-wider font-semibold text-white/40">Human Pose</span>
+            <span class="text-[9px] font-mono px-1.5 py-0.2 rounded-full bg-emerald-500/20 text-emerald-300 border border-emerald-500/30">
+              {poses.length}
+            </span>
+          </div>
+
+          <button
+            type="button"
+            role="switch"
+            aria-checked={showPoses}
+            on:click={() => dispatch('togglePoses')}
+            class="switch-track {showPoses ? 'switch-active-emerald' : ''}"
+            title={showPoses ? 'Hide pose skeleton' : 'Show pose skeleton'}
+            aria-label="Toggle pose skeleton"
+          >
+            <span class="switch-thumb {showPoses ? 'translate-x-3.5 bg-emerald-200' : 'translate-x-0.5 bg-white/40'}"></span>
+          </button>
+        </div>
+
+        <p class="text-[10px] text-white/45 font-mono px-0.5">
+          {poses.length} {poses.length === 1 ? 'person skeleton' : 'skeletons'} detected (17 keypoints)
+        </p>
+      </div>
+    {/if}
+
+    <!-- 3. Tags (Open-Vocabulary / General Tagging) -->
     <div class="space-y-1.5">
       <span class="text-[9px] uppercase tracking-wider font-semibold text-white/40 block pl-0.5">Tags</span>
       {#if loadingDetails}
@@ -284,7 +348,7 @@
       {/if}
     </div>
 
-    <!-- Visually Similar Media (CLIP) -->
+    <!-- 4. Visually Similar Media -->
     <div class="border-t border-white/[0.08] pt-3.5 space-y-2">
       <div class="flex items-center justify-between px-0.5">
         <span class="text-[9px] uppercase tracking-wider font-semibold text-white/40">Similar Media</span>
@@ -334,7 +398,53 @@
 </aside>
 
 <style>
-  /* Apple Liquid-Glass Framework */
+  /* ========================================================================= */
+  /* Liquid Micro Toggle Switches                                              */
+  /* ========================================================================= */
+  .switch-track {
+    position: relative;
+    display: inline-flex;
+    align-items: center;
+    width: 28px;
+    height: 16px;
+    border-radius: 9999px;
+    background: rgba(255, 255, 255, 0.08);
+    border: 1px solid rgba(255, 255, 255, 0.16);
+    box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.4);
+    cursor: pointer;
+    transition: all 0.22s cubic-bezier(0.34, 1.56, 0.64, 1);
+    outline: none;
+    flex-shrink: 0;
+  }
+
+  .switch-track:hover {
+    background: rgba(255, 255, 255, 0.12);
+    border-color: rgba(255, 255, 255, 0.24);
+  }
+
+  .switch-thumb {
+    width: 11px;
+    height: 11px;
+    border-radius: 9999px;
+    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.45);
+    transition: transform 0.22s cubic-bezier(0.34, 1.56, 0.64, 1), background-color 0.22s ease;
+  }
+
+  .switch-active-purple {
+    background: rgba(168, 85, 247, 0.25);
+    border-color: rgba(168, 85, 247, 0.55);
+    box-shadow: 0 0 8px rgba(168, 85, 247, 0.3), inset 0 1px 2px rgba(0, 0, 0, 0.3);
+  }
+
+  .switch-active-emerald {
+    background: rgba(16, 185, 129, 0.25);
+    border-color: rgba(16, 185, 129, 0.55);
+    box-shadow: 0 0 8px rgba(16, 185, 129, 0.3), inset 0 1px 2px rgba(0, 0, 0, 0.3);
+  }
+
+  /* ========================================================================= */
+  /* Sidebar and Container Components                                          */
+  /* ========================================================================= */
   .liquid-sidebar {
     background: rgba(18, 18, 22, 0.72);
     border-color: rgba(255, 255, 255, 0.1);
@@ -378,7 +488,7 @@
 
   .liquid-map-frame {
     border: 1px solid rgba(255, 255, 255, 0.12);
-    box-shadow: 
+    box-shadow:
       0 4px 16px rgba(0, 0, 0, 0.35),
       inset 0 1px 0 rgba(255, 255, 255, 0.2);
   }
@@ -402,10 +512,6 @@
     background: rgba(0, 0, 0, 0.4);
     border: 1px solid rgba(255, 255, 255, 0.2);
     box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.4);
-  }
-
-  .liquid-input:focus {
-    border-color: rgba(255, 255, 255, 0.3);
   }
 
   .liquid-chip {

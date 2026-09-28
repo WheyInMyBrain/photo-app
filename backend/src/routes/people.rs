@@ -63,6 +63,26 @@ pub async fn name_person(
     Ok(Json(true))
 }
 
+/// DELETE /api/persons/{id} or POST /api/persons/{id}/delete
+pub async fn delete_person(
+    State(state): State<AppState>,
+    auth_user: AuthUser,
+    AxumPath(person_id): AxumPath<String>,
+) -> Result<Json<bool>, AppError> {
+    let affected_assets = PersonRepo::delete_person(&state.db, &auth_user.id, &person_id)
+        .await
+        .map_err(|e| match e {
+            sqlx::Error::RowNotFound => AppError::NotFound("Person not found".into()),
+            _ => AppError::Internal(e.to_string()),
+        })?;
+
+    for aid in affected_assets {
+        let _ = AssetRepo::sync_search_index(&state.db, &auth_user.id, &aid).await;
+    }
+
+    Ok(Json(true))
+}
+
 #[derive(Deserialize)]
 pub struct ReassignFacePayload {
     pub target_person_id: String,
@@ -98,6 +118,25 @@ pub async fn verify_face(
     PersonRepo::verify_face(&state.db, &auth_user.id, &face_id)
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?;
+
+    Ok(Json(true))
+}
+
+/// DELETE /api/faces/{face_id} or POST /api/faces/{face_id}/delete
+/// Removes a stray face detection (e.g. background crowd or false positive)
+pub async fn delete_face(
+    State(state): State<AppState>,
+    auth_user: AuthUser,
+    AxumPath(face_id): AxumPath<String>,
+) -> Result<Json<bool>, AppError> {
+    let (asset_id, _) = PersonRepo::delete_face(&state.db, &auth_user.id, &face_id)
+        .await
+        .map_err(|e| match e {
+            sqlx::Error::RowNotFound => AppError::NotFound("Face not found".into()),
+            _ => AppError::Internal(e.to_string()),
+        })?;
+
+    let _ = AssetRepo::sync_search_index(&state.db, &auth_user.id, &asset_id).await;
 
     Ok(Json(true))
 }

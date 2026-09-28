@@ -1,3 +1,4 @@
+// photo-app/crates/media_processing/src/lib.rs
 pub mod clip_engine;
 pub mod clustering;
 pub mod face_detector;
@@ -11,6 +12,8 @@ pub mod tag_engine;
 pub mod video_processor;
 pub mod clip_cache;
 pub mod simd;
+pub mod yolo_detector;
+pub mod yolo_engine;
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -18,6 +21,7 @@ use std::sync::Arc;
 
 pub use clip_engine::ClipEngine;
 pub use face_engine::FaceEngine;
+pub use yolo_engine::YoloEngine;
 pub use metadata::{ExtractedMetadata, MetadataService};
 pub use models::*;
 pub use storage::StorageService;
@@ -33,6 +37,7 @@ pub struct MediaEngine {
     pub face_engine: Arc<FaceEngine>,
     pub tag_engine: Arc<TagEngine>,
     pub clip_engine: Arc<ClipEngine>,
+    pub yolo_engine: Arc<YoloEngine>,
 }
 
 impl MediaEngine {
@@ -40,11 +45,13 @@ impl MediaEngine {
         face_engine: Arc<FaceEngine>,
         tag_engine: Arc<TagEngine>,
         clip_engine: Arc<ClipEngine>,
+        yolo_engine: Arc<YoloEngine>,
     ) -> Self {
         Self {
             face_engine,
             tag_engine,
             clip_engine,
+            yolo_engine,
         }
     }
 
@@ -199,11 +206,9 @@ impl MediaEngine {
         thumbs_root: &Path,
         existing_clusters: Vec<KnownPersonCluster>,
     ) -> Result<AiEnrichmentResult, Box<dyn std::error::Error + Send + Sync>> {
-        // Look for the preview generated in Phase 1 (e.g. {shard}/{asset_id}_preview.webp or .jpg)
         let candidate_preview = shard_dir.join(format!("{}_preview.webp", asset_id));
         let candidate_preview_jpg = shard_dir.join(format!("{}_preview.jpg", asset_id));
 
-        // Use the lightweight preview if present; otherwise fall back to the original file
         let source_path = if candidate_preview.exists() {
             &candidate_preview
         } else if candidate_preview_jpg.exists() {
@@ -212,17 +217,19 @@ impl MediaEngine {
             disk_path
         };
 
-        // Decodes a small ~1080p preview in ~5ms instead of a 48MP raw image
         let img = image_processor::ImageProcessor::load_image(source_path)?;
 
-        // 1. Tags
-        let tags = self.tag_engine.tag_image(&img, 0.35)
+        // 1. General Classification Tags
+        let tag_predictions = self.tag_engine.tag_image(&img, 0.35)
             .unwrap_or_default()
             .into_iter()
             .map(|(name, confidence)| TagPrediction { name, confidence })
-            .collect();
+            .collect::<Vec<_>>();
 
-        // 2. Face Detection & Clustering
+        // 2. YOLO Human Pose Estimation
+        let poses = self.yolo_engine.detect_poses(&img, 0.45, 0.45).unwrap_or_default();
+
+        // 3. Face Detection & Clustering
         let faces_res = FaceClusterer::cluster_single_image(
             &img,
             &self.face_engine,
@@ -230,15 +237,17 @@ impl MediaEngine {
             existing_clusters,
         )?;
 
-        // 3. Visual CLIP Embedding
+        // 4. Visual CLIP Embedding
         let clip_embedding = self.clip_engine.extract_image_embedding(&img).ok();
 
         Ok(AiEnrichmentResult {
             detected_faces: faces_res.detected_faces,
             updated_clusters: faces_res.updated_clusters,
             new_persons: faces_res.new_persons,
-            tags,
+            tags: tag_predictions,
             clip_embedding,
+            objects: Vec::new(),
+            poses,
         })
     }
 
@@ -250,7 +259,6 @@ impl MediaEngine {
         thumbs_root: &Path,
         existing_clusters: Vec<KnownPersonCluster>,
     ) -> Result<AiEnrichmentResult, Box<dyn std::error::Error + Send + Sync>> {
-        // Determine whether to sample from the lightweight 720p H.264 preview or the original
         let candidate_preview_mp4 = shard_dir.join(format!("{}_preview.mp4", asset_id));
         let video_source = if candidate_preview_mp4.exists() {
             &candidate_preview_mp4
@@ -258,7 +266,6 @@ impl MediaEngine {
             disk_path
         };
 
-        // Extract metadata for duration
         let v_meta = video_processor::VideoProcessor::extract_metadata(video_source)
             .or_else(|_| video_processor::VideoProcessor::extract_metadata(disk_path))?;
 
@@ -270,25 +277,29 @@ impl MediaEngine {
             1
         };
 
-        // Samples 720p frames rapidly from the preview mp4
         let sampled_frames = video_processor::VideoProcessor::sample_frames(
             video_source,
             v_meta.duration_seconds,
             sample_count,
         );
 
-        // 1. Tags across sampled frames
+        // 1. General Tags & Human Poses across sampled frames
         let mut tag_map: HashMap<String, f32> = HashMap::new();
+        let mut all_poses = Vec::new();
+
         for frame in &sampled_frames {
             if let Ok(predictions) = self.tag_engine.tag_image(frame, 0.35) {
                 for (name, conf) in predictions {
                     let entry = tag_map.entry(name).or_insert(conf);
-                    if conf > *entry {
-                        *entry = conf;
-                    }
+                    if conf > *entry { *entry = conf; }
                 }
             }
+
+            if let Ok(poses) = self.yolo_engine.detect_poses(frame, 0.45, 0.45) {
+                all_poses.extend(poses);
+            }
         }
+
         let tags = tag_map
             .into_iter()
             .map(|(name, confidence)| TagPrediction { name, confidence })
@@ -311,6 +322,8 @@ impl MediaEngine {
             new_persons: faces_res.new_persons,
             tags,
             clip_embedding,
+            objects: Vec::new(),
+            poses: all_poses,
         })
     }
 }

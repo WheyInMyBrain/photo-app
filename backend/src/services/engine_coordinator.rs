@@ -8,7 +8,7 @@ use tracing::info;
 use crate::services::clip_cache::load_clip_cache;
 use crate::services::cluster_cache::{ClusterCacheManager, SharedClusterCache};
 
-use media_processing::{ClipCacheManager, ClipEngine, FaceEngine, MediaEngine, TagEngine};
+use media_processing::{ClipCacheManager, ClipEngine, FaceEngine, MediaEngine, TagEngine, YoloEngine};
 
 /// Generic container that manages a resource's lazy loading and idle eviction.
 struct ManagedResource<T> {
@@ -295,7 +295,8 @@ impl EngineCoordinator {
                     let face = Arc::new(FaceEngine::init(&m_dir).map_err(|e| e.to_string())?);
                     let tag = Arc::new(TagEngine::init(&m_dir).map_err(|e| e.to_string())?);
                     let clip = Arc::new(ClipEngine::init(&m_dir).map_err(|e| e.to_string())?);
-                    Ok(MediaEngine::new(face, tag, clip))
+                    let yolo = Arc::new(YoloEngine::init(&m_dir).map_err(|e| e.to_string())?);
+                    Ok(MediaEngine::new(face, tag, clip, yolo))
                 })
                 .await
                 .map_err(|e| e.to_string())?

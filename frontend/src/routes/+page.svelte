@@ -23,6 +23,7 @@
   import PhotoModal from '$lib/components/PhotoModal.svelte';
   import TimelineScrubber from '$lib/components/TimelineScrubber.svelte';
   import AddToAlbumModal from '$lib/components/AddToAlbumModal.svelte';
+  import ManageAlbumModal from '$lib/components/ManageAlbumModal.svelte';
 
   const timeline = createTimelineStore();
   const { sections, isLoading, hasMore } = timeline;
@@ -37,6 +38,7 @@
   let filterDebounceTimer: ReturnType<typeof setTimeout> | null = null;
   let sseSubscription: { close: () => void } | null = null;
   let showAddToAlbumModal = false;
+  let showManageAlbumModal = false;
 
   $: selectedAsset = resolveAsset($sections, activeCoords);
   $: prevAsset = resolveAsset($sections, getPrevCoords($sections, activeCoords));$: nextAsset = resolveAsset($sections, getNextCoords($sections, activeCoords));
@@ -122,6 +124,21 @@
     activeCoords = [secIdx, itemIdx];
   }
 
+  async function handleRemoveFromAlbum() {
+    if (!$filterStore.album_id || selectedAssetIds.length === 0) return;
+    const ok = await albumStore.removeItems($filterStore.album_id, selectedAssetIds);
+    if (ok) {
+      selection.clearSelection();
+      timeline.fetchMedia($filterQueryString, true);
+      albumStore.load();
+    }
+  }
+
+  async function handleSetCover(assetId: string, thumbPath: string) {
+    if (!$filterStore.album_id) return;
+    await albumStore.setCover($filterStore.album_id, assetId, thumbPath);
+  }
+
   $: if ($filterQueryString !== undefined) {
     if (filterDebounceTimer) clearTimeout(filterDebounceTimer);
     filterDebounceTimer = setTimeout(() => {
@@ -201,13 +218,27 @@
 
       {#if $filterStore.album_id}
         <span class="opacity-40">/</span>
-        <div class="inline-flex items-center gap-1.5 px-2.5 py-0.5 rounded-full bg-purple-500/15 border border-purple-500/30 text-purple-300 font-medium">
-          <span>📁 {currentAlbum?.title || 'Album'}</span>
+        <div class="inline-flex items-center gap-2 px-3 py-1 rounded-full liquid-breadcrumb text-white text-xs">
+          <span class="font-medium truncate max-w-[180px] sm:max-w-[260px]">
+            {currentAlbum?.title || 'Album'}
+          </span>
+
+          <button
+            type="button"
+            on:click={() => (showManageAlbumModal = true)}
+            class="text-white/60 hover:text-white px-1 tracking-widest font-bold cursor-pointer transition-colors"
+            title="Album options (Rename, Delete)"
+            aria-label="Album options"
+          >
+            •••
+          </button>
+
           <button
             type="button"
             on:click={() => filterStore.clearAlbum()}
-            class="hover:text-white transition-colors cursor-pointer ml-1 leading-none text-xs"
+            class="text-white/50 hover:text-white cursor-pointer ml-0.5 leading-none"
             title="Exit album"
+            aria-label="Exit album"
           >
             ✕
           </button>
@@ -222,9 +253,7 @@
     {/if}
   </div>
 
-  <!-- ================================================================= -->
-  <!-- SINGLE UNIFIED ALBUMS SHELF (Shown only in Albums mode at root)   -->
-  <!-- ================================================================= -->
+  <!-- Single Unified Albums Shelf -->
   {#if $filterStore.view_mode === 'albums' && !$filterStore.album_id}
     <div class="space-y-3" in:fade={{ duration: 150 }}>
       <div class="flex items-center justify-between px-1">
@@ -249,7 +278,6 @@
               on:click={() => filterStore.setAlbumId(album.id)}
               class="group text-left p-2.5 rounded-2xl bg-white/5 hover:bg-white/10 border border-[var(--border-glass)] hover:border-purple-500/40 transition-all cursor-pointer flex flex-col gap-2.5 spring-tap"
             >
-              <!-- Album Cover Tile -->
               <div class="w-full aspect-square rounded-xl overflow-hidden bg-black/25 flex items-center justify-center border border-white/5 relative">
                 {#if album.cover_thumb}
                   <img
@@ -266,7 +294,6 @@
                 </div>
               </div>
 
-              <!-- Title & Item Counter -->
               <div class="min-w-0 px-0.5">
                 <div class="text-xs font-semibold truncate text-[var(--text-main)] group-hover:text-purple-400 transition-colors">
                   {album.title}
@@ -282,9 +309,7 @@
     </div>
   {/if}
 
-  <!-- ================================================================= -->
-  <!-- MEDIA TIMELINE GRID                                               -->
-  <!-- ================================================================= -->
+  <!-- Media Timeline Grid -->
   {#if $sections.length === 0 && !$isLoading}
     <div in:fade={{ duration: 150 }} class="flex-1 flex flex-col items-center justify-center text-center py-24 text-[var(--text-muted)] text-xs">
       <div class="text-4xl mb-3 opacity-60">
@@ -299,6 +324,7 @@
       </p>
     </div>
   {:else}
+    <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
     <div
       role="region"
       aria-label="Media timeline grid"
@@ -401,17 +427,16 @@
   on:jump={(e) => scrollToSection(e.detail.index)}
 />
 
-<!-- Batch Action Bar with Add To Album Integration -->
 <BatchActionBar
   count={$selectedCount}
   isActionLoading={$isActionLoading}
   on:toggleDelete={selection.batchToggleDelete}
   on:purge={selection.batchPurge}
   on:addToAlbum={() => (showAddToAlbumModal = true)}
+  on:removeFromAlbum={handleRemoveFromAlbum}
   on:clear={selection.clearSelection}
 />
 
-<!-- Add To Custom Album Modal -->
 {#if showAddToAlbumModal}
   <AddToAlbumModal
     assetIds={selectedAssetIds}
@@ -425,7 +450,17 @@
   />
 {/if}
 
-<!-- Single Asset Lightbox / Viewer Modal -->
+<ManageAlbumModal
+  isOpen={showManageAlbumModal}
+  album={currentAlbum}
+  on:close={() => (showManageAlbumModal = false)}
+  on:updated={() => albumStore.load()}
+  on:deleted={() => {
+    timeline.fetchMedia($filterQueryString, true);
+    albumStore.load();
+  }}
+/>
+
 {#if selectedAsset && activeCoords !== null}
   <PhotoModal
     asset={selectedAsset}
@@ -452,10 +487,20 @@
     on:toggleFavorite={(e) => {
       if (activeCoords) timeline.patchFavorite(activeCoords, e.detail.is_favorite);
     }}
+    on:setAsCover={(e) => {
+      if (selectedAsset) handleSetCover(selectedAsset.id, selectedAsset.thumb_path);
+    }}
   />
 {/if}
 
 <style>
+  .liquid-breadcrumb {
+    background: rgba(255, 255, 255, 0.08);
+    border: 1px solid rgba(255, 255, 255, 0.16);
+    backdrop-filter: blur(20px) saturate(180%);
+    box-shadow: 0 4px 14px rgba(0, 0, 0, 0.25), inset 0 1px 0 rgba(255, 255, 255, 0.25);
+  }
+
   .section-container {
     content-visibility: auto;
     contain-intrinsic-size: auto 380px;

@@ -16,11 +16,14 @@ export interface AlbumRecord {
 
 export async function fetchCustomAlbums(): Promise<AlbumRecord[]> {
   const res = await fetch('/api/albums', { credentials: 'include' });
-  if (!res.ok) throw new Error('Failed to load custom albums');
+  if (!res.ok) throw new Error('Failed to load albums');
   return res.json();
 }
 
-export async function createCustomAlbum(title: string, description?: string): Promise<{ status: string; album_id: string }> {
+export async function createCustomAlbum(
+  title: string,
+  description?: string
+): Promise<{ status: string; album_id: string }> {
   const res = await fetch('/api/albums', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
@@ -29,6 +32,30 @@ export async function createCustomAlbum(title: string, description?: string): Pr
   });
   if (!res.ok) throw new Error('Failed to create album');
   return res.json();
+}
+
+export async function updateAlbumDetails(
+  albumId: string,
+  title: string,
+  description?: string
+): Promise<void> {
+  const res = await fetch(`/api/albums/${albumId}`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    credentials: 'include',
+    body: JSON.stringify({ title, description })
+  });
+  if (!res.ok) throw new Error('Failed to update album details');
+}
+
+export async function setAlbumCover(albumId: string, assetId?: string): Promise<void> {
+  const res = await fetch(`/api/albums/${albumId}/cover`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    credentials: 'include',
+    body: JSON.stringify({ asset_id: assetId ?? null })
+  });
+  if (!res.ok) throw new Error('Failed to update album cover');
 }
 
 export async function addAssetsToAlbum(albumId: string, assetIds: string[]): Promise<void> {
@@ -51,9 +78,20 @@ export async function removeAssetsFromAlbum(albumId: string, assetIds: string[])
   if (!res.ok) throw new Error('Failed to remove assets from album');
 }
 
-export async function deleteCustomAlbum(albumId: string): Promise<void> {
-  const res = await fetch(`/api/albums/${albumId}/delete`, {
-    method: 'POST',
+export async function reorderAlbumAssets(albumId: string, assetIds: string[]): Promise<void> {
+  const res = await fetch(`/api/albums/${albumId}/reorder`, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/json' },
+    credentials: 'include',
+    body: JSON.stringify({ asset_ids: assetIds })
+  });
+  if (!res.ok) throw new Error('Failed to reorder album assets');
+}
+
+export async function deleteCustomAlbum(albumId: string, deleteMedia = false): Promise<void> {
+  // Uses delete_media query param to optionally move assets to trash
+  const res = await fetch(`/api/albums/${albumId}?delete_media=${deleteMedia}`, {
+    method: 'DELETE',
     credentials: 'include'
   });
   if (!res.ok) throw new Error('Failed to delete album');

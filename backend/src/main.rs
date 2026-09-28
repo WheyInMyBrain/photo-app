@@ -7,7 +7,7 @@ mod services;
 use axum::{
     extract::DefaultBodyLimit,
     http::{header, HeaderValue},
-    routing::{get, post},
+    routing::{delete, get, post},
     Extension, Router,
 };
 use config::Config;
@@ -120,6 +120,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/assets/{id}/purge", post(routes::media::hard_delete_asset))
         .route("/api/assets/batch/delete", post(routes::media::batch_toggle_soft_delete))
         .route("/api/assets/batch/purge", post(routes::media::batch_purge_assets))
+        .route("/api/assets/{id}/poses", get(routes::media::get_asset_poses))
 
         // Upload
         .route("/api/upload", post(routes::upload::upload_photo))
@@ -131,29 +132,49 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Event Stream
         .route("/api/events", get(routes::events::stream_events))
 
-        // Folder Structure Custom Albums & Collections
-        .route("/api/albums", get(routes::albums::list_albums).post(routes::albums::create_album))
-        .route("/api/albums/{id}", get(routes::albums::get_album))
+        // Folder Structure, Custom Albums & Collections
+        .route(
+            "/api/albums",
+            get(routes::albums::list_albums).post(routes::albums::create_album),
+        )
+        .route(
+            "/api/albums/{id}",
+            get(routes::albums::get_album)
+                .put(routes::albums::update_album)
+                .delete(routes::albums::delete_album),
+        )
         .route("/api/albums/{id}/assets", post(routes::albums::add_assets_to_album))
         .route("/api/albums/{id}/assets/remove", post(routes::albums::remove_assets_from_album))
-        .route("/api/albums/{id}/cover", post(routes::albums::set_album_cover))
+        .route("/api/albums/{id}/remove-assets", post(routes::albums::remove_assets_from_album))
+        .route(
+            "/api/albums/{id}/cover",
+            post(routes::albums::set_album_cover).put(routes::albums::set_album_cover),
+        )
+        .route(
+            "/api/albums/{id}/reorder",
+            post(routes::albums::reorder_album_assets).put(routes::albums::reorder_album_assets),
+        )
         .route("/api/albums/{id}/delete", post(routes::albums::delete_album))
         .route("/api/albums/suggestions", get(routes::albums::get_folder_suggestions))
 
-        // People & Face Metadata
+        // People & Faces
         .route("/api/smart-albums/people", get(routes::people::get_people_overview))
         .route("/api/assets/{id}/faces", get(routes::people::get_asset_faces))
         .route("/api/persons/{id}/name", post(routes::people::name_person))
+        .route("/api/persons/{id}", delete(routes::people::delete_person))
+        .route("/api/persons/{id}/delete", post(routes::people::delete_person))
         .route("/api/persons/merge", post(routes::people::merge_persons))
+        .route("/api/persons/names", get(routes::people::get_names_directory))
         .route("/api/faces/{face_id}/reassign", post(routes::people::reassign_face))
         .route("/api/faces/{face_id}/verify", post(routes::people::verify_face))
+        .route("/api/faces/{face_id}", delete(routes::people::delete_face))
+        .route("/api/faces/{face_id}/delete", post(routes::people::delete_face))
 
         // Locations & Map data
         .route("/api/media/locations", get(routes::media::get_media_locations))
 
         // Tag Metadata
         .route("/api/assets/{id}/tags", get(routes::tags::get_asset_tags))
-        .route("/api/persons/names", get(routes::people::get_names_directory))
 
         // Static Asset Mounts
         .nest("/users", users_static_router)

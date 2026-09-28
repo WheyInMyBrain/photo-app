@@ -31,17 +31,46 @@ pub struct IngestionDetectedFace {
     pub embedding: Vec<f32>,
 }
 
+// ---------------------------------------------------------------------------
+// NEW YOLO DTOs for Database Ingestion
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone)]
+pub struct IngestionDetectedObject {
+    pub id: String,
+    pub class_id: i32,
+    pub label: String,
+    pub score: f32,
+    pub bbox_x: f32,
+    pub bbox_y: f32,
+    pub bbox_w: f32,
+    pub bbox_h: f32,
+}
+
+#[derive(Debug, Clone)]
+pub struct IngestionDetectedPose {
+    pub id: String,
+    pub score: f32,
+    pub bbox_x: f32,
+    pub bbox_y: f32,
+    pub bbox_w: f32,
+    pub bbox_h: f32,
+    pub keypoints_json: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct IngestionPayload {
     pub asset: NewAssetRecord,
     pub new_persons: Vec<IngestionNewPerson>,
     pub updated_clusters: Vec<IngestionUpdatedCluster>,
     pub detected_faces: Vec<IngestionDetectedFace>,
+    pub objects: Vec<IngestionDetectedObject>,
+    pub poses: Vec<IngestionDetectedPose>,
     pub tags: Vec<IngestionTagInput>,
 }
 
 /// Payload containing exclusively AI inferences produced in the background.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct AiEnrichmentPayload {
     pub asset_id: String,
     pub user_id: String,
@@ -49,6 +78,8 @@ pub struct AiEnrichmentPayload {
     pub new_persons: Vec<IngestionNewPerson>,
     pub updated_clusters: Vec<IngestionUpdatedCluster>,
     pub detected_faces: Vec<IngestionDetectedFace>,
+    pub objects: Vec<IngestionDetectedObject>,
+    pub poses: Vec<IngestionDetectedPose>,
     pub tags: Vec<IngestionTagInput>,
 }
 
@@ -65,7 +96,7 @@ impl IngestionRepo {
         // 1. Insert core asset record
         crate::AssetRepo::insert_asset_tx(&mut *tx, &payload.asset).await?;
 
-        // 2. Batch insert new persons (ON CONFLICT DO NOTHING in case of batch duplicates)
+        // 2. Batch insert new persons
         let new_covers: Vec<(String, String)> = payload
             .new_persons
             .iter()
@@ -83,7 +114,7 @@ impl IngestionRepo {
                 b.push_bind(np.person_id)
                     .push_bind(&payload.asset.user_id)
                     .push_bind(None::<String>)
-                    .push_bind(None::<String>) // NULL so it won't trigger FK on asset_faces
+                    .push_bind(None::<String>)
                     .push_bind(1i32)
                     .push_bind(embedding_bytes);
             });
@@ -116,11 +147,7 @@ impl IngestionRepo {
                 .iter()
                 .filter_map(|f| {
                     let pid = f.person_id.trim();
-                    if pid.is_empty() {
-                        None
-                    } else {
-                        Some(pid.to_string())
-                    }
+                    if pid.is_empty() { None } else { Some(pid.to_string()) }
                 })
                 .collect();
 
@@ -180,7 +207,7 @@ impl IngestionRepo {
             qb.build().execute(&mut *tx).await?;
         }
 
-        // 4b. Backfill cover_face_id on persons now that asset_faces exist
+        // 4b. Backfill cover_face_id on persons
         for (person_id, cover_face_id) in new_covers {
             sqlx::query(
                 r#"
@@ -199,7 +226,48 @@ impl IngestionRepo {
             .await?;
         }
 
-        // 5. Delegate Tags and FTS5 Sync to TagRepo
+        // 5. Batch insert detected objects (YOLO seg boxes)
+        if !payload.objects.is_empty() {
+            let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new(
+                "INSERT INTO asset_objects (id, asset_id, class_id, label, score, bbox_x, bbox_y, bbox_w, bbox_h) ",
+            );
+
+            qb.push_values(payload.objects, |mut b, obj| {
+                b.push_bind(obj.id)
+                    .push_bind(&payload.asset.id)
+                    .push_bind(obj.class_id)
+                    .push_bind(obj.label)
+                    .push_bind(obj.score)
+                    .push_bind(obj.bbox_x)
+                    .push_bind(obj.bbox_y)
+                    .push_bind(obj.bbox_w)
+                    .push_bind(obj.bbox_h);
+            });
+
+            qb.build().execute(&mut *tx).await?;
+        }
+
+        // 6. Batch insert detected poses (YOLO pose keypoints)
+        if !payload.poses.is_empty() {
+            let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new(
+                "INSERT INTO asset_poses (id, asset_id, score, bbox_x, bbox_y, bbox_w, bbox_h, keypoints) ",
+            );
+
+            qb.push_values(payload.poses, |mut b, pose| {
+                b.push_bind(pose.id)
+                    .push_bind(&payload.asset.id)
+                    .push_bind(pose.score)
+                    .push_bind(pose.bbox_x)
+                    .push_bind(pose.bbox_y)
+                    .push_bind(pose.bbox_w)
+                    .push_bind(pose.bbox_h)
+                    .push_bind(pose.keypoints_json);
+            });
+
+            qb.build().execute(&mut *tx).await?;
+        }
+
+        // 7. Delegate Tags and FTS5 Sync to TagRepo
         if !payload.tags.is_empty() {
             TagRepo::save_asset_tags_tx(
                 &mut tx,
@@ -214,7 +282,7 @@ impl IngestionRepo {
         Ok(())
     }
 
-    /// Commits purely the asynchronous AI inferences (faces, clusters, tags, and CLIP vector)
+    /// Commits purely the asynchronous AI inferences (faces, clusters, objects, poses, tags, and CLIP vector)
     /// to an existing asset row without touching base file metadata.
     pub async fn commit_ai_metadata(
         pool: &SqlitePool,
@@ -248,7 +316,7 @@ impl IngestionRepo {
             .await?;
         }
 
-        // 2. Batch insert new persons (cover_face_id is NULL initially)
+        // 2. Batch insert new persons
         let new_covers: Vec<(String, String)> = payload
             .new_persons
             .iter()
@@ -299,11 +367,7 @@ impl IngestionRepo {
                 .iter()
                 .filter_map(|f| {
                     let pid = f.person_id.trim();
-                    if pid.is_empty() {
-                        None
-                    } else {
-                        Some(pid.to_string())
-                    }
+                    if pid.is_empty() { None } else { Some(pid.to_string()) }
                 })
                 .collect();
 
@@ -388,7 +452,60 @@ impl IngestionRepo {
             .await?;
         }
 
-        // 5. Delegate AI Tags and FTS5 Sync to TagRepo
+        // 5. Batch insert detected objects (YOLO seg boxes)
+        if !payload.objects.is_empty() {
+            // Delete prior detections on this asset to maintain idempotency
+            sqlx::query("DELETE FROM asset_objects WHERE asset_id = ?")
+                .bind(&payload.asset_id)
+                .execute(&mut *tx)
+                .await?;
+
+            let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new(
+                "INSERT INTO asset_objects (id, asset_id, class_id, label, score, bbox_x, bbox_y, bbox_w, bbox_h) ",
+            );
+
+            qb.push_values(payload.objects, |mut b, obj| {
+                b.push_bind(obj.id)
+                    .push_bind(&payload.asset_id)
+                    .push_bind(obj.class_id)
+                    .push_bind(obj.label)
+                    .push_bind(obj.score)
+                    .push_bind(obj.bbox_x)
+                    .push_bind(obj.bbox_y)
+                    .push_bind(obj.bbox_w)
+                    .push_bind(obj.bbox_h);
+            });
+
+            qb.build().execute(&mut *tx).await?;
+        }
+
+        // 6. Batch insert detected poses (YOLO pose keypoints)
+        if !payload.poses.is_empty() {
+            // Delete prior poses on this asset to maintain idempotency
+            sqlx::query("DELETE FROM asset_poses WHERE asset_id = ?")
+                .bind(&payload.asset_id)
+                .execute(&mut *tx)
+                .await?;
+
+            let mut qb: QueryBuilder<Sqlite> = QueryBuilder::new(
+                "INSERT INTO asset_poses (id, asset_id, score, bbox_x, bbox_y, bbox_w, bbox_h, keypoints) ",
+            );
+
+            qb.push_values(payload.poses, |mut b, pose| {
+                b.push_bind(pose.id)
+                    .push_bind(&payload.asset_id)
+                    .push_bind(pose.score)
+                    .push_bind(pose.bbox_x)
+                    .push_bind(pose.bbox_y)
+                    .push_bind(pose.bbox_w)
+                    .push_bind(pose.bbox_h)
+                    .push_bind(pose.keypoints_json);
+            });
+
+            qb.build().execute(&mut *tx).await?;
+        }
+
+        // 7. Delegate AI Tags and FTS5 Sync to TagRepo
         if !payload.tags.is_empty() {
             TagRepo::save_asset_tags_tx(
                 &mut tx,

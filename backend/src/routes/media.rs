@@ -10,7 +10,7 @@ use db::AssetRepo;
 use db::domain::{
     BatchActionRequest, BatchActionResponse, DynamicFiltersResponse, FavoriteToggleResponse,
     MediaPageResponse, MediaQuery, SimilarMediaItem, SoftDeleteResponse, MapLocationPoint, 
-    MapLocationsQuery,
+    MapLocationsQuery, AssetPoseDetail
 };
 use crate::error::AppError;
 use crate::middleware::auth::AuthUser;
@@ -326,4 +326,17 @@ pub async fn get_media_locations(
             ))
         }
     }
+}
+
+/// GET /api/assets/:id/poses
+pub async fn get_asset_poses(
+    State(state): State<AppState>,
+    auth_user: AuthUser,
+    AxumPath(asset_id): AxumPath<String>,
+) -> Result<Json<Vec<AssetPoseDetail>>, AppError> {
+    let poses = AssetRepo::get_asset_poses(&state.db, &auth_user.id, &asset_id)
+        .await
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+
+    Ok(Json(poses))
 }
