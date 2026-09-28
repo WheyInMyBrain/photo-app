@@ -2,40 +2,93 @@
 @import 'leaflet/dist/leaflet.css';
 @import 'leaflet.markercluster/dist/MarkerCluster.css';
 
-:root {
+:root,
+[data-theme="light"] {
   /* Dynamic Notch & Home Indicator Safe Insets */
   --sat: env(safe-area-inset-top, 0px);
   --sab: env(safe-area-inset-bottom, 0px);
   --sal: env(safe-area-inset-left, 0px);
   --sar: env(safe-area-inset-right, 0px);
 
-  /* Light Theme Tokens */
+  /* Light Theme Color Tokens */
   --bg-primary: #f8fafc;
-  --bg-surface: rgba(255, 255, 255, 0.72);
-  --bg-surface-elevated: rgba(255, 255, 255, 0.88);
+  --bg-surface: rgba(255, 255, 255, 0.78);
+  --bg-surface-elevated: rgba(255, 255, 255, 0.92);
   --border-glass: rgba(0, 0, 0, 0.08);
   --border-specular: rgba(255, 255, 255, 0.9);
+  --border-subtle: rgba(0, 0, 0, 0.12);
   --text-main: #09090b;
   --text-muted: #64748b;
   --shimmer-1: #e2e8f0;
   --shimmer-2: #f1f5f9;
   --pill-shadow: 0 16px 36px -8px rgba(0, 0, 0, 0.12), 0 4px 12px -2px rgba(0, 0, 0, 0.05);
+
+  /* Liquid Dock & Floating Controls Tokens (Light) */
+  --dock-bg: rgba(255, 255, 255, 0.82);
+  --dock-bg-hover: rgba(255, 255, 255, 0.95);
+  --dock-border: rgba(0, 0, 0, 0.08);
+  --dock-border-hover: rgba(0, 0, 0, 0.14);
+  --dock-shadow: rgba(0, 0, 0, 0.08);
+  --dock-highlight: rgba(255, 255, 255, 0.95);
+  --pill-bg: rgba(0, 0, 0, 0.06);
+  --pill-border: rgba(0, 0, 0, 0.09);
+  --card-bg: rgba(0, 0, 0, 0.03);
+  --card-border: rgba(0, 0, 0, 0.07);
 }
 
 @media (prefers-color-scheme: dark) {
-  :root {
+  :root:not([data-theme="light"]) {
     /* High-End OLED Dark Tokens */
     --bg-primary: #000000;
     --bg-surface: rgba(18, 18, 22, 0.75);
     --bg-surface-elevated: rgba(26, 26, 32, 0.85);
     --border-glass: rgba(255, 255, 255, 0.09);
     --border-specular: rgba(255, 255, 255, 0.16);
+    --border-subtle: rgba(255, 255, 255, 0.14);
     --text-main: #f8fafc;
     --text-muted: #94a3b8;
     --shimmer-1: #0f1015;
     --shimmer-2: #1c1d24;
     --pill-shadow: 0 20px 48px -10px rgba(0, 0, 0, 0.8), 0 0 1px 1px rgba(255, 255, 255, 0.1);
+
+    /* Liquid Dock & Floating Controls Tokens (Dark) */
+    --dock-bg: rgba(255, 255, 255, 0.07);
+    --dock-bg-hover: rgba(255, 255, 255, 0.12);
+    --dock-border: rgba(255, 255, 255, 0.14);
+    --dock-border-hover: rgba(255, 255, 255, 0.22);
+    --dock-shadow: rgba(0, 0, 0, 0.5);
+    --dock-highlight: rgba(255, 255, 255, 0.28);
+    --pill-bg: rgba(255, 255, 255, 0.16);
+    --pill-border: rgba(255, 255, 255, 0.22);
+    --card-bg: rgba(255, 255, 255, 0.04);
+    --card-border: rgba(255, 255, 255, 0.08);
   }
+}
+
+[data-theme="dark"] {
+  /* High-End OLED Dark Tokens Explicit Selector */
+  --bg-primary: #000000;
+  --bg-surface: rgba(18, 18, 22, 0.75);
+  --bg-surface-elevated: rgba(26, 26, 32, 0.85);
+  --border-glass: rgba(255, 255, 255, 0.09);
+  --border-specular: rgba(255, 255, 255, 0.16);
+  --border-subtle: rgba(255, 255, 255, 0.14);
+  --text-main: #f8fafc;
+  --text-muted: #94a3b8;
+  --shimmer-1: #0f1015;
+  --shimmer-2: #1c1d24;
+  --pill-shadow: 0 20px 48px -10px rgba(0, 0, 0, 0.8), 0 0 1px 1px rgba(255, 255, 255, 0.1);
+
+  --dock-bg: rgba(255, 255, 255, 0.07);
+  --dock-bg-hover: rgba(255, 255, 255, 0.12);
+  --dock-border: rgba(255, 255, 255, 0.14);
+  --dock-border-hover: rgba(255, 255, 255, 0.22);
+  --dock-shadow: rgba(0, 0, 0, 0.5);
+  --dock-highlight: rgba(255, 255, 255, 0.28);
+  --pill-bg: rgba(255, 255, 255, 0.16);
+  --pill-border: rgba(255, 255, 255, 0.22);
+  --card-bg: rgba(255, 255, 255, 0.04);
+  --card-border: rgba(255, 255, 255, 0.08);
 }
 
 html, body {
@@ -52,6 +105,7 @@ html, body {
   user-select: none;
   -webkit-user-select: none;
   overscroll-behavior-y: none;
+  overscroll-behavior-x: none;
 }
 
 /* Glassmorphism Surface Primitives */
@@ -163,10 +217,17 @@ html, body {
 
 /* Dark mode map tile filter to match OLED palette */
 @media (prefers-color-scheme: dark) {
-  .leaflet-tile-pane {
+  :root:not([data-theme="light"]) .leaflet-tile-pane {
     filter: brightness(0.65) invert(1) contrast(3) hue-rotate(200deg) saturate(0.3) brightness(0.75);
   }
-  .leaflet-container {
+  :root:not([data-theme="light"]) .leaflet-container {
     background: #000000 !important;
   }
+}
+
+[data-theme="dark"] .leaflet-tile-pane {
+  filter: brightness(0.65) invert(1) contrast(3) hue-rotate(200deg) saturate(0.3) brightness(0.75);
+}
+[data-theme="dark"] .leaflet-container {
+  background: #000000 !important;
 }

@@ -240,9 +240,9 @@ impl FaceClusterer {
             }
         }
 
-        // Match threshold (0.42 - 0.45 works best with InsightFace / ArcFace embeddings)
+        // Match threshold (0.50 - 0.55 works best with InsightFace / ArcFace embeddings)
         if let Some(idx) = best_person_idx {
-            if highest_sim >= 0.42 {
+            if highest_sim >= 0.55 {
                 let cluster = &mut existing_clusters[idx];
                 let pid = cluster.person_id.clone();
                 cluster.face_count += 1;

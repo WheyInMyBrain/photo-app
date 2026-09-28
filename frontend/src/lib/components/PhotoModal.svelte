@@ -74,11 +74,6 @@
   // =========================================================================
   // COCO 17 Keypoints Anatomical Color Palette
   // =========================================================================
-  // Keypoint Indices:
-  // 0: Nose, 1: L-Eye, 2: R-Eye, 3: L-Ear, 4: R-Ear
-  // 5: L-Shoulder, 6: R-Shoulder, 7: L-Elbow, 8: R-Elbow, 9: L-Wrist, 10: R-Wrist
-  // 11: L-Hip, 12: R-Hip, 13: L-Knee, 14: R-Knee, 15: L-Ankle, 16: R-Ankle
-
   const KEYPOINT_COLORS: Record<number, string> = {
     0: '#f59e0b', // Nose (Amber)
     1: '#fbbf24', // Left Eye (Amber Light)
@@ -361,7 +356,7 @@
       <button
         type="button"
         on:click={() => dispatch('close')}
-        class="pointer-events-auto liquid-icon-btn w-9 h-9 rounded-full flex items-center justify-center text-white/70 hover:text-white spring-tap cursor-pointer"
+        class="pointer-events-auto liquid-icon-btn w-9 h-9 rounded-full flex items-center justify-center text-[var(--text-main)] spring-tap cursor-pointer"
         title="Close (Esc)"
         aria-label="Close preview"
       >
@@ -378,7 +373,7 @@
             on:click={() => {
               if (asset) dispatch('setAsCover', { id: asset.id, thumb_path: asset.thumb_path });
             }}
-            class="liquid-btn text-xs px-3 py-1.5 rounded-full text-white/80 hover:text-white transition-all spring-tap cursor-pointer"
+            class="liquid-btn text-xs px-3 py-1.5 rounded-full text-[var(--text-main)] transition-all spring-tap cursor-pointer font-medium"
             title="Make this photo the album cover"
           >
             Set as Cover
@@ -389,7 +384,7 @@
           <button
             type="button"
             on:click={() => gestures.resetZoom()}
-            class="liquid-btn text-xs px-3 py-1.5 rounded-full text-white/80 font-mono cursor-pointer"
+            class="liquid-btn text-xs px-3 py-1.5 rounded-full text-[var(--text-main)] font-mono cursor-pointer font-medium"
           >
             {Math.round(gestures.getScale() * 100)}%
           </button>
@@ -398,11 +393,11 @@
         <button
           type="button"
           on:click={handleToggleFavorite}
-          class="liquid-icon-btn w-9 h-9 rounded-full flex items-center justify-center spring-tap cursor-pointer {isFavorite ? 'text-amber-300 liquid-fav-active' : 'text-white/60 hover:text-white'}"
+          class="liquid-icon-btn w-9 h-9 rounded-full flex items-center justify-center spring-tap cursor-pointer {isFavorite ? 'text-amber-500 dark:text-amber-300 liquid-fav-active' : 'text-[var(--text-muted)] hover:text-[var(--text-main)]'}"
           title="Toggle Favorite"
           aria-label="Toggle Favorite"
         >
-          <svg xmlns="http://www.w3.org/2000/svg" class="w-4 h-4 {isFavorite ? 'fill-amber-300 stroke-amber-300' : 'fill-none stroke-current'}" viewBox="0 0 24 24" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <svg xmlns="http://www.w3.org/2000/svg" class="w-4 h-4 {isFavorite ? 'fill-amber-500 dark:fill-amber-300 stroke-amber-500 dark:stroke-amber-300' : 'fill-none stroke-current'}" viewBox="0 0 24 24" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
             <polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"></polygon>
           </svg>
         </button>
@@ -410,7 +405,7 @@
         <button
           type="button"
           on:click={() => (showMobileInfo = !showMobileInfo)}
-          class="md:hidden liquid-icon-btn w-9 h-9 rounded-full flex items-center justify-center text-white/80 spring-tap cursor-pointer {showMobileInfo ? 'border-white/30 bg-white/15' : ''}"
+          class="md:hidden liquid-icon-btn w-9 h-9 rounded-full flex items-center justify-center text-[var(--text-main)] spring-tap cursor-pointer {showMobileInfo ? 'ring-2 ring-purple-500/50' : ''}"
           aria-label="Toggle photo details"
         >
           <svg xmlns="http://www.w3.org/2000/svg" class="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -440,7 +435,7 @@
         <button
           type="button"
           on:click|stopPropagation={() => dispatch('prev')}
-          class="hidden md:flex absolute left-6 z-30 liquid-icon-btn w-11 h-11 rounded-full text-white/80 hover:text-white spring-tap cursor-pointer items-center justify-center"
+          class="hidden md:flex absolute left-6 z-30 liquid-icon-btn w-11 h-11 rounded-full text-[var(--text-main)] spring-tap cursor-pointer items-center justify-center"
           aria-label="Previous photo"
         >
           <svg xmlns="http://www.w3.org/2000/svg" class="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2.5">
@@ -453,7 +448,7 @@
         <button
           type="button"
           on:click|stopPropagation={() => dispatch('next')}
-          class="hidden md:flex absolute right-6 z-30 liquid-icon-btn w-11 h-11 rounded-full text-white/80 hover:text-white spring-tap cursor-pointer items-center justify-center"
+          class="hidden md:flex absolute right-6 z-30 liquid-icon-btn w-11 h-11 rounded-full text-[var(--text-main)] spring-tap cursor-pointer items-center justify-center"
           aria-label="Next photo"
         >
           <svg xmlns="http://www.w3.org/2000/svg" class="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2.5">
@@ -468,10 +463,10 @@
           <div
             class="md:hidden absolute inset-y-0 left-0 w-[20%] z-20 cursor-pointer"
             role="button"
-            tabindex="-1"
+            tabindex="0"
             aria-label="Previous image"
             on:click|stopPropagation={() => dispatch('prev')}
-            on:keydown={() => {}}
+            on:keydown={(e) => (e.key === 'Enter' || e.key === ' ') && dispatch('prev')}
           ></div>
         {/if}
 
@@ -479,10 +474,10 @@
           <div
             class="md:hidden absolute inset-y-0 right-0 w-[20%] z-20 cursor-pointer"
             role="button"
-            tabindex="-1"
+            tabindex="0"
             aria-label="Next image"
             on:click|stopPropagation={() => dispatch('next')}
-            on:keydown={() => {}}
+            on:keydown={(e) => (e.key === 'Enter' || e.key === ' ') && dispatch('next')}
           ></div>
         {/if}
       {/if}
@@ -552,15 +547,19 @@
                   {#each faces as f (f.face_id)}
                     <button
                       type="button"
-                      class="absolute pointer-events-auto border border-purple-400/90 bg-purple-500/15 rounded-lg cursor-pointer group z-10 hover:border-purple-300 hover:bg-purple-500/25 transition-all shadow-sm"
+                      class="absolute pointer-events-auto border border-purple-500/90 bg-purple-500/15 rounded-lg cursor-pointer group z-10 hover:border-purple-400 hover:bg-purple-500/25 transition-all shadow-sm"
                       style="left: {f.bbox_x * 100}%; top: {f.bbox_y * 100}%; width: {f.bbox_w * 100}%; height: {f.bbox_h * 100}%;"
                       on:click|stopPropagation={() => (showMobileInfo = true)}
                       aria-label="View face details for {f.person_name || 'Unnamed'}"
                     >
                       <span
-                        class="absolute -bottom-6 left-1/2 -translate-x-1/2 liquid-tag text-[10px] text-purple-200 px-2 py-0.5 rounded-full shadow-lg whitespace-nowrap opacity-90 group-hover:opacity-100 font-medium pointer-events-none font-mono"
+                        class="absolute -bottom-6 left-1/2 -translate-x-1/2 liquid-tag text-[10px] text-[var(--text-main)] px-2 py-0.5 rounded-full shadow-lg whitespace-nowrap opacity-90 group-hover:opacity-100 font-medium pointer-events-none font-mono flex items-center gap-1"
                       >
-                        👤 {f.person_name || 'Unnamed'}
+                        <svg xmlns="http://www.w3.org/2000/svg" class="w-2.5 h-2.5 opacity-80" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                          <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"></path>
+                          <circle cx="12" cy="7" r="4"></circle>
+                        </svg>
+                        <span>{f.person_name || 'Unnamed'}</span>
                       </span>
                     </button>
                   {/each}
@@ -574,7 +573,7 @@
                       style="left: {obj.bbox_x * 100}%; top: {obj.bbox_y * 100}%; width: {obj.bbox_w * 100}%; height: {obj.bbox_h * 100}%;"
                     >
                       <span
-                        class="absolute -top-5 left-0 liquid-tag text-[9px] text-cyan-200 px-1.5 py-0.5 rounded-md shadow-md whitespace-nowrap font-mono tracking-tight"
+                        class="absolute -top-5 left-0 liquid-tag text-[9px] text-cyan-600 dark:text-cyan-200 px-1.5 py-0.5 rounded-md shadow-md whitespace-nowrap font-mono tracking-tight"
                       >
                         {obj.label} {Math.round(obj.score * 100)}%
                       </span>
@@ -599,7 +598,7 @@
                       <!-- Anatomically Grouped Bone Connections -->
                       {#each SKELETON_BONES as [i, j, boneColor]}
                         {#if pose.keypoints[i] && pose.keypoints[j] && pose.keypoints[i].score > 0.35 && pose.keypoints[j].score > 0.35}
-                          <!-- Dark drop-shadow bone backing for high contrast on any background -->
+                          <!-- Drop shadow bone backing -->
                           <line
                             x1={pose.keypoints[i].x * 100}
                             y1={pose.keypoints[i].y * 100}
@@ -626,7 +625,6 @@
                       <!-- Anatomically Grouped Joint Keypoints -->
                       {#each pose.keypoints as kp, idx}
                         {#if kp.score > 0.35}
-                          <!-- Joint Outer Ring -->
                           <circle
                             cx={kp.x * 100}
                             cy={kp.y * 100}
@@ -635,7 +633,6 @@
                             stroke="rgba(0, 0, 0, 0.75)"
                             stroke-width="0.18"
                           />
-                          <!-- Joint Core Highlight -->
                           <circle
                             cx={kp.x * 100}
                             cy={kp.y * 100}
@@ -659,7 +656,6 @@
       {asset}
       {isFavorite}
       {faces}
-      {objects}
       {poses}
       {tags}
       {similarItems}
@@ -667,7 +663,6 @@
       {loadingDetails}
       {loadingSimilar}
       {showFaces}
-      {showObjects}
       {showPoses}
       {showMobileInfo}
       on:toggleFavorite={handleToggleFavorite}
@@ -684,26 +679,27 @@
 
 <style>
   .liquid-btn {
-    background: rgba(255, 255, 255, 0.08);
-    border: 1px solid rgba(255, 255, 255, 0.14);
-    box-shadow: 0 4px 14px rgba(0, 0, 0, 0.3), inset 0 1px 0 rgba(255, 255, 255, 0.25);
+    background: var(--dock-bg);
+    border: 1px solid var(--dock-border);
+    box-shadow: 0 4px 14px var(--dock-shadow), inset 0 1px 0 var(--dock-highlight);
   }
 
   .liquid-btn:hover {
-    background: rgba(255, 255, 255, 0.14);
-    border-color: rgba(255, 255, 255, 0.24);
+    background: var(--dock-bg-hover);
+    border-color: var(--border-subtle);
   }
 
   .liquid-icon-btn {
-    background: rgba(20, 20, 24, 0.6);
-    border: 1px solid rgba(255, 255, 255, 0.14);
+    background: var(--dock-bg);
+    border: 1px solid var(--dock-border);
     backdrop-filter: blur(20px) saturate(180%);
-    box-shadow: 0 4px 14px rgba(0, 0, 0, 0.35), inset 0 1px 0 rgba(255, 255, 255, 0.25);
+    -webkit-backdrop-filter: blur(20px) saturate(180%);
+    box-shadow: 0 4px 14px var(--dock-shadow), inset 0 1px 0 var(--dock-highlight);
   }
 
   .liquid-icon-btn:hover {
-    background: rgba(255, 255, 255, 0.12);
-    border-color: rgba(255, 255, 255, 0.25);
+    background: var(--dock-bg-hover);
+    border-color: var(--border-subtle);
   }
 
   .liquid-fav-active {
@@ -713,8 +709,10 @@
   }
 
   .liquid-tag {
-    background: rgba(15, 15, 20, 0.88);
-    border: 1px solid rgba(255, 255, 255, 0.18);
+    background: var(--bg-surface-elevated);
+    border: 1px solid var(--border-glass);
     backdrop-filter: blur(14px);
+    -webkit-backdrop-filter: blur(14px);
+    box-shadow: 0 4px 12px var(--dock-shadow);
   }
 </style>

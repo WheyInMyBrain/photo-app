@@ -127,13 +127,13 @@
           <!-- Year Dot Indicator -->
           <div class="relative flex items-center justify-center pointer-events-none">
             <div
-              class="rounded-full transition-all duration-200 {isCurrent ? 'w-2 h-2 bg-white shadow-[0_0_8px_rgba(255,255,255,0.8)] scale-125' : 'w-1.5 h-1.5 bg-white/70 group-hover:bg-white/90'}"
+              class="rounded-full transition-all duration-200 {isCurrent ? 'w-2 h-2 bg-purple-500 shadow-[0_0_8px_rgba(168,85,247,0.7)] scale-125' : 'w-1.5 h-1.5 bg-[var(--text-main)] opacity-70 group-hover:opacity-90'}"
             ></div>
           </div>
         {:else}
           <!-- Month Micro-Tick -->
           <div
-            class="rounded-full transition-all duration-200 pointer-events-none {isCurrent ? 'w-2 h-0.5 bg-white/90 shadow-[0_0_4px_rgba(255,255,255,0.6)]' : 'w-1 h-0.5 bg-white/25 group-hover:bg-white/40'}"
+            class="rounded-full transition-all duration-200 pointer-events-none {isCurrent ? 'w-2 h-0.5 bg-purple-500 shadow-[0_0_4px_rgba(168,85,247,0.5)]' : 'w-1 h-0.5 bg-[var(--text-muted)] opacity-35 group-hover:opacity-60'}"
           ></div>
         {/if}
       {/each}
@@ -150,11 +150,11 @@
       <div
         class="liquid-hud px-4 py-2 rounded-2xl flex items-baseline gap-1.5"
       >
-        <span class="text-xs font-semibold tracking-tight text-white capitalize">
+        <span class="text-xs font-semibold tracking-tight text-[var(--text-main)] capitalize">
           {activeMarker.label}
         </span>
         {#if activeMarker.year}
-          <span class="text-[11px] font-mono text-white/60 font-medium">
+          <span class="text-[11px] font-mono text-[var(--text-muted)] font-medium">
             {activeMarker.year}
           </span>
         {/if}
@@ -162,35 +162,30 @@
 
       <!-- Specular Pointer Arrow -->
       <div
-        class="w-0 h-0 border-y-[5px] border-y-transparent border-l-[5px] border-l-white/20 -ml-[1px]"
+        class="w-0 h-0 border-y-[5px] border-y-transparent border-l-[5px] border-l-[var(--border-subtle)] -ml-[1px]"
       ></div>
     </div>
   {/if}
 {/if}
 
 <style>
-  /* Apple Liquid-Glass Track */
   .liquid-track {
-    background: rgba(255, 255, 255, 0.1);
-    box-shadow: inset 0 0 1px rgba(255, 255, 255, 0.2);
+    background: var(--pill-bg);
+    box-shadow: inset 0 0 1px var(--border-glass);
   }
 
   .liquid-track-active {
-    background: rgba(255, 255, 255, 0.25);
-    box-shadow: 
-      0 0 12px rgba(255, 255, 255, 0.2),
-      inset 0 1px 0 rgba(255, 255, 255, 0.4);
+    background: var(--dock-border);
+    box-shadow: 0 0 10px var(--dock-shadow), inset 0 1px 0 var(--border-specular);
   }
 
-  /* Liquid-Glass HUD Capsule */
   .liquid-hud {
-    background: rgba(20, 20, 24, 0.72);
-    border: 1px solid rgba(255, 255, 255, 0.16);
+    background: var(--bg-surface-elevated);
+    border: 1px solid var(--border-glass);
     backdrop-filter: blur(28px) saturate(190%);
     -webkit-backdrop-filter: blur(28px) saturate(190%);
     box-shadow:
-      0 12px 30px rgba(0, 0, 0, 0.6),
-      inset 0 1px 0 0 rgba(255, 255, 255, 0.3),
-      inset 0 -1px 0 0 rgba(0, 0, 0, 0.4);
+      0 12px 30px var(--dock-shadow),
+      inset 0 1px 0 0 var(--border-specular);
   }
 </style>

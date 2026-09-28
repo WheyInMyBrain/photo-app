@@ -33,7 +33,7 @@
           class="group relative rounded-xl overflow-hidden glass-panel border border-[var(--border-glass)] hover:border-purple-500/60 shadow-sm hover:shadow-xl transition-all spring-tap cursor-pointer min-w-[90px] max-h-[260px] md:max-h-[320px] text-left focus:outline-none focus:ring-2 focus:ring-purple-400"
         >
           <!-- Vignette Gradient -->
-          <div class="absolute inset-0 bg-gradient-to-t from-black/85 via-black/20 to-black/10 z-10 pointer-events-none"></div>
+          <div class="absolute inset-0 bg-gradient-to-t from-black/85 via-black/25 to-black/10 z-10 pointer-events-none"></div>
 
           <!-- Cover Image -->
           {#if album.cover_thumb}
@@ -44,15 +44,19 @@
               class="w-full h-full object-cover transition-transform duration-500 group-hover:scale-105 pointer-events-none"
             />
           {:else}
-            <div class="w-full h-full flex items-center justify-center text-3xl bg-[var(--bg-surface-elevated)]">
-              📁
+            <div class="w-full h-full flex items-center justify-center bg-[var(--bg-surface-elevated)] text-[var(--text-muted)] opacity-50">
+              <svg xmlns="http://www.w3.org/2000/svg" class="w-8 h-8" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path>
+              </svg>
             </div>
           {/if}
 
           <!-- Micro Badge -->
-          <div class="absolute top-2 left-2 z-20 glass-panel px-2 py-0.5 rounded-full flex items-center gap-1 text-[10px] text-white font-medium border border-white/10 shadow-sm">
-            <span>📁</span>
-            <span class="font-mono text-[9px] opacity-80">{album.count}</span>
+          <div class="absolute top-2 left-2 z-20 px-2 py-0.5 rounded-full flex items-center gap-1.5 text-[10px] text-white font-medium bg-black/60 backdrop-blur-md border border-white/15 shadow-sm">
+            <svg xmlns="http://www.w3.org/2000/svg" class="w-2.5 h-2.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path>
+            </svg>
+            <span class="font-mono text-[9px] opacity-90">{album.count}</span>
           </div>
 
           <!-- Title Details -->
@@ -60,8 +64,8 @@
             <h4 class="text-xs font-bold text-white tracking-tight truncate drop-shadow-sm">
               {album.name}
             </h4>
-            <span class="text-[9px] text-white/60 font-mono tracking-wide uppercase">
-              Album
+            <span class="text-[9px] text-white/70 font-mono tracking-wide uppercase">
+              Folder
             </span>
           </div>
         </button>

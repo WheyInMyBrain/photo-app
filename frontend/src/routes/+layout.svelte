@@ -70,25 +70,25 @@
 
 {#if $authStore.isLoading}
   <div class="h-screen w-screen flex flex-col items-center justify-center gap-3 bg-[var(--bg-primary)] text-[var(--text-main)]">
-    <div class="w-7 h-7 border-2 border-white/20 border-t-white rounded-full animate-spin"></div>
-    <span class="text-xs font-medium tracking-tight text-white/50 font-mono">Opening Vault...</span>
+    <div class="w-7 h-7 border-2 border-[var(--border-subtle)] border-t-[var(--text-main)] rounded-full animate-spin"></div>
+    <span class="text-xs font-medium tracking-tight text-[var(--text-muted)] font-mono">Opening Vault...</span>
   </div>
 {:else if !$authStore.isAuthenticated}
   <AuthScreen />
 {:else}
-  <div class="h-screen w-screen flex overflow-hidden relative font-sans bg-[var(--bg-primary)] text-[var(--text-main)]">
+  <div class="h-screen w-screen flex overflow-hidden relative font-sans bg-[var(--bg-primary)] text-[var(--text-main)] isolate">
     <!-- Menu Button (Top Left) -->
     {#if !isSidebarOpen}
       <button
         type="button"
         on:click={() => (isSidebarOpen = true)}
         style="top: max(1rem, var(--sat)); left: max(1rem, var(--sal));"
-        class="liquid-btn fixed z-30 w-10 h-10 rounded-full text-white/80 hover:text-white transition-all duration-300 spring-tap cursor-pointer flex items-center justify-center select-none {isNavHidden ? '-translate-y-16 opacity-0' : 'translate-y-0 opacity-100'}"
+        class="liquid-btn fixed z-30 w-10 h-10 rounded-full text-[var(--text-main)] transition-all duration-300 spring-tap cursor-pointer flex items-center justify-center select-none {isNavHidden ? '-translate-y-16 opacity-0 pointer-events-none' : 'translate-y-0 opacity-100'}"
         title="Open menu"
         aria-label="Open menu"
       >
         <svg xmlns="http://www.w3.org/2000/svg" class="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 6h16M4 12h16M4 18h16" />
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2.2" d="M4 6h16M4 12h16M4 18h16" />
         </svg>
       </button>
     {/if}
@@ -104,7 +104,7 @@
     <main
       bind:this={mainScrollContainer}
       on:scroll={handleMainScroll}
-      class="flex-1 w-full h-full overflow-y-auto relative overscroll-none scroll-smooth"
+      class="flex-1 w-full h-full overflow-y-auto relative overscroll-none scroll-smooth bg-[var(--bg-primary)]"
     >
       <slot />
 
@@ -113,12 +113,12 @@
         style="bottom: max(1.5rem, calc(var(--sab) + 0.75rem));"
         class="fixed left-1/2 -translate-x-1/2 z-30 pointer-events-auto select-none transition-all duration-500 cubic-bezier(0.16, 1, 0.3, 1) {isNavHidden ? 'translate-y-24 opacity-0 scale-95 pointer-events-none' : 'translate-y-0 opacity-100 scale-100'}"
       >
-        <nav aria-label="View switcher" class="liquid-dock p-1 rounded-full flex items-center gap-1">
+        <nav aria-label="View switcher" class="liquid-dock p-1 rounded-full flex items-center gap-1 backdrop-blur-2xl">
           <!-- Photos Tab -->
           <button
             type="button"
             on:click={() => filterStore.setViewMode('timeline')}
-            class="relative px-5 py-2 rounded-full text-xs font-medium tracking-tight transition-all duration-200 spring-tap cursor-pointer {$filterStore.view_mode === 'timeline' ? 'text-white' : 'text-white/60 hover:text-white/90'}"
+            class="relative px-5 py-2 rounded-full text-xs font-medium tracking-tight transition-all duration-200 spring-tap cursor-pointer {$filterStore.view_mode === 'timeline' ? 'text-[var(--text-main)] font-semibold' : 'text-[var(--text-muted)] hover:text-[var(--text-main)]'}"
           >
             {#if $filterStore.view_mode === 'timeline'}
               <div class="liquid-active-pill absolute inset-0 rounded-full -z-10"></div>
@@ -130,7 +130,7 @@
           <button
             type="button"
             on:click={() => filterStore.setViewMode('albums')}
-            class="relative px-5 py-2 rounded-full text-xs font-medium tracking-tight transition-all duration-200 spring-tap cursor-pointer {$filterStore.view_mode === 'albums' ? 'text-white' : 'text-white/60 hover:text-white/90'}"
+            class="relative px-5 py-2 rounded-full text-xs font-medium tracking-tight transition-all duration-200 spring-tap cursor-pointer {$filterStore.view_mode === 'albums' ? 'text-[var(--text-main)] font-semibold' : 'text-[var(--text-muted)] hover:text-[var(--text-main)]'}"
           >
             {#if $filterStore.view_mode === 'albums'}
               <div class="liquid-active-pill absolute inset-0 rounded-full -z-10"></div>
@@ -145,7 +145,7 @@
         type="button"
         on:click={() => modalStore.openUpload()}
         style="bottom: max(1.5rem, calc(var(--sab) + 0.75rem)); right: max(1.5rem, var(--sar));"
-        class="liquid-btn fixed z-30 w-11 h-11 rounded-full text-white/80 hover:text-white flex items-center justify-center spring-tap cursor-pointer select-none transition-all duration-500 cubic-bezier(0.16, 1, 0.3, 1) {isNavHidden ? 'translate-y-24 opacity-0 scale-90 pointer-events-none' : 'translate-y-0 opacity-100 scale-100'}"
+        class="liquid-btn fixed z-30 w-11 h-11 rounded-full text-[var(--text-main)] flex items-center justify-center spring-tap cursor-pointer select-none transition-all duration-500 cubic-bezier(0.16, 1, 0.3, 1) backdrop-blur-2xl {isNavHidden ? 'translate-y-24 opacity-0 scale-90 pointer-events-none' : 'translate-y-0 opacity-100 scale-100'}"
         title="Upload Media"
         aria-label="Upload Media"
       >
@@ -157,8 +157,8 @@
 
     <!-- Window Drag-and-Drop Overlay -->
     {#if isDraggingOverWindow}
-      <div class="fixed inset-0 z-50 bg-black/60 flex items-center justify-center pointer-events-none">
-        <div class="liquid-dock px-8 py-4 rounded-3xl text-sm font-medium tracking-tight text-white animate-pulse">
+      <div class="fixed inset-0 z-50 bg-black/60 backdrop-blur-sm flex items-center justify-center pointer-events-none">
+        <div class="liquid-dock px-8 py-4 rounded-3xl text-sm font-medium tracking-tight text-[var(--text-main)] animate-pulse">
           Drop photos or videos to upload
         </div>
       </div>
@@ -193,38 +193,33 @@
 {/if}
 
 <style>
-  /* Apple Liquid-Glass: crystal clear refraction, specular rim lights, zero heavy blurs */
+  /* All variables (--dock-bg, --dock-border, etc.) resolve directly from app.css */
   .liquid-dock {
-    background: rgba(255, 255, 255, 0.05);
-    border: 1px solid rgba(255, 255, 255, 0.14);
+    background: var(--dock-bg);
+    border: 1px solid var(--dock-border);
     box-shadow: 
-      0 12px 32px rgba(0, 0, 0, 0.45),
-      inset 0 1px 0 rgba(255, 255, 255, 0.28),
-      inset 0 -1px 0 rgba(0, 0, 0, 0.35);
+      0 12px 32px var(--dock-shadow),
+      inset 0 1px 0 var(--dock-highlight);
   }
 
   .liquid-btn {
-    background: rgba(255, 255, 255, 0.06);
-    border: 1px solid rgba(255, 255, 255, 0.14);
+    background: var(--dock-bg);
+    border: 1px solid var(--dock-border);
     box-shadow: 
-      0 8px 24px rgba(0, 0, 0, 0.35),
-      inset 0 1px 0 rgba(255, 255, 255, 0.3),
-      inset 0 -1px 0 rgba(0, 0, 0, 0.3);
+      0 8px 24px var(--dock-shadow),
+      inset 0 1px 0 var(--dock-highlight);
   }
 
   .liquid-btn:hover {
-    background: rgba(255, 255, 255, 0.1);
-    border-color: rgba(255, 255, 255, 0.22);
-    box-shadow: 
-      0 10px 28px rgba(0, 0, 0, 0.45),
-      inset 0 1px 0 rgba(255, 255, 255, 0.4);
+    background: var(--dock-bg-hover);
+    border-color: var(--dock-border-hover);
   }
 
   .liquid-active-pill {
-    background: rgba(255, 255, 255, 0.14);
-    border: 1px solid rgba(255, 255, 255, 0.18);
+    background: var(--pill-bg);
+    border: 1px solid var(--pill-border);
     box-shadow: 
-      0 2px 8px rgba(0, 0, 0, 0.2),
-      inset 0 1px 0 rgba(255, 255, 255, 0.35);
+      0 2px 8px var(--dock-shadow),
+      inset 0 1px 0 var(--dock-highlight);
   }
 </style>

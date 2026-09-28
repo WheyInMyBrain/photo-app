@@ -63,7 +63,7 @@
   const pinchZoom = createPinchZoomHandler(
     () => gridDensity.zoomIn(),
     () => gridDensity.zoomOut(),
-    () => activeCoords === null
+    () => activeCoords === null && !$isSelectionActive
   );
 
   const dragSelect = createDragSelectHandler({
@@ -80,6 +80,7 @@
   }
 
   function handleContainerClick(e: MouseEvent) {
+    // If the user was just dragging or held to select, suppress the click event so modal doesn't open
     if (dragSelect.isDragging()) return;
 
     const target = e.target as HTMLElement;
@@ -218,7 +219,7 @@
 
       {#if $filterStore.album_id}
         <span class="opacity-40">/</span>
-        <div class="inline-flex items-center gap-2 px-3 py-1 rounded-full liquid-breadcrumb text-white text-xs">
+        <div class="inline-flex items-center gap-2 px-3 py-1 rounded-full liquid-breadcrumb text-[var(--text-main)] text-xs">
           <span class="font-medium truncate max-w-[180px] sm:max-w-[260px]">
             {currentAlbum?.title || 'Album'}
           </span>
@@ -226,29 +227,40 @@
           <button
             type="button"
             on:click={() => (showManageAlbumModal = true)}
-            class="text-white/60 hover:text-white px-1 tracking-widest font-bold cursor-pointer transition-colors"
-            title="Album options (Rename, Delete)"
+            class="text-[var(--text-muted)] hover:text-[var(--text-main)] px-1 tracking-widest font-bold cursor-pointer transition-colors"
+            title="Album options"
             aria-label="Album options"
           >
-            •••
+            <svg xmlns="http://www.w3.org/2000/svg" class="w-3.5 h-3.5 inline" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <circle cx="12" cy="12" r="1"></circle>
+              <circle cx="19" cy="12" r="1"></circle>
+              <circle cx="5" cy="12" r="1"></circle>
+            </svg>
           </button>
 
           <button
             type="button"
             on:click={() => filterStore.clearAlbum()}
-            class="text-white/50 hover:text-white cursor-pointer ml-0.5 leading-none"
+            class="text-[var(--text-muted)] hover:text-[var(--text-main)] cursor-pointer ml-0.5 leading-none"
             title="Exit album"
             aria-label="Exit album"
           >
-            ✕
+            <svg xmlns="http://www.w3.org/2000/svg" class="w-3 h-3 inline" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <line x1="18" y1="6" x2="6" y2="18"></line>
+              <line x1="6" y1="6" x2="18" y2="18"></line>
+            </svg>
           </button>
         </div>
       {/if}
     </div>
 
     {#if $filterStore.show_trash}
-      <span class="text-[10px] bg-red-500/15 border border-red-500/30 text-red-400 px-2.5 py-0.5 rounded-full font-mono font-medium whitespace-nowrap flex-shrink-0">
-        Trash: 30d Auto-Purge
+      <span class="text-[10px] bg-red-500/15 border border-red-500/30 text-red-500 dark:text-red-400 px-2.5 py-0.5 rounded-full font-mono font-medium whitespace-nowrap flex-shrink-0 flex items-center gap-1.5">
+        <svg xmlns="http://www.w3.org/2000/svg" class="w-3 h-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <polyline points="3 6 5 6 21 6"></polyline>
+          <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path>
+        </svg>
+        <span>Trash: 30d Auto-Purge</span>
       </span>
     {/if}
   </div>
@@ -266,8 +278,12 @@
       </div>
 
       {#if $albumStore.length === 0}
-        <div class="py-12 px-4 text-center border border-dashed border-[var(--border-glass)] rounded-2xl bg-white/[0.02]">
-          <div class="text-3xl mb-2 opacity-50">📁</div>
+        <div class="py-12 px-4 text-center border border-dashed border-[var(--border-glass)] rounded-2xl bg-[var(--card-bg)]">
+          <div class="w-8 h-8 mx-auto mb-2 text-[var(--text-muted)] opacity-60">
+            <svg xmlns="http://www.w3.org/2000/svg" class="w-full h-full" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path>
+            </svg>
+          </div>
           <p class="text-xs text-[var(--text-muted)]">No albums yet. Select photos to add them to an album, or upload into a folder.</p>
         </div>
       {:else}
@@ -276,9 +292,9 @@
             <button
               type="button"
               on:click={() => filterStore.setAlbumId(album.id)}
-              class="group text-left p-2.5 rounded-2xl bg-white/5 hover:bg-white/10 border border-[var(--border-glass)] hover:border-purple-500/40 transition-all cursor-pointer flex flex-col gap-2.5 spring-tap"
+              class="group text-left p-2.5 rounded-2xl bg-[var(--card-bg)] hover:bg-[var(--dock-bg-hover)] border border-[var(--border-glass)] hover:border-purple-500/40 transition-all cursor-pointer flex flex-col gap-2.5 spring-tap"
             >
-              <div class="w-full aspect-square rounded-xl overflow-hidden bg-black/25 flex items-center justify-center border border-white/5 relative">
+              <div class="w-full aspect-square rounded-xl overflow-hidden bg-black/10 dark:bg-black/40 flex items-center justify-center border border-[var(--border-glass)] relative">
                 {#if album.cover_thumb}
                   <img
                     src={album.cover_thumb.startsWith('/') ? album.cover_thumb : `/${album.cover_thumb}`}
@@ -286,16 +302,20 @@
                     class="w-full h-full object-cover group-hover:scale-105 transition-transform duration-300"
                   />
                 {:else}
-                  <span class="text-3xl opacity-40">📁</span>
+                  <div class="w-8 h-8 text-[var(--text-muted)] opacity-50">
+                    <svg xmlns="http://www.w3.org/2000/svg" class="w-full h-full" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+                      <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path>
+                    </svg>
+                  </div>
                 {/if}
 
-                <div class="absolute bottom-1.5 right-1.5 bg-black/60 backdrop-blur-md px-1.5 py-0.5 rounded-md text-[9px] text-white/90 font-mono">
+                <div class="absolute bottom-1.5 right-1.5 bg-black/60 dark:bg-black/75 backdrop-blur-md px-1.5 py-0.5 rounded-md text-[9px] text-white font-mono">
                   {album.media_count}
                 </div>
               </div>
 
               <div class="min-w-0 px-0.5">
-                <div class="text-xs font-semibold truncate text-[var(--text-main)] group-hover:text-purple-400 transition-colors">
+                <div class="text-xs font-semibold truncate text-[var(--text-main)] group-hover:text-purple-500 dark:group-hover:text-purple-400 transition-colors">
                   {album.title}
                 </div>
                 <div class="text-[10px] text-[var(--text-muted)]">
@@ -312,10 +332,24 @@
   <!-- Media Timeline Grid -->
   {#if $sections.length === 0 && !$isLoading}
     <div in:fade={{ duration: 150 }} class="flex-1 flex flex-col items-center justify-center text-center py-24 text-[var(--text-muted)] text-xs">
-      <div class="text-4xl mb-3 opacity-60">
-        {$filterStore.show_trash ? '🗑️' : $filterStore.album_id ? '📁' : '📷'}
+      <div class="w-10 h-10 mb-3 text-[var(--text-muted)] opacity-60">
+        {#if $filterStore.show_trash}
+          <svg xmlns="http://www.w3.org/2000/svg" class="w-full h-full" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
+            <polyline points="3 6 5 6 21 6"></polyline>
+            <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path>
+          </svg>
+        {:else if $filterStore.album_id}
+          <svg xmlns="http://www.w3.org/2000/svg" class="w-full h-full" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
+            <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path>
+          </svg>
+        {:else}
+          <svg xmlns="http://www.w3.org/2000/svg" class="w-full h-full" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
+            <path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"></path>
+            <circle cx="12" cy="13" r="4"></circle>
+          </svg>
+        {/if}
       </div>
-      <p class="font-medium text-sm">
+      <p class="font-medium text-sm text-[var(--text-main)]">
         {$filterStore.show_trash
           ? 'Trash is empty.'
           : $filterStore.album_id
@@ -328,7 +362,7 @@
     <div
       role="region"
       aria-label="Media timeline grid"
-      class="space-y-6 md:space-y-8 touch-pan-y"
+      class="space-y-6 md:space-y-8 select-none {$isSelectionActive ? 'touch-none' : 'touch-pan-y'}"
       style="--grid-cols: {currentDensity.cols}; --grid-cols-mobile: {currentDensity.colsMobile};"
       on:click={handleContainerClick}
       on:keydown={handleContainerKeydown}
@@ -339,7 +373,7 @@
     >
       {#each $sections as section, secIdx (section.title)}
         <section id="section-marker-{secIdx}" class="section-container">
-          <div class="sticky top-0 z-20 py-2.5 px-1 flex items-center justify-between backdrop-blur-xl bg-[var(--bg-primary)]/80 border-b border-[var(--border-glass)] mb-2.5">
+          <div class="sticky top-0 z-20 py-2.5 px-1 flex items-center justify-between backdrop-blur-xl bg-[var(--bg-primary)]/85 border-b border-[var(--border-glass)] mb-2.5">
             <h2 class="text-xs md:text-sm font-semibold tracking-tight text-[var(--text-main)]">
               {section.title}
             </h2>
@@ -375,32 +409,42 @@
                 <button
                   type="button"
                   data-select-btn
-                  class="select-btn absolute top-1.5 left-1.5 w-5 h-5 md:w-6 md:h-6 rounded-full flex items-center justify-center transition-all z-30 cursor-pointer bg-black/35 backdrop-blur-md opacity-0 group-hover:opacity-100 text-white/80 hover:text-white border border-white/20"
+                  class="select-btn absolute top-1.5 left-1.5 w-5 h-5 md:w-6 md:h-6 rounded-full flex items-center justify-center transition-all z-30 cursor-pointer bg-black/40 backdrop-blur-md opacity-0 group-hover:opacity-100 text-white hover:text-white border border-white/20"
                   title="Select media"
                   aria-label="Select {asset.file_name}"
                 >
-                  <span class="text-[10px] md:text-[11px] font-bold leading-none pointer-events-none">✓</span>
+                  <svg xmlns="http://www.w3.org/2000/svg" class="w-3 h-3 text-white pointer-events-none" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round">
+                    <polyline points="20 6 9 17 4 12"></polyline>
+                  </svg>
                 </button>
 
                 {#if asset.is_favorite}
-                  <div class="absolute top-1.5 right-1.5 bg-black/40 backdrop-blur-md px-1.5 py-0.5 rounded-full text-amber-300 text-[10px] leading-none z-20 pointer-events-none shadow-sm border border-white/10">
-                    ★
+                  <div class="absolute top-1.5 right-1.5 bg-black/50 backdrop-blur-md px-1.5 py-1 rounded-full text-amber-300 leading-none z-20 pointer-events-none shadow-sm border border-white/10 flex items-center justify-center">
+                    <svg xmlns="http://www.w3.org/2000/svg" class="w-2.5 h-2.5 fill-amber-300 stroke-amber-300" viewBox="0 0 24 24" stroke-width="2">
+                      <polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"></polygon>
+                    </svg>
                   </div>
                 {/if}
 
                 {#if asset.days_remaining !== null && asset.days_remaining !== undefined && $gridDensity > 0}
-                  <div class="absolute bottom-1.5 left-1.5 bg-red-500/20 backdrop-blur-md border border-red-500/30 px-1.5 py-0.5 rounded-full text-[9px] text-red-300 font-mono font-medium z-20 pointer-events-none shadow-sm">
-                    🗑️ {asset.days_remaining}d
+                  <div class="absolute bottom-1.5 left-1.5 bg-red-500/30 backdrop-blur-md border border-red-500/40 px-1.5 py-0.5 rounded-full text-[9px] text-red-200 font-mono font-medium z-20 pointer-events-none shadow-sm flex items-center gap-1">
+                    <svg xmlns="http://www.w3.org/2000/svg" class="w-2.5 h-2.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                      <polyline points="3 6 5 6 21 6"></polyline>
+                      <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path>
+                    </svg>
+                    <span>{asset.days_remaining}d</span>
                   </div>
                 {:else if asset.mime_type === 'image/gif' && $gridDensity > 0}
-                  <div class="absolute bottom-1.5 left-1.5 bg-black/50 backdrop-blur-md border border-white/10 px-2 py-0.5 rounded-full text-[8px] text-white font-mono font-bold tracking-wider z-20 pointer-events-none">
+                  <div class="absolute bottom-1.5 left-1.5 bg-black/60 backdrop-blur-md border border-white/15 px-2 py-0.5 rounded-full text-[8px] text-white font-mono font-bold tracking-wider z-20 pointer-events-none">
                     GIF
                   </div>
                 {/if}
 
                 {#if asset.duration_seconds && $gridDensity > 0}
-                  <div class="absolute bottom-1.5 right-1.5 bg-black/50 backdrop-blur-md border border-white/10 px-1.5 py-0.5 rounded-full text-[9px] text-white font-mono z-20 pointer-events-none flex items-center gap-1 shadow-sm">
-                    <span class="text-[7px]">▶</span>
+                  <div class="absolute bottom-1.5 right-1.5 bg-black/60 backdrop-blur-md border border-white/15 px-1.5 py-0.5 rounded-full text-[9px] text-white font-mono z-20 pointer-events-none flex items-center gap-1 shadow-sm">
+                    <svg xmlns="http://www.w3.org/2000/svg" class="w-2 h-2 fill-current" viewBox="0 0 24 24">
+                      <polygon points="5 3 19 12 5 21 5 3"></polygon>
+                    </svg>
                     <span>{Math.floor(asset.duration_seconds / 60)}:{Math.floor(asset.duration_seconds % 60).toString().padStart(2, '0')}</span>
                   </div>
                 {/if}
@@ -495,10 +539,10 @@
 
 <style>
   .liquid-breadcrumb {
-    background: rgba(255, 255, 255, 0.08);
-    border: 1px solid rgba(255, 255, 255, 0.16);
+    background: var(--dock-bg);
+    border: 1px solid var(--dock-border);
     backdrop-filter: blur(20px) saturate(180%);
-    box-shadow: 0 4px 14px rgba(0, 0, 0, 0.25), inset 0 1px 0 rgba(255, 255, 255, 0.25);
+    box-shadow: 0 4px 14px var(--dock-shadow), inset 0 1px 0 var(--dock-highlight);
   }
 
   .section-container {
@@ -524,6 +568,7 @@
     width: 100%;
     aspect-ratio: var(--ratio, 1);
     contain: layout paint;
+    -webkit-touch-callout: none; /* Prevents iOS native callout menu on long-press */
   }
 
   :global(.tile-card[aria-pressed="true"]) {

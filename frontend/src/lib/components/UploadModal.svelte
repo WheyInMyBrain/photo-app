@@ -1,6 +1,7 @@
 <!-- photo-app/frontend/src/lib/components/UploadModal.svelte -->
 <script lang="ts">
   import { createEventDispatcher, onMount } from 'svelte';
+  import { fade, scale } from 'svelte/transition';
   import { authStore } from '$lib/stores/authStore';
   import { fetchCustomAlbums } from '$lib/api/albums';
   import type { CandidateItem, InspectPreview } from '$lib/types/upload';
@@ -23,8 +24,9 @@
   let folderPath = '';
   let isUploading = false;
   let uploadProgress = 0;
+  let currentFileProgress = 0;
   let statusMessage = '';
-  let inspectError = '';
+  let uploadError = '';
   let existingFolders: string[] = [];
   let isFolderDropdownOpen = false;
 
@@ -46,9 +48,10 @@
       ? stagedFiles.length > 0
       : linkPreview !== null && selectedLinkItems.size > 0;
 
-  // Filter existing folders/albums as the user types
-  $: filteredFolders = existingFolders.filter((f) =>
-    f.toLowerCase().includes(folderPath.trim().toLowerCase()) && f.toLowerCase() !== folderPath.trim().toLowerCase()
+  $: filteredFolders = existingFolders.filter(
+    (f) =>
+      f.toLowerCase().includes(folderPath.trim().toLowerCase()) &&
+      f.toLowerCase() !== folderPath.trim().toLowerCase()
   );
 
   onMount(async () => {
@@ -78,8 +81,12 @@
   }
 
   function addFiles(files: FileList | File[]) {
-    const valid = Array.from(files).filter(
-      (f) => f.type.startsWith('image/') || f.type.startsWith('video/')
+    const rawList = Array.from(files);
+    const valid = rawList.filter(
+      (f) =>
+        f.type.startsWith('image/') ||
+        f.type.startsWith('video/') ||
+        /\.(heic|heif|mov|mp4|jpg|jpeg|png|webp|gif|mkv|webm)$/i.test(f.name)
     );
     stagedFiles = [...stagedFiles, ...valid];
   }
@@ -90,9 +97,12 @@
 
   function handleFileSelect(e: Event) {
     const input = e.target as HTMLInputElement;
-    if (input.files) {
-      addFiles(input.files);
-      input.value = '';
+    if (input.files && input.files.length > 0) {
+      const selected = Array.from(input.files);
+      setTimeout(() => {
+        addFiles(selected);
+        input.value = '';
+      }, 50);
     }
   }
 
@@ -108,14 +118,14 @@
   async function inspectLink() {
     if (!linkUrl.trim() || isUploading) return;
     isUploading = true;
-    inspectError = '';
+    uploadError = '';
     statusMessage = 'Inspecting link...';
 
     try {
       const res = await fetch('/api/upload/inspect', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ url: linkUrl.trim() }),
+        body: JSON.stringify({ url: linkUrl.trim() })
       });
 
       if (res.status === 401) {
@@ -142,7 +152,7 @@
         throw new Error('No supported media found.');
       }
     } catch (e: any) {
-      inspectError = e.message || 'Inspection failed.';
+      uploadError = e.message || 'Inspection failed.';
     } finally {
       isUploading = false;
       statusMessage = '';
@@ -168,14 +178,14 @@
     const payload = {
       platform: linkPreview.platform,
       folder: folderPath.trim() || undefined,
-      selected_items: linkPreview.items.filter((i) => selectedLinkItems.has(i.id)),
+      selected_items: linkPreview.items.filter((i) => selectedLinkItems.has(i.id))
     };
 
     try {
       const res = await fetch('/api/upload/commit', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload),
+        body: JSON.stringify(payload)
       });
 
       if (!res.ok) throw new Error(await res.text());
@@ -184,9 +194,43 @@
       dispatch('uploaded', { count: data.total_uploaded || payload.selected_items.length });
       forceClose();
     } catch (e: any) {
-      inspectError = `Import failed: ${e.message}`;
+      uploadError = `Import failed: ${e.message}`;
       isUploading = false;
     }
+  }
+
+  // Upload small files with single-part XHR progress
+  function uploadSingleWithProgress(file: File, folder: string): Promise<void> {
+    return new Promise((resolve, reject) => {
+      const xhr = new XMLHttpRequest();
+      const formData = new FormData();
+      formData.append('file', file);
+      if (folder.trim()) {
+        formData.append('folder', folder.trim());
+      }
+
+      xhr.upload.onprogress = (e) => {
+        if (e.lengthComputable) {
+          currentFileProgress = Math.round((e.loaded / e.total) * 100);
+        }
+      };
+
+      xhr.onload = () => {
+        if (xhr.status >= 200 && xhr.status < 300) {
+          resolve();
+        } else if (xhr.status === 401) {
+          authStore.checkStatus();
+          reject(new Error('Session expired. Please log in again.'));
+        } else {
+          reject(new Error(xhr.responseText || `Upload failed with status ${xhr.status}`));
+        }
+      };
+
+      xhr.onerror = () => reject(new Error('Network connection error or request terminated by server.'));
+      xhr.open('POST', '/api/upload');
+      xhr.withCredentials = true;
+      xhr.send(formData);
+    });
   }
 
   async function handleMasterUpload() {
@@ -198,20 +242,29 @@
     }
 
     isUploading = true;
-    uploadProgress = 5;
+    uploadError = '';
+    uploadProgress = 0;
+    currentFileProgress = 0;
     const totalCount = stagedFiles.length;
 
     try {
       for (let i = 0; i < stagedFiles.length; i++) {
         const file = stagedFiles[i];
+        currentFileProgress = 0;
+
         if (file.size > CHUNK_THRESHOLD_BYTES) {
+          // Use chunked upload for large files to avoid Vite proxy buffer overflow and Actix payload limits
+          statusMessage = `Streaming ${file.name} in chunks...`;
           await uploadChunked(file, folderPath, (part, total) => {
-            statusMessage = `Streaming ${file.name} (${part}/${total})...`;
+            currentFileProgress = Math.round((part / total) * 100);
+            statusMessage = `Uploading ${file.name} (chunk ${part}/${total})...`;
           });
         } else {
-          statusMessage = `Uploading ${file.name}...`;
-          await uploadDirect(file, folderPath);
+          // Use single-part upload with live XHR byte progress for standard files
+          statusMessage = `Uploading (${i + 1}/${totalCount}): ${file.name}`;
+          await uploadSingleWithProgress(file, folderPath);
         }
+
         uploadProgress = Math.round(((i + 1) / totalCount) * 100);
       }
 
@@ -219,7 +272,7 @@
       dispatch('uploaded', { count: totalCount });
       forceClose();
     } catch (e: any) {
-      statusMessage = `Failed: ${e.message}`;
+      uploadError = e.message || 'Upload failed.';
       isUploading = false;
     }
   }
@@ -229,8 +282,9 @@
     stagedFiles = [];
     folderPath = '';
     uploadProgress = 0;
+    currentFileProgress = 0;
     statusMessage = '';
-    inspectError = '';
+    uploadError = '';
     linkUrl = '';
     linkPreview = null;
     selectedLinkItems.clear();
@@ -247,25 +301,25 @@
 
 {#if isOpen}
   <!-- svelte-ignore a11y_click_events_have_key_events -->
-  <!-- svelte-ignore a11y_no_static_element_interactions -->
   <div
+    transition:fade={{ duration: 150 }}
     class="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-md p-4 sm:p-6 select-none"
     role="dialog"
     aria-modal="true"
     tabindex="-1"
     on:click|self={() => { if (!isUploading) forceClose(); }}
   >
-    <!-- Liquid-Glass Modal Card -->
     <div
-      class="liquid-modal rounded-3xl w-full max-w-lg flex flex-col max-h-[85vh] overflow-visible"
+      transition:scale={{ start: 0.96, duration: 150 }}
+      class="liquid-modal rounded-3xl w-full max-w-lg flex flex-col max-h-[85vh] overflow-visible text-[var(--text-main)]"
     >
       <!-- Header -->
-      <div class="px-6 py-4.5 border-b border-white/[0.08] flex items-center justify-between">
+      <div class="px-6 py-4.5 border-b border-[var(--border-glass)] flex items-center justify-between">
         <div>
-          <h2 class="text-sm font-semibold tracking-tight text-white flex items-center gap-2">
+          <h2 class="text-sm font-semibold tracking-tight text-[var(--text-main)] flex items-center gap-2">
             <span>Add Media</span>
           </h2>
-          <p class="text-[11px] text-white/45 mt-0.5 font-normal tracking-tight">
+          <p class="text-[11px] text-[var(--text-muted)] mt-0.5 font-normal tracking-tight">
             Original files preserved with full metadata.
           </p>
         </div>
@@ -273,7 +327,7 @@
           type="button"
           on:click={forceClose}
           disabled={isUploading}
-          class="liquid-icon-btn w-7 h-7 flex items-center justify-center rounded-full text-white/50 hover:text-white transition-all spring-tap cursor-pointer disabled:opacity-30"
+          class="liquid-icon-btn w-7 h-7 flex items-center justify-center rounded-full text-[var(--text-muted)] hover:text-[var(--text-main)] transition-all spring-tap cursor-pointer disabled:opacity-30"
           title="Close"
           aria-label="Close modal"
         >
@@ -288,15 +342,15 @@
       <div class="px-6 pt-4">
         <div class="liquid-segmented p-0.5 rounded-xl flex text-xs">
           <button
-            class="flex-1 py-1.5 rounded-lg transition-all font-medium spring-tap cursor-pointer {uploadMode === 'files' ? 'liquid-seg-active text-white' : 'text-white/50 hover:text-white'}"
-            on:click={() => { uploadMode = 'files'; inspectError = ''; }}
+            class="flex-1 py-1.5 rounded-lg transition-all font-medium spring-tap cursor-pointer {uploadMode === 'files' ? 'liquid-seg-active text-[var(--text-main)] font-semibold' : 'text-[var(--text-muted)] hover:text-[var(--text-main)]'}"
+            on:click={() => { uploadMode = 'files'; uploadError = ''; }}
             disabled={isUploading}
           >
             Files
           </button>
           <button
-            class="flex-1 py-1.5 rounded-lg transition-all font-medium spring-tap cursor-pointer {uploadMode === 'link' ? 'liquid-seg-active text-white' : 'text-white/50 hover:text-white'}"
-            on:click={() => { uploadMode = 'link'; inspectError = ''; }}
+            class="flex-1 py-1.5 rounded-lg transition-all font-medium spring-tap cursor-pointer {uploadMode === 'link' ? 'liquid-seg-active text-[var(--text-main)] font-semibold' : 'text-[var(--text-muted)] hover:text-[var(--text-main)]'}"
+            on:click={() => { uploadMode = 'link'; uploadError = ''; }}
             disabled={isUploading}
           >
             Web Link
@@ -308,7 +362,7 @@
       <div class="p-6 space-y-4 overflow-y-auto flex-1 no-scrollbar">
         <!-- Destination Album / Folder Input with Dynamic Suggestions -->
         <div class="space-y-1.5 relative">
-          <span class="text-[9px] uppercase tracking-wider font-semibold text-white/40 block pl-1">
+          <span class="text-[9px] uppercase tracking-wider font-semibold text-[var(--text-muted)] block pl-1">
             Destination Album
           </span>
           <div class="relative">
@@ -321,19 +375,18 @@
               on:blur={() => setTimeout(() => (isFolderDropdownOpen = false), 200)}
               placeholder="root (e.g. 2026/holidays)..."
               disabled={isUploading || linkPreview !== null}
-              class="liquid-input w-full rounded-xl px-3.5 py-2 text-xs text-white placeholder-white/30 outline-none transition-all disabled:opacity-40"
+              class="liquid-input w-full rounded-xl px-3.5 py-2 text-xs text-[var(--text-main)] placeholder-[var(--text-muted)] outline-none transition-all disabled:opacity-40"
             />
 
-            <!-- Interactive Suggestions Dropdown -->
             {#if isFolderDropdownOpen && filteredFolders.length > 0 && !isUploading}
               <div class="absolute left-0 right-0 top-full mt-1.5 z-50 liquid-dropdown rounded-xl p-1 shadow-2xl max-h-40 overflow-y-auto no-scrollbar">
                 {#each filteredFolders as folder}
                   <button
                     type="button"
-                    class="w-full text-left px-3 py-1.5 rounded-lg text-xs text-white/80 hover:text-white hover:bg-white/10 transition-colors flex items-center gap-2 cursor-pointer"
+                    class="w-full text-left px-3 py-1.5 rounded-lg text-xs text-[var(--text-main)] hover:bg-[var(--dock-bg-hover)] transition-colors flex items-center gap-2 cursor-pointer"
                     on:mousedown|preventDefault={() => selectFolderSuggestion(folder)}
                   >
-                    <svg xmlns="http://www.w3.org/2000/svg" class="w-3.5 h-3.5 text-white/40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                    <svg xmlns="http://www.w3.org/2000/svg" class="w-3.5 h-3.5 text-[var(--text-muted)]" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
                       <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path>
                     </svg>
                     <span class="truncate">{folder}</span>
@@ -345,17 +398,16 @@
         </div>
 
         {#if uploadMode === 'files'}
-          <!-- Local Files Section -->
           <div class="space-y-2.5">
             <div class="flex items-center justify-between px-1">
-              <span class="text-[9px] uppercase tracking-wider font-semibold text-white/40">
+              <span class="text-[9px] uppercase tracking-wider font-semibold text-[var(--text-muted)]">
                 Staged ({stagedFiles.length})
               </span>
               <button
                 type="button"
                 on:click={() => fileInputEl?.click()}
                 disabled={isUploading}
-                class="text-xs text-purple-300 hover:text-purple-200 font-medium cursor-pointer transition-colors"
+                class="text-xs text-purple-600 dark:text-purple-400 hover:underline font-medium cursor-pointer transition-colors"
               >
                 + Add more
               </button>
@@ -365,7 +417,7 @@
               bind:this={fileInputEl}
               type="file"
               multiple
-              accept="image/*,video/*"
+              accept="image/heic,image/heif,image/jpeg,image/png,image/webp,video/mp4,video/quicktime,.heic,.heif,.mov,.mp4,.jpg,.jpeg,.png,.webp,.gif"
               on:change={handleFileSelect}
               class="hidden"
             />
@@ -376,26 +428,26 @@
                 on:click={() => fileInputEl?.click()}
                 class="liquid-dropzone w-full rounded-2xl p-8 flex flex-col items-center justify-center gap-2.5 text-center cursor-pointer transition-all spring-tap"
               >
-                <div class="w-10 h-10 rounded-full liquid-icon-plate flex items-center justify-center text-white/70">
+                <div class="w-10 h-10 rounded-full liquid-icon-plate flex items-center justify-center text-[var(--text-main)]">
                   <svg xmlns="http://www.w3.org/2000/svg" class="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                     <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4v16m8-8H4" />
                   </svg>
                 </div>
-                <span class="text-xs font-medium text-white tracking-tight">Select photos or videos</span>
-                <span class="text-[10px] text-white/40">HEIC, RAW, 4K video, Live Photos preserved</span>
+                <span class="text-xs font-medium text-[var(--text-main)] tracking-tight">Select photos or videos</span>
+                <span class="text-[10px] text-[var(--text-muted)]">HEIC, RAW, 4K video, Live Photos preserved</span>
               </button>
             {:else}
               <div class="space-y-1.5 max-h-52 overflow-y-auto pr-0.5 no-scrollbar">
                 {#each stagedFiles as file, idx}
                   <div class="liquid-card flex items-center justify-between p-2.5 rounded-xl text-xs">
                     <div class="truncate mr-3">
-                      <div class="text-white/90 font-medium truncate max-w-[280px] flex items-center gap-2">
+                      <div class="text-[var(--text-main)] font-medium truncate max-w-[280px] flex items-center gap-2">
                         <span class="truncate">{file.name}</span>
                         {#if file.size > CHUNK_THRESHOLD_BYTES}
-                          <span class="text-[9px] liquid-tag px-1.5 py-0.2 rounded font-mono">STREAM</span>
+                          <span class="text-[9px] liquid-tag px-1.5 py-0.2 rounded font-mono">CHUNKED</span>
                         {/if}
                       </div>
-                      <div class="text-[10px] text-white/40 mt-0.5 font-mono">
+                      <div class="text-[10px] text-[var(--text-muted)] mt-0.5 font-mono">
                         {formatBytes(file.size)} • {file.type || 'binary'}
                       </div>
                     </div>
@@ -403,8 +455,9 @@
                       <button
                         type="button"
                         on:click={() => removeFile(idx)}
-                        class="text-white/40 hover:text-white p-1 cursor-pointer transition-colors spring-tap"
+                        class="text-[var(--text-muted)] hover:text-[var(--text-main)] p-1 cursor-pointer transition-colors spring-tap"
                         title="Remove file"
+                        aria-label="Remove {file.name}"
                       >
                         <svg xmlns="http://www.w3.org/2000/svg" class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                           <line x1="18" y1="6" x2="6" y2="18"></line>
@@ -418,11 +471,10 @@
             {/if}
           </div>
         {:else}
-          <!-- Web Link Section -->
           {#if !linkPreview}
             <div class="space-y-3">
               <div class="space-y-1.5">
-                <span class="text-[9px] uppercase tracking-wider font-semibold text-white/40 block pl-1">
+                <span class="text-[9px] uppercase tracking-wider font-semibold text-[var(--text-muted)] block pl-1">
                   Source URL
                 </span>
                 <div class="flex gap-2">
@@ -433,13 +485,13 @@
                     placeholder="https://..."
                     disabled={isUploading}
                     on:keydown={(e) => e.key === 'Enter' && inspectLink()}
-                    class="liquid-input flex-1 rounded-xl px-3.5 py-2 text-xs text-white placeholder-white/30 outline-none transition-all"
+                    class="liquid-input flex-1 rounded-xl px-3.5 py-2 text-xs text-[var(--text-main)] placeholder-[var(--text-muted)] outline-none transition-all"
                   />
                   <button
                     type="button"
                     on:click={inspectLink}
                     disabled={!linkUrl.trim() || isUploading}
-                    class="liquid-btn-primary px-4 py-2 rounded-xl text-xs font-medium text-white transition-all disabled:opacity-40 cursor-pointer flex items-center gap-1.5 min-w-[76px] justify-center spring-tap"
+                    class="liquid-btn-primary px-4 py-2 rounded-xl text-xs font-semibold text-white transition-all disabled:opacity-40 cursor-pointer flex items-center gap-1.5 min-w-[76px] justify-center spring-tap shadow-sm"
                   >
                     {#if isUploading}
                       <span class="inline-block w-3 h-3 border-2 border-white/20 border-t-white rounded-full animate-spin"></span>
@@ -448,31 +500,27 @@
                     {/if}
                   </button>
                 </div>
-                {#if inspectError}
-                  <p class="text-[11px] text-rose-300 pt-1 leading-snug pl-1">{inspectError}</p>
-                {/if}
               </div>
             </div>
           {:else}
-            <!-- Link Candidate Grid -->
             <div class="space-y-3">
               <div class="flex items-center justify-between text-xs px-1">
                 <div>
-                  <span class="text-white font-medium">{linkPreview.author}</span>
-                  <span class="text-white/45"> on {linkPreview.platform} ({linkPreview.items.length})</span>
+                  <span class="text-[var(--text-main)] font-semibold">{linkPreview.author}</span>
+                  <span class="text-[var(--text-muted)]"> on {linkPreview.platform} ({linkPreview.items.length})</span>
                 </div>
                 <button
                   type="button"
-                  on:click={() => { linkPreview = null; inspectError = ''; }}
+                  on:click={() => { linkPreview = null; uploadError = ''; }}
                   disabled={isUploading}
-                  class="text-purple-300 hover:text-purple-200 font-medium cursor-pointer text-xs"
+                  class="text-purple-600 dark:text-purple-400 hover:underline font-medium cursor-pointer text-xs"
                 >
                   Change Link
                 </button>
               </div>
 
               {#if linkPreview.caption}
-                <p class="text-[11px] text-white/60 line-clamp-2 italic border-l-2 border-white/20 pl-2.5">
+                <p class="text-[11px] text-[var(--text-muted)] line-clamp-2 italic border-l-2 border-purple-500/40 pl-2.5">
                   "{linkPreview.caption}"
                 </p>
               {/if}
@@ -484,7 +532,7 @@
                     type="button"
                     disabled={isUploading}
                     on:click={() => toggleLinkItem(item.id)}
-                    class="relative aspect-square liquid-card rounded-xl overflow-hidden cursor-pointer group focus:outline-none transition-all spring-tap {isSelected ? 'ring-1.5 ring-white/70' : 'opacity-40'}"
+                    class="relative aspect-square liquid-card rounded-xl overflow-hidden cursor-pointer group focus:outline-none transition-all spring-tap {isSelected ? 'ring-2 ring-purple-500 shadow-md' : 'opacity-50'}"
                   >
                     {#if item.thumbnail_base64 || item.thumbnail_url}
                       <img
@@ -493,55 +541,63 @@
                         class="w-full h-full object-cover pointer-events-none"
                       />
                     {:else}
-                      <div class="w-full h-full flex flex-col items-center justify-center text-white/50 text-[10px] gap-1 font-mono uppercase">
+                      <div class="w-full h-full flex flex-col items-center justify-center text-[var(--text-muted)] text-[10px] gap-1 font-mono uppercase">
                         <span>{item.media_type}</span>
                       </div>
                     {/if}
 
-                    <div class="absolute top-1.5 left-1.5 w-4 h-4 rounded-full flex items-center justify-center transition-colors {isSelected ? 'bg-white text-black' : 'bg-black/50 text-transparent border border-white/30'}">
+                    <div class="absolute top-1.5 left-1.5 w-4 h-4 rounded-full flex items-center justify-center transition-colors {isSelected ? 'bg-purple-600 text-white' : 'bg-black/50 text-transparent border border-white/40'}">
                       <svg xmlns="http://www.w3.org/2000/svg" class="w-2.5 h-2.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3">
                         <polyline points="20 6 9 17 4 12"></polyline>
                       </svg>
                     </div>
 
-                    <span class="absolute bottom-1 right-1 text-[8px] uppercase px-1.5 py-0.2 rounded-full bg-black/70 text-white/80 font-mono tracking-wider">
+                    <span class="absolute bottom-1 right-1 text-[8px] uppercase px-1.5 py-0.2 rounded-full bg-black/75 text-white font-mono tracking-wider">
                       {item.media_type}
                     </span>
                   </button>
                 {/each}
               </div>
-
-              {#if inspectError}
-                <p class="text-[11px] text-rose-300 pt-1 leading-snug pl-1">{inspectError}</p>
-              {/if}
             </div>
           {/if}
         {/if}
 
-        <!-- Stream / Upload Progress Indicator -->
-        {#if isUploading && (uploadMode === 'files' || uploadProgress > 0)}
-          <div class="space-y-1.5 pt-1">
-            <div class="flex justify-between text-xs text-white/50">
-              <span class="truncate max-w-[280px] font-mono text-[11px]">{statusMessage}</span>
-              <span class="font-mono text-white/80 text-[11px]">{uploadMode === 'files' ? `${uploadProgress}%` : ''}</span>
+        <!-- Active Progress Bar with live percentage and file status -->
+        {#if isUploading}
+          <div class="space-y-1.5 pt-2">
+            <div class="flex justify-between text-xs text-[var(--text-muted)] font-mono">
+              <span class="truncate max-w-[280px] text-[11px]">{statusMessage}</span>
+              <span class="text-[var(--text-main)] font-semibold text-[11px]">{currentFileProgress}%</span>
             </div>
-            <div class="w-full bg-white/[0.06] rounded-full h-1 overflow-hidden border border-white/[0.08]">
+            <div class="w-full bg-[var(--pill-bg)] rounded-full h-1.5 overflow-hidden border border-[var(--border-glass)]">
               <div
-                class="bg-white/80 h-full transition-all duration-300 ease-out rounded-full"
-                style="width: {uploadProgress > 0 ? uploadProgress : 100}%"
+                class="bg-gradient-to-r from-purple-600 to-emerald-500 h-full transition-all duration-150 ease-out rounded-full"
+                style="width: {currentFileProgress}%"
               ></div>
             </div>
+          </div>
+        {/if}
+
+        <!-- Visible Error Box -->
+        {#if uploadError}
+          <div class="p-2.5 rounded-xl bg-rose-500/15 border border-rose-500/30 text-rose-600 dark:text-rose-200 text-xs flex items-start gap-2">
+            <svg xmlns="http://www.w3.org/2000/svg" class="w-4 h-4 flex-shrink-0 text-rose-500 mt-0.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <circle cx="12" cy="12" r="10"></circle>
+              <line x1="12" y1="8" x2="12" y2="12"></line>
+              <line x1="12" y1="16" x2="12.01" y2="16"></line>
+            </svg>
+            <span class="leading-snug">{uploadError}</span>
           </div>
         {/if}
       </div>
 
       <!-- Footer Actions -->
-      <div class="px-6 py-4 border-t border-white/[0.08] flex justify-end gap-2.5">
+      <div class="px-6 py-4 border-t border-[var(--border-glass)] flex justify-end gap-2.5">
         <button
           type="button"
           on:click={forceClose}
           disabled={isUploading}
-          class="liquid-btn-secondary px-4 py-2 rounded-xl text-xs text-white/60 hover:text-white transition-all spring-tap cursor-pointer disabled:opacity-40"
+          class="liquid-btn-secondary px-4 py-2 rounded-xl text-xs text-[var(--text-muted)] hover:text-[var(--text-main)] transition-all spring-tap cursor-pointer disabled:opacity-40"
         >
           Cancel
         </button>
@@ -549,7 +605,7 @@
           type="button"
           on:click={handleMasterUpload}
           disabled={!canUpload || isUploading}
-          class="liquid-btn-primary px-5 py-2 rounded-xl text-xs font-medium text-white transition-all disabled:opacity-40 cursor-pointer flex items-center gap-2 spring-tap"
+          class="liquid-btn-primary px-5 py-2 rounded-xl text-xs font-semibold text-white transition-all disabled:opacity-40 cursor-pointer flex items-center gap-2 spring-tap shadow-sm"
         >
           {#if isUploading}
             <span class="inline-block w-3.5 h-3.5 border-2 border-white/20 border-t-white rounded-full animate-spin"></span>
@@ -567,113 +623,114 @@
 
 <style>
   .liquid-modal {
-    background: rgba(18, 18, 22, 0.76);
-    border: 1px solid rgba(255, 255, 255, 0.13);
-    backdrop-filter: blur(40px) saturate(180%);
-    -webkit-backdrop-filter: blur(40px) saturate(180%);
+    background: var(--bg-surface-elevated);
+    border: 1px solid var(--border-glass);
+    backdrop-filter: blur(40px) saturate(190%);
+    -webkit-backdrop-filter: blur(40px) saturate(190%);
     box-shadow:
-      0 30px 70px rgba(0, 0, 0, 0.75),
-      inset 0 1px 0 0 rgba(255, 255, 255, 0.22),
-      inset 0 -1px 0 0 rgba(0, 0, 0, 0.4);
+      0 30px 70px var(--dock-shadow),
+      inset 0 1px 0 0 var(--border-specular);
   }
 
   .liquid-dropzone {
-    background: rgba(255, 255, 255, 0.02);
-    border: 1px dashed rgba(255, 255, 255, 0.16);
+    background: var(--card-bg);
+    border: 1.5px dashed var(--border-glass);
   }
 
   .liquid-dropzone:hover {
-    background: rgba(255, 255, 255, 0.05);
-    border-color: rgba(255, 255, 255, 0.3);
+    background: var(--dock-bg-hover);
+    border-color: var(--border-subtle);
   }
 
   .liquid-card {
-    background: rgba(255, 255, 255, 0.04);
-    border: 1px solid rgba(255, 255, 255, 0.08);
-    box-shadow: inset 0 1px 0 0 rgba(255, 255, 255, 0.1);
+    background: var(--card-bg);
+    border: 1px solid var(--card-border);
+    box-shadow: inset 0 1px 0 0 var(--border-specular);
+  }
+
+  .liquid-card:hover {
+    background: var(--dock-bg-hover);
+    border-color: var(--border-subtle);
   }
 
   .liquid-input {
-    background: rgba(0, 0, 0, 0.35);
-    border: 1px solid rgba(255, 255, 255, 0.1);
-    box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.4);
+    background: var(--pill-bg);
+    border: 1px solid var(--border-glass);
+    box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.08);
   }
 
   .liquid-input:focus {
-    border-color: rgba(255, 255, 255, 0.25);
-    box-shadow: 
-      inset 0 1px 2px rgba(0, 0, 0, 0.4),
-      0 0 0 1px rgba(255, 255, 255, 0.15);
+    border-color: var(--border-subtle);
+    box-shadow: 0 0 0 1px var(--border-subtle);
   }
 
   .liquid-dropdown {
-    background: rgba(22, 22, 28, 0.94);
-    border: 1px solid rgba(255, 255, 255, 0.14);
-    backdrop-filter: blur(28px) saturate(180%);
-    -webkit-backdrop-filter: blur(28px) saturate(180%);
-    box-shadow: 0 12px 32px rgba(0, 0, 0, 0.6), inset 0 1px 0 rgba(255, 255, 255, 0.15);
+    background: var(--bg-surface-elevated);
+    border: 1px solid var(--border-glass);
+    backdrop-filter: blur(28px) saturate(190%);
+    -webkit-backdrop-filter: blur(28px) saturate(190%);
+    box-shadow: 0 12px 32px var(--dock-shadow), inset 0 1px 0 var(--border-specular);
   }
 
   .liquid-segmented {
-    background: rgba(0, 0, 0, 0.4);
-    border: 1px solid rgba(255, 255, 255, 0.08);
-    box-shadow: inset 0 1px 2px rgba(0, 0, 0, 0.4);
+    background: var(--pill-bg);
+    border: 1px solid var(--border-glass);
   }
 
   .liquid-seg-active {
-    background: rgba(255, 255, 255, 0.14);
-    border: 1px solid rgba(255, 255, 255, 0.18);
+    background: var(--dock-bg);
+    border: 1px solid var(--dock-border);
     box-shadow:
-      0 2px 6px rgba(0, 0, 0, 0.25),
-      inset 0 1px 0 rgba(255, 255, 255, 0.3);
+      0 2px 6px var(--dock-shadow),
+      inset 0 1px 0 var(--dock-highlight);
   }
 
   .liquid-icon-btn {
-    background: rgba(255, 255, 255, 0.05);
-    border: 1px solid rgba(255, 255, 255, 0.12);
-    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.2);
+    background: var(--card-bg);
+    border: 1px solid var(--card-border);
+    box-shadow: inset 0 1px 0 var(--border-specular);
   }
 
   .liquid-icon-btn:hover {
-    background: rgba(255, 255, 255, 0.12);
-    border-color: rgba(255, 255, 255, 0.2);
+    background: var(--dock-bg-hover);
+    border-color: var(--border-subtle);
   }
 
   .liquid-icon-plate {
-    background: rgba(255, 255, 255, 0.08);
-    border: 1px solid rgba(255, 255, 255, 0.12);
-    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.25);
+    background: var(--pill-bg);
+    border: 1px solid var(--border-glass);
+    box-shadow: inset 0 1px 0 var(--border-specular);
   }
 
   .liquid-tag {
-    background: rgba(255, 255, 255, 0.1);
-    border: 1px solid rgba(255, 255, 255, 0.15);
-    color: rgba(255, 255, 255, 0.85);
+    background: var(--pill-bg);
+    border: 1px solid var(--border-glass);
+    color: var(--text-muted);
   }
 
   .liquid-btn-primary {
-    background: rgba(255, 255, 255, 0.15);
-    border: 1px solid rgba(255, 255, 255, 0.24);
-    box-shadow:
-      0 4px 14px rgba(0, 0, 0, 0.3),
-      inset 0 1px 0 rgba(255, 255, 255, 0.35);
+    background: #9333ea;
   }
 
   .liquid-btn-primary:hover:not(:disabled) {
-    background: rgba(255, 255, 255, 0.22);
-    border-color: rgba(255, 255, 255, 0.32);
-    box-shadow:
-      0 6px 18px rgba(0, 0, 0, 0.4),
-      inset 0 1px 0 rgba(255, 255, 255, 0.45);
+    background: #7e22ce;
   }
 
   .liquid-btn-secondary {
-    background: rgba(255, 255, 255, 0.04);
-    border: 1px solid rgba(255, 255, 255, 0.08);
+    background: var(--card-bg);
+    border: 1px solid var(--card-border);
   }
 
   .liquid-btn-secondary:hover:not(:disabled) {
-    background: rgba(255, 255, 255, 0.08);
-    border-color: rgba(255, 255, 255, 0.14);
+    background: var(--dock-bg-hover);
+    border-color: var(--border-subtle);
+  }
+
+  .no-scrollbar::-webkit-scrollbar {
+    display: none;
+  }
+  .no-scrollbar {
+    -ms-overflow-style: none;
+    scrollbar-width: none;
   }
 </style>
