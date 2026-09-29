@@ -422,7 +422,7 @@ async fn extract_highlight_links(input_url: &str, client: &Client) -> Result<Ext
 }
 
 // -----------------------------------------------------------------------------
-// User Profile Feed
+// User Profile Feed (Full Pagination Loop)
 // -----------------------------------------------------------------------------
 async fn extract_user_profile_feed(input_url: &str, client: &Client) -> Result<ExtractedMediaMetadata> {
     let parsed_url = reqwest::Url::parse(input_url)?;
@@ -433,62 +433,75 @@ async fn extract_user_profile_feed(input_url: &str, client: &Client) -> Result<E
         .filter(|s| !s.is_empty() && *s != "explore" && *s != "direct")
         .context("Could not extract username from Instagram profile URL")?;
 
-    let max_id = parsed_url
-        .query_pairs()
-        .find(|(k, _)| k == "max_id")
-        .map(|(_, v)| v.to_string());
-
-    let mut api_url = format!("https://www.instagram.com/api/v1/feed/user/{username}/username/?count=12");
-    if let Some(ref mid) = max_id {
-        api_url = format!("{api_url}&max_id={mid}");
-    }
-
-    let resp = client
-        .get(&api_url)
-        .header(REFERER, format!("https://www.instagram.com/{username}/"))
-        .send()
-        .await?;
-
-    if !resp.status().is_success() {
-        bail!("Instagram feed API returned HTTP {}", resp.status());
-    }
-
-    let body = resp.text().await?;
-    let payload: Value = serde_json::from_str(&body)?;
-    let raw_items = payload
-        .get("items")
-        .and_then(|i| i.as_array())
-        .context("Failed to read items array from user feed")?;
-
-    if raw_items.is_empty() {
-        bail!("No items returned for @{username} in this frame.");
-    }
-
     let mut items = Vec::new();
     let mut discovered_post_urls = Vec::new();
+    let mut current_max_id: Option<String> = None;
+    let mut page_count = 0;
+    const MAX_PAGES: usize = 100; // Safety cap (e.g. 100 * 12 = 1200 items) to avoid infinite loops or rate bans
 
-    for raw in raw_items {
-        if let Some(code) = raw.get("code").and_then(|c| c.as_str()) {
-            discovered_post_urls.push(format!("https://www.instagram.com/p/{code}/"));
+    loop {
+        page_count += 1;
+        let mut api_url = format!("https://www.instagram.com/api/v1/feed/user/{username}/username/?count=12");
+        if let Some(ref mid) = current_max_id {
+            api_url = format!("{api_url}&max_id={mid}");
         }
 
-        let raw_nodes: Vec<&Value> = if let Some(arr) = raw.get("carousel_media").and_then(|c| c.as_array()) {
-            arr.iter().collect()
-        } else {
-            vec![raw]
-        };
+        let resp = client
+            .get(&api_url)
+            .header(REFERER, format!("https://www.instagram.com/{username}/"))
+            .send()
+            .await?;
 
-        for node in raw_nodes {
-            if let Some(media_item) = parse_media_item(node) {
-                items.push(media_item);
+        if !resp.status().is_success() {
+            // If the first page fails, return an error. If later pages fail, keep what we have.
+            if items.is_empty() {
+                bail!("Instagram feed API returned HTTP {}", resp.status());
+            } else {
+                break;
             }
         }
+
+        let body = resp.text().await?;
+        let payload: Value = serde_json::from_str(&body)?;
+
+        let raw_items = match payload.get("items").and_then(|i| i.as_array()) {
+            Some(arr) if !arr.is_empty() => arr,
+            _ => break,
+        };
+
+        for raw in raw_items {
+            if let Some(code) = raw.get("code").and_then(|c| c.as_str()) {
+                discovered_post_urls.push(format!("https://www.instagram.com/p/{code}/"));
+            }
+
+            let raw_nodes: Vec<&Value> = if let Some(arr) = raw.get("carousel_media").and_then(|c| c.as_array()) {
+                arr.iter().collect()
+            } else {
+                vec![raw]
+            };
+
+            for node in raw_nodes {
+                if let Some(media_item) = parse_media_item(node) {
+                    items.push(media_item);
+                }
+            }
+        }
+
+        let more_available = payload.get("more_available").and_then(|v| v.as_bool()).unwrap_or(false);
+        let next_max_id = payload.get("next_max_id").and_then(|v| v.as_str()).map(|s| s.to_string());
+
+        if !more_available || next_max_id.is_none() || page_count >= MAX_PAGES {
+            break;
+        }
+
+        current_max_id = next_max_id;
+        // Mild throttle to avoid getting IP-flagged during multi-page pagination
+        tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
     }
 
-    let next_page_url = payload
-        .get("next_max_id")
-        .and_then(|v| v.as_str())
-        .map(|next_id| format!("https://www.instagram.com/{username}/?max_id={next_id}"));
+    if items.is_empty() {
+        bail!("No items returned for @{username}");
+    }
 
     Ok(ExtractedMediaMetadata {
         platform: "instagram".to_string(),
@@ -498,7 +511,7 @@ async fn extract_user_profile_feed(input_url: &str, client: &Client) -> Result<E
         published_at: None,
         tags: Vec::new(),
         items,
-        next_page_url,
+        next_page_url: None,
         discovered_post_urls,
         embedded_player_urls: Vec::new(),
     })
