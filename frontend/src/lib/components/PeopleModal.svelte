@@ -5,6 +5,7 @@
   import { fade, scale } from 'svelte/transition';
   import { filterStore } from '$lib/stores/filterStore';
   import { authStore } from '$lib/stores/authStore';
+  import { fetchCustomAlbums, type AlbumRecord } from '$lib/api/albums';
   import {
     fetchPeopleOverview,
     fetchNamesDirectory,
@@ -23,10 +24,17 @@
   }>();
 
   let people: PersonCard[] = [];
+  let albums: AlbumRecord[] = [];
   let nameDirectory: NameDirectoryItem[] = [];
   let isLoading = true;
   let editingId: string | null = null;
   let editingName = '';
+
+  // Album path navigation state
+  let currentPath = ''; // e.g. "" (all), "college", "college/trip"
+  let selectedAlbumId: string = 'all';
+  let isPathDropdownOpen = false;
+  let pathInputRef: HTMLInputElement | null = null;
 
   // Multi-selection state
   let selectedIds: Set<string> = new Set();
@@ -44,28 +52,130 @@
   let showBatchDeleteConfirm = false;
   let isDeleting = false;
 
-  $: selectedPeople = people.filter((p) => selectedIds.has(p.id));$: canMergeSelected = selectedIds.size >= 2;
+  $: selectedPeople = people.filter((p) => selectedIds.has(p.id));
+  $: canMergeSelected = selectedIds.size >= 2;
   $: canDeleteSelected = selectedIds.size > 0;
 
-  async function loadPeople() {
+  // Process albums into normalized path segments
+  $: allAlbums = albums.map((a) => {
+    const rawPath = (a.title || '').trim().replace(/^\/+|\/+$/g, '');
+    return {
+      id: a.id,
+      title: a.title || 'Untitled',
+      normalizedPath: rawPath.toLowerCase(),
+      displayPath: rawPath
+    };
+  });
+
+  // Calculate suggestions based on what is typed in currentPath
+  $: pathSuggestions = (() => {
+    const query = currentPath.trim().toLowerCase().replace(/^\/+/, '');
+    
+    if (!query) {
+      // At root level: show all top-level directory names
+      const rootSegments = new Set<string>();
+      const directMatches: { id: string; title: string; nextSegment: string; fullPath: string }[] = [];
+
+      for (const a of allAlbums) {
+        const parts = a.displayPath.split('/');
+        const top = parts[0];
+        if (!rootSegments.has(top.toLowerCase())) {
+          rootSegments.add(top.toLowerCase());
+          directMatches.push({
+            id: parts.length === 1 ? a.id : '',
+            title: top,
+            nextSegment: top,
+            fullPath: top + (parts.length > 1 ? '/' : '')
+          });
+        }
+      }
+      return directMatches;
+    }
+
+    // Matching sub-paths (e.g., query is "college" or "college/")
+    const cleanPrefix = query.endsWith('/') ? query : query + '/';
+    const suggestions: { id: string; title: string; nextSegment: string; fullPath: string }[] = [];
+    const seenSegments = new Set<string>();
+
+    for (const a of allAlbums) {
+      if (a.normalizedPath.startsWith(cleanPrefix) || a.normalizedPath.startsWith(query)) {
+        const remaining = a.displayPath.slice(
+          a.normalizedPath.startsWith(cleanPrefix) ? cleanPrefix.length : query.length
+        ).replace(/^\/+/, '');
+        
+        const nextSegment = remaining.split('/')[0];
+        if (nextSegment && !seenSegments.has(nextSegment.toLowerCase())) {
+          seenSegments.add(nextSegment.toLowerCase());
+          const hasMore = remaining.includes('/');
+          const nextFullPath = (cleanPrefix + nextSegment).replace(/\/+/g, '/') + (hasMore ? '/' : '');
+          suggestions.push({
+            id: !hasMore ? a.id : '',
+            title: nextSegment,
+            nextSegment,
+            fullPath: nextFullPath
+          });
+        } else if (!nextSegment && !seenSegments.has(a.normalizedPath)) {
+          // Exact match on album
+          seenSegments.add(a.normalizedPath);
+          suggestions.push({
+            id: a.id,
+            title: a.title,
+            nextSegment: a.title,
+            fullPath: a.displayPath
+          });
+        }
+      }
+    }
+
+    return suggestions;
+  })();
+
+  async function loadData(albumId: string = selectedAlbumId) {
     if (!browser || !$authStore.isAuthenticated) return;
     isLoading = true;
     try {
-      const [peopleData, namesData] = await Promise.all([
-        fetchPeopleOverview(),
-        fetchNamesDirectory()
+      const [peopleData, namesData, albumsData] = await Promise.all([
+        fetchPeopleOverview(albumId === 'all' ? undefined : albumId),
+        fetchNamesDirectory(),
+        fetchCustomAlbums()
       ]);
       people = peopleData;
       nameDirectory = namesData;
+      albums = albumsData;
     } catch (e) {
-      console.error('Failed loading people:', e);
+      console.error('Failed loading modal data:', e);
     } finally {
       isLoading = false;
     }
   }
 
+  // Load when opened or when selected album changes
   $: if (isOpen && browser &&$authStore.isAuthenticated) {
-    loadPeople();
+    loadData(selectedAlbumId);
+  }
+
+  function handleSelectPath(suggestion: { id: string; fullPath: string }) {
+    currentPath = suggestion.fullPath;
+    if (suggestion.id) {
+      selectedAlbumId = suggestion.id;
+      isPathDropdownOpen = false;
+    } else {
+      // Find matching album ID if this path matches an existing album directly
+      const clean = currentPath.toLowerCase().replace(/\/+$/, '');
+      const matched = allAlbums.find((a) => a.normalizedPath === clean);
+      if (matched) {
+        selectedAlbumId = matched.id;
+      }
+      isPathDropdownOpen = true;
+    }
+    clearSelection();
+  }
+
+  function handleClearToRoot() {
+    currentPath = '';
+    selectedAlbumId = 'all';
+    isPathDropdownOpen = false;
+    clearSelection();
   }
 
   function toggleSelection(id: string) {
@@ -97,7 +207,7 @@
     if (matched) {
       try {
         await mergePersons(person.id, matched.id);
-        await loadPeople();
+        await loadData(selectedAlbumId);
       } catch (err) {
         console.error('Auto-merge failed:', err);
       }
@@ -123,7 +233,7 @@
       source = null;
       target = null;
       clearSelection();
-      await loadPeople();
+      await loadData(selectedAlbumId);
     } catch (err) {
       console.error('Merge failed:', err);
     } finally {
@@ -148,7 +258,7 @@
       }
       showMultiMergeModal = false;
       clearSelection();
-      await loadPeople();
+      await loadData(selectedAlbumId);
     } catch (err) {
       console.error('Multi-merge failed:', err);
     } finally {
@@ -192,7 +302,9 @@
   function handleKeydown(e: KeyboardEvent) {
     if (!isOpen) return;
     if (e.key === 'Escape') {
-      if (showBatchDeleteConfirm) {
+      if (isPathDropdownOpen) {
+        isPathDropdownOpen = false;
+      } else if (showBatchDeleteConfirm) {
         showBatchDeleteConfirm = false;
       } else if (showMultiMergeModal) {
         showMultiMergeModal = false;
@@ -242,7 +354,7 @@
             <span>People & Faces</span>
           </h2>
           <p class="text-[11px] text-[var(--text-muted)] mt-0.5 tracking-tight">
-            Click to filter or select. Drag onto another person or use checkboxes to bulk merge and delete.
+            Filter faces across library folders to easily cluster and merge duplicates.
           </p>
         </div>
 
@@ -262,6 +374,89 @@
               <line x1="6" y1="6" x2="18" y2="18"></line>
             </svg>
           </button>
+        </div>
+      </div>
+
+      <!-- Path & Sub-Album Navigation Bar -->
+      <div class="px-6 py-3 border-b border-[var(--border-glass)] bg-black/10 dark:bg-white/[0.02] flex items-center gap-2 relative">
+        <!-- Quick Reset Button -->
+        <button
+          type="button"
+          on:click={handleClearToRoot}
+          class="px-2.5 py-1.5 rounded-xl text-xs font-medium flex items-center gap-1.5 transition-all spring-tap cursor-pointer whitespace-nowrap {selectedAlbumId === 'all' ? 'bg-purple-600 text-white shadow-sm' : 'liquid-card text-[var(--text-muted)] hover:text-[var(--text-main)]'}"
+          title="Show faces across all library photos"
+        >
+          <svg xmlns="http://www.w3.org/2000/svg" class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <rect x="3" y="3" width="7" height="7"></rect>
+            <rect x="14" y="3" width="7" height="7"></rect>
+            <rect x="14" y="14" width="7" height="7"></rect>
+            <rect x="3" y="14" width="7" height="7"></rect>
+          </svg>
+          <span>All Library</span>
+        </button>
+
+        <!-- Path Input Box -->
+        <div class="relative flex-1">
+          <div class="liquid-input flex items-center gap-2 px-3 py-1.5 rounded-xl text-xs">
+            <span class="text-[var(--text-muted)] font-mono select-none">root/</span>
+            <input
+              type="text"
+              bind:this={pathInputRef}
+              bind:value={currentPath}
+              placeholder="college/subfolder/..."
+              on:focus={() => (isPathDropdownOpen = true)}
+              on:input={() => (isPathDropdownOpen = true)}
+              class="bg-transparent border-none outline-none flex-1 text-[var(--text-main)] placeholder-[var(--text-muted)]/50 font-mono text-xs"
+            />
+            {#if currentPath}
+              <button
+                type="button"
+                on:click={() => { currentPath = ''; isPathDropdownOpen = true; }}
+                class="text-[var(--text-muted)] hover:text-[var(--text-main)] p-0.5"
+                title="Clear folder path"
+              >
+                <svg xmlns="http://www.w3.org/2000/svg" class="w-3 3" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+                  <line x1="18" y1="6" x2="6" y2="18"></line>
+                  <line x1="6" y1="6" x2="18" y2="18"></line>
+                </svg>
+              </button>
+            {/if}
+          </div>
+
+          <!-- Dynamic Path Suggestions Dropdown -->
+          {#if isPathDropdownOpen && pathSuggestions.length > 0}
+            <div
+              transition:scale={{ start: 0.98, duration: 100 }}
+              class="absolute left-0 right-0 top-full mt-1.5 z-30 liquid-modal rounded-2xl shadow-xl max-h-56 overflow-y-auto p-1.5 space-y-1 no-scrollbar border border-[var(--border-glass)]"
+            >
+              <div class="px-2 py-1 text-[10px] text-[var(--text-muted)] font-mono uppercase tracking-wider">
+                Matching Folders & Albums
+              </div>
+              {#each pathSuggestions as item}
+                <button
+                  type="button"
+                  on:click={() => handleSelectPath(item)}
+                  class="w-full flex items-center justify-between px-2.5 py-1.5 rounded-lg text-left text-xs hover:bg-[var(--dock-bg-hover)] transition-colors cursor-pointer text-[var(--text-main)]"
+                >
+                  <div class="flex items-center gap-2 truncate">
+                    <svg xmlns="http://www.w3.org/2000/svg" class="w-3.5 h-3.5 text-purple-400 flex-shrink-0" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                      <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path>
+                    </svg>
+                    <span class="font-mono text-xs truncate">root/{item.fullPath}</span>
+                  </div>
+                  {#if item.id}
+                    <span class="text-[10px] px-1.5 py-0.5 rounded bg-purple-500/20 text-purple-300 font-mono">
+                      album
+                    </span>
+                  {:else}
+                    <span class="text-[10px] text-[var(--text-muted)] font-mono">
+                      folder &rarr;
+                    </span>
+                  {/if}
+                </button>
+              {/each}
+            </div>
+          {/if}
         </div>
       </div>
 
@@ -335,7 +530,7 @@
           </div>
         {:else if people.length === 0}
           <div class="text-xs text-[var(--text-muted)] text-center py-20 font-normal">
-            No identified faces found in your library yet.
+            No identified faces found in this folder or album.
           </div>
         {:else}
           <div class="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 gap-3">

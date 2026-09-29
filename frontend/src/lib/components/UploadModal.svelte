@@ -185,13 +185,19 @@
 
           const res = await fetch(`/api/upload/ingest${queryParam}`, {
             method: 'POST',
-            headers: { 'Content-Type': 'text/plain' },
+            headers: { 'Content-Type': 'application/json' },
             credentials: 'include',
-            body: urlToSend
+            body: JSON.stringify({
+              url: urlToSend,
+              folder: cleanInputPath || undefined
+            })
           });
 
           if (res.ok) {
             dispatch('uploaded', { count: 1 });
+          } else {
+            const errData = await res.json().catch(() => ({}));
+            console.error('Ingest failed:', errData);
           }
         }
       } catch (err) {

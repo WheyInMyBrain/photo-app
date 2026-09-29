@@ -25,9 +25,13 @@ export interface AssetFaceDetail {
   is_verified: boolean;
 }
 
-export async function fetchPeopleOverview(): Promise<PersonCard[]> {
-  const res = await fetch('/api/smart-albums/people', { credentials: 'include' });
-  if (!res.ok) throw new Error('Failed to load people identities');
+export async function fetchPeopleOverview(albumId?: string): Promise<PersonCard[]> {
+  const url = albumId && albumId !== 'all'
+    ? `/api/smart-albums/people?album_id=${encodeURIComponent(albumId)}`
+    : '/api/smart-albums/people';
+
+  const res = await fetch(url);
+  if (!res.ok) throw new Error('Failed to fetch people overview');
   return res.json();
 }
 

@@ -5,38 +5,81 @@ pub struct PersonRepo;
 
 impl PersonRepo {
     /// Returns clustered identities visible strictly for the given user
-    pub async fn get_overview(pool: &SqlitePool, user_id: &str) -> Result<Vec<PersonCard>, sqlx::Error> {
-        let rows = sqlx::query(
-            r#"
-            SELECT 
-                p.id,
-                p.name,
-                COUNT(af.id) AS face_count,
-                (
-                    SELECT af2.face_thumb_path 
-                    FROM asset_faces af2
-                    JOIN assets a2 ON af2.asset_id = a2.id
-                    WHERE af2.person_id = p.id 
-                      AND a2.user_id = ?1
-                      AND a2.deleted_at IS NULL
-                    ORDER BY af2.detection_score DESC 
-                    LIMIT 1
-                ) AS avatar_thumb
-            FROM persons p
-            JOIN asset_faces af ON af.person_id = p.id
-            JOIN assets a ON af.asset_id = a.id
-            WHERE p.user_id = ?1
-              AND a.user_id = ?1
-              AND a.deleted_at IS NULL 
-              AND p.is_hidden = 0
-            GROUP BY p.id
-            HAVING face_count >= 1
-            ORDER BY face_count DESC
-            "#,
-        )
-        .bind(user_id)
-        .fetch_all(pool)
-        .await?;
+    pub async fn get_overview(
+        pool: &SqlitePool,
+        user_id: &str,
+        album_id: Option<&str>,
+    ) -> Result<Vec<PersonCard>, sqlx::Error> {
+        let rows = if let Some(aid) = album_id {
+            sqlx::query(
+                r#"
+                SELECT 
+                    p.id,
+                    p.name,
+                    COUNT(af.id) AS face_count,
+                    (
+                        SELECT af2.face_thumb_path 
+                        FROM asset_faces af2
+                        JOIN assets a2 ON af2.asset_id = a2.id
+                        JOIN album_assets aa2 ON aa2.asset_id = a2.id
+                        WHERE af2.person_id = p.id 
+                          AND a2.user_id = ?1
+                          AND aa2.album_id = ?2
+                          AND a2.deleted_at IS NULL
+                        ORDER BY af2.detection_score DESC 
+                        LIMIT 1
+                    ) AS avatar_thumb
+                FROM persons p
+                JOIN asset_faces af ON af.person_id = p.id
+                JOIN assets a ON af.asset_id = a.id
+                JOIN album_assets aa ON aa.asset_id = a.id
+                WHERE p.user_id = ?1
+                  AND a.user_id = ?1
+                  AND aa.album_id = ?2
+                  AND a.deleted_at IS NULL 
+                  AND p.is_hidden = 0
+                GROUP BY p.id
+                HAVING face_count >= 1
+                ORDER BY face_count DESC
+                "#,
+            )
+            .bind(user_id)
+            .bind(aid)
+            .fetch_all(pool)
+            .await?
+        } else {
+            sqlx::query(
+                r#"
+                SELECT 
+                    p.id,
+                    p.name,
+                    COUNT(af.id) AS face_count,
+                    (
+                        SELECT af2.face_thumb_path 
+                        FROM asset_faces af2
+                        JOIN assets a2 ON af2.asset_id = a2.id
+                        WHERE af2.person_id = p.id 
+                          AND a2.user_id = ?1
+                          AND a2.deleted_at IS NULL
+                        ORDER BY af2.detection_score DESC 
+                        LIMIT 1
+                    ) AS avatar_thumb
+                FROM persons p
+                JOIN asset_faces af ON af.person_id = p.id
+                JOIN assets a ON af.asset_id = a.id
+                WHERE p.user_id = ?1
+                  AND a.user_id = ?1
+                  AND a.deleted_at IS NULL 
+                  AND p.is_hidden = 0
+                GROUP BY p.id
+                HAVING face_count >= 1
+                ORDER BY face_count DESC
+                "#,
+            )
+            .bind(user_id)
+            .fetch_all(pool)
+            .await?
+        };
 
         let people = rows
             .into_iter()

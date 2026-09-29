@@ -1,5 +1,5 @@
 use axum::{
-    extract::{Path as AxumPath, State},
+    extract::{Path as AxumPath, Query, State},
     response::Json,
 };
 use serde::Deserialize;
@@ -10,14 +10,24 @@ use crate::error::AppError;
 use crate::middleware::auth::AuthUser;
 use crate::AppState;
 
-/// GET /api/smart-albums/people
+#[derive(Deserialize)]
+pub struct PeopleOverviewQuery {
+    pub album_id: Option<String>,
+}
+
+/// GET /api/smart-albums/people?album_id=...
 pub async fn get_people_overview(
     State(state): State<AppState>,
     auth_user: AuthUser,
+    Query(query): Query<PeopleOverviewQuery>,
 ) -> Result<Json<Vec<PersonCard>>, AppError> {
-    let people = PersonRepo::get_overview(&state.db, &auth_user.id)
-        .await
-        .map_err(|e| AppError::Internal(e.to_string()))?;
+    let people = PersonRepo::get_overview(
+        &state.db,
+        &auth_user.id,
+        query.album_id.as_deref(),
+    )
+    .await
+    .map_err(|e| AppError::Internal(e.to_string()))?;
 
     Ok(Json(people))
 }
