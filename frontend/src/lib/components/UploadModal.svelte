@@ -21,7 +21,7 @@
   let isFolderDropdownOpen = false;
   let fileInputEl: HTMLInputElement;
 
-  // Active directory level inside the folder tree browser (e.g. "" for root, "College" for College/)
+  // Active directory level inside the folder tree browser
   let browsingDir = '';
   let searchQuery = '';
 
@@ -31,25 +31,24 @@
     initialFiles = [];
   }
 
+  // Can upload if files are staged OR if there's a link preview with selections OR a raw URL typed in
   $: canUpload =
     $uploadQueue.uploadMode === 'files'
       ? $uploadQueue.stagedFiles.length > 0
-      : $uploadQueue.linkPreview !== null && $uploadQueue.selectedLinkItems.size > 0;
+      : ($uploadQueue.linkPreview !== null && $uploadQueue.selectedLinkItems.size > 0) ||
+        Boolean($uploadQueue.linkUrl.trim());
 
-  // Normalized folder path
+  // Normalized folder path (empty string means "Auto / Server Suggested")
   $: cleanInputPath = normalizePath($uploadQueue.folderPath);
 
-  // Fetch children under the folder we are currently browsing
   $: currentChildren = getDirectChildren(rawAlbumPaths, browsingDir);
 
-  // Filter children by live search query if typing
   $: visibleNodes = searchQuery.trim()
     ? currentChildren.filter((node) =>
         node.name.toLowerCase().includes(searchQuery.trim().toLowerCase())
       )
     : currentChildren;
 
-  // Split browsingDir into clickable breadcrumb steps
   $: browsingCrumbs = (() => {
     if (!browsingDir) return [];
     const parts = browsingDir.split('/');
@@ -124,26 +123,62 @@
     selectDirectory(newFullPath);
   }
 
-  // Non-blocking handoff: Closes modal instantly and starts floating widget
-  function handleStartUpload() {
+  // Unified start upload handler (Supports files batch, inspected items, or 1-click direct link ingest)
+  async function handleStartUpload() {
     const state = $uploadQueue;
+
     if (state.uploadMode === 'files' && state.stagedFiles.length > 0) {
       const filesToUpload = [...state.stagedFiles];
       const targetFolder = cleanInputPath;
 
-      // Close modal immediately
       forceClose();
 
-      // Launch floating bottom-right persistent progress widget
       uploadProgressStore.startBatch(filesToUpload, targetFolder, () => {
         dispatch('uploaded', { count: filesToUpload.length });
       });
-    } else {
-      // Web link import path
-      uploadQueue.executeUpload((count) => {
-        dispatch('uploaded', { count });
-        forceClose();
-      });
+    } else if (state.uploadMode === 'link') {
+      forceClose();
+
+      try {
+        // If the user inspected items and selected specific ones, do a JSON batch commit
+        if (state.linkPreview && state.selectedLinkItems.size > 0) {
+          const selectedIds = Array.from(state.selectedLinkItems);
+          const payload = {
+            platform: state.linkPreview.platform,
+            folder: cleanInputPath || state.linkPreview.suggested_folder,
+            selected_items: state.linkPreview.items.filter((item) => selectedIds.includes(item.id))
+          };
+
+          const res = await fetch('/api/upload/ingest', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            credentials: 'include',
+            body: JSON.stringify(payload)
+          });
+
+          if (res.ok) {
+            dispatch('uploaded', { count: selectedIds.size });
+          }
+        } 
+        // Otherwise, do 1-click direct link ingest (sending raw URL text to backend)
+        else if (state.linkUrl.trim()) {
+          const urlToSend = state.linkUrl.trim();
+          const queryParam = cleanInputPath ? `?folder=${encodeURIComponent(cleanInputPath)}` : '';
+
+          const res = await fetch(`/api/upload/ingest${queryParam}`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'text/plain' },
+            credentials: 'include',
+            body: urlToSend
+          });
+
+          if (res.ok) {
+            dispatch('uploaded', { count: 1 });
+          }
+        }
+      } catch (err) {
+        console.error('Link import error:', err);
+      }
     }
   }
 
@@ -235,7 +270,7 @@
                 }}
                 class="text-[10px] text-purple-600 dark:text-purple-400 hover:underline cursor-pointer"
               >
-                Clear to root
+                Reset to Auto
               </button>
             {/if}
           </div>
@@ -253,7 +288,7 @@
                   <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path>
                 </svg>
                 <span class="truncate font-medium">
-                  {$uploadQueue.folderPath ? $uploadQueue.folderPath : 'root (no album)'}
+                  {$uploadQueue.folderPath ? $uploadQueue.folderPath : 'Auto (Suggested by link or root)'}
                 </span>
               </div>
               <span class="text-[10px] text-[var(--text-muted)] opacity-60">
@@ -312,7 +347,7 @@
                   on:click={() => selectDirectory(browsingDir)}
                   class="w-full text-left px-2.5 py-1.5 rounded-lg text-xs bg-purple-500/10 hover:bg-purple-500/20 text-purple-600 dark:text-purple-300 font-medium transition-colors flex items-center justify-between cursor-pointer"
                 >
-                  <span class="truncate">Select "{browsingDir || 'root'}"</span>
+                  <span class="truncate">Select "{browsingDir || 'Auto (Suggested)'}"</span>
                   <span class="text-[10px] uppercase font-mono">Use Current</span>
                 </button>
 
@@ -441,7 +476,7 @@
             {/if}
           </div>
         {:else}
-          <!-- Web Link Section -->
+          <!-- Web Link Section with Two-Way Inspect / Direct Ingest -->
           {#if !$uploadQueue.linkPreview}
             <div class="space-y-3">
               <div class="space-y-1.5">
@@ -462,9 +497,10 @@
                     type="button"
                     on:click={() => uploadQueue.inspectLink()}
                     disabled={!$uploadQueue.linkUrl.trim()}
-                    class="liquid-btn-primary px-4 py-2 rounded-xl text-xs font-semibold text-white transition-all disabled:opacity-40 cursor-pointer flex items-center gap-1.5 min-w-[76px] justify-center spring-tap shadow-sm"
+                    class="liquid-btn-secondary px-3.5 py-2 rounded-xl text-xs font-medium text-[var(--text-main)] transition-all disabled:opacity-40 cursor-pointer flex items-center justify-center spring-tap"
+                    title="Inspect items before importing"
                   >
-                    <span>Inspect</span>
+                    Inspect
                   </button>
                 </div>
               </div>
@@ -542,8 +578,10 @@
         >
           {#if $uploadQueue.uploadMode === 'files'}
             Upload {$uploadQueue.stagedFiles.length} item{$uploadQueue.stagedFiles.length === 1 ? '' : 's'}
+          {:else if $uploadQueue.linkPreview}
+            Import Selected ({$uploadQueue.selectedLinkItems.size})
           {:else}
-            Import {$uploadQueue.selectedLinkItems.size} item{$uploadQueue.selectedLinkItems.size === 1 ? '' : 's'}
+            Import Link (Auto)
           {/if}
         </button>
       </div>
