@@ -841,7 +841,7 @@ pub async fn upload_ingest(
         .and_then(|h| h.to_str().ok())
         .unwrap_or("");
 
-    // Case 1: Selective JSON commit
+    // Case 1: Selective JSON commit or JSON with a URL
     if content_type.starts_with("application/json") {
         if let Ok(commit_req) = serde_json::from_slice::<CommitLinkRequest>(&body) {
             let target_folder = commit_req
@@ -858,10 +858,30 @@ pub async fn upload_ingest(
             .await?;
 
             return Ok(Json(IngestResponse::Batch(receipt)));
+        } 
+        // Added fallback to catch JSON objects with a "url" field or a raw JSON string URL
+        else if let Ok(val) = serde_json::from_slice::<serde_json::Value>(&body) {
+            if let Some(url) = val.get("url").and_then(|v| v.as_str()).or_else(|| val.as_str()) {
+                if url.starts_with("http://") || url.starts_with("https://") {
+                    let manifest = resolve_or_scrape_manifest(&state, &auth_user, url).await?;
+                    let target_folder = query.folder.unwrap_or(manifest.suggested_folder);
+
+                    let receipt = execute_item_downloads(
+                        &state,
+                        &auth_user,
+                        manifest.items,
+                        &target_folder,
+                        &manifest.platform,
+                    )
+                    .await?;
+
+                    return Ok(Json(IngestResponse::Batch(receipt)));
+                }
+            }
         }
     }
 
-    // Case 2: URL Auto-Commit
+    // Case 2: URL Auto-Commit (Plain text / raw string URLs)
     let is_text_or_url = content_type.starts_with("text/")
         || (body.len() < 2048
             && std::str::from_utf8(&body)
