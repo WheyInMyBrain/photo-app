@@ -841,8 +841,9 @@ pub async fn upload_ingest(
         .and_then(|h| h.to_str().ok())
         .unwrap_or("");
 
-    // Case 1: Selective JSON commit or JSON with a URL
-    if content_type.starts_with("application/json") {
+    // Case 1: JSON Payloads (Handles both CommitLinkRequest AND Apple Shortcut {"url": "..."})
+    if content_type.starts_with("application/json") || body.starts_with(b"{") {
+        // 1a: Try CommitLinkRequest (web app selective import)
         if let Ok(commit_req) = serde_json::from_slice::<CommitLinkRequest>(&body) {
             let target_folder = commit_req
                 .folder
@@ -858,12 +859,19 @@ pub async fn upload_ingest(
             .await?;
 
             return Ok(Json(IngestResponse::Batch(receipt)));
-        } 
-        // Added fallback to catch JSON objects with a "url" field or a raw JSON string URL
-        else if let Ok(val) = serde_json::from_slice::<serde_json::Value>(&body) {
-            if let Some(url) = val.get("url").and_then(|v| v.as_str()).or_else(|| val.as_str()) {
-                if url.starts_with("http://") || url.starts_with("https://") {
-                    let manifest = resolve_or_scrape_manifest(&state, &auth_user, url).await?;
+        }
+
+        // 1b: Catch Apple Shortcut JSON: {"url": "https://..."} or {"link": "..."}
+        if let Ok(val) = serde_json::from_slice::<serde_json::Value>(&body) {
+            let extracted_url = val.get("url")
+                .or_else(|| val.get("link"))
+                .or_else(|| val.get("target"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim());
+
+            if let Some(target_url) = extracted_url {
+                if target_url.starts_with("http://") || target_url.starts_with("https://") {
+                    let manifest = resolve_or_scrape_manifest(&state, &auth_user, target_url).await?;
                     let target_folder = query.folder.unwrap_or(manifest.suggested_folder);
 
                     let receipt = execute_item_downloads(
@@ -881,7 +889,7 @@ pub async fn upload_ingest(
         }
     }
 
-    // Case 2: URL Auto-Commit (Plain text / raw string URLs)
+    // Case 2: URL Auto-Commit (Raw text link)
     let is_text_or_url = content_type.starts_with("text/")
         || (body.len() < 2048
             && std::str::from_utf8(&body)
@@ -909,7 +917,7 @@ pub async fn upload_ingest(
         }
     }
 
-    // Case 3: Binary Media Upload
+    // Case 3: Binary Media Upload (Real images / videos only)
     let file_name = resolve_incoming_filename(&query, &headers, &body);
     let final_folder = query.folder.unwrap_or_else(default_camera_folder);
 
