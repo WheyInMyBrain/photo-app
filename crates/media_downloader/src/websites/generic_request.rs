@@ -215,6 +215,7 @@ pub async fn scrape(url: &str) -> Result<ExtractedMediaMetadata> {
         published_at: extract_published_time(&html),
         tags: extract_tags(&html),
         items,
+        location: None,
         next_page_url: discover_next_page(url, &html),
         discovered_post_urls: discover_post_links(url, &html),
         embedded_player_urls: extract_embedded_players(url, &html),

@@ -1,7 +1,7 @@
 // src/websites/instagram.rs
 
 use crate::utils::page::extract_hashtags_from_text;
-use crate::models::{ExtractedMediaMetadata, MediaDimensions, MediaItem, MediaType, MediaVariant};
+use crate::models::{ExtractedLocation, ExtractedMediaMetadata, MediaDimensions, MediaItem, MediaType, MediaVariant};
 use crate::websites::Extractor;
 use anyhow::{bail, Context, Result};
 use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, COOKIE, REFERER, USER_AGENT};
@@ -96,6 +96,59 @@ pub async fn extract_instagram(
 }
 
 // -----------------------------------------------------------------------------
+// Location Resolver: Parses embedded coords or hits /locations/{id}/info/
+// -----------------------------------------------------------------------------
+async fn extract_and_resolve_location(
+    loc_val: Option<&Value>,
+    client: &Client,
+) -> Option<ExtractedLocation> {
+    let loc = loc_val?;
+    let name = loc.get("name").and_then(|n| n.as_str())?.trim().to_string();
+    if name.is_empty() {
+        return None;
+    }
+
+    let mut latitude = loc.get("lat").and_then(|l| l.as_f64());
+    let mut longitude = loc.get("lng").and_then(|l| l.as_f64());
+
+    let location_id = loc
+        .get("pk")
+        .or_else(|| loc.get("id"))
+        .map(|v| v.to_string().trim_matches('"').to_string());
+
+    // If coordinates are missing from the post node, fetch them via the location info API
+    if (latitude.is_none() || longitude.is_none()) && location_id.is_some() {
+        if let Some(ref lid) = location_id {
+            let loc_api = format!("https://www.instagram.com/api/v1/locations/{lid}/info/");
+            if let Ok(resp) = client
+                .get(&loc_api)
+                .header(REFERER, "https://www.instagram.com/")
+                .send()
+                .await
+            {
+                if resp.status().is_success() {
+                    if let Ok(body) = resp.text().await {
+                        if let Ok(json) = serde_json::from_str::<Value>(&body) {
+                            if let Some(loc_node) = json.get("location") {
+                                latitude = loc_node.get("lat").and_then(|l| l.as_f64());
+                                longitude = loc_node.get("lng").and_then(|l| l.as_f64());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Some(ExtractedLocation {
+        name,
+        latitude,
+        longitude,
+        location_id,
+    })
+}
+
+// -----------------------------------------------------------------------------
 // Mobile /info/ API (Highest Master Quality + Full Variant List)
 // -----------------------------------------------------------------------------
 async fn fetch_mobile_post_info(shortcode: &str, client: &Client) -> Result<ExtractedMediaMetadata> {
@@ -155,6 +208,8 @@ async fn fetch_mobile_post_info(shortcode: &str, client: &Client) -> Result<Extr
         bail!("Failed to parse media items from mobile payload for shortcode: {shortcode}");
     }
 
+    let location = extract_and_resolve_location(item.get("location"), client).await;
+
     Ok(ExtractedMediaMetadata {
         platform: "instagram".to_string(),
         author,
@@ -166,6 +221,7 @@ async fn fetch_mobile_post_info(shortcode: &str, client: &Client) -> Result<Extr
             .and_then(format_epoch_timestamp),
         tags,
         items,
+        location,
         next_page_url: None,
         discovered_post_urls: Vec::new(),
         embedded_player_urls: Vec::new(),
@@ -228,6 +284,8 @@ async fn fetch_graphql_post_info(shortcode: &str, client: &Client) -> Result<Ext
         bail!("No items parsed from GraphQL for {shortcode}");
     }
 
+    let location = extract_and_resolve_location(media.get("location"), client).await;
+
     Ok(ExtractedMediaMetadata {
         platform: "instagram".to_string(),
         author,
@@ -240,6 +298,7 @@ async fn fetch_graphql_post_info(shortcode: &str, client: &Client) -> Result<Ext
             .and_then(format_epoch_timestamp),
         tags,
         items,
+        location,
         next_page_url: None,
         discovered_post_urls: Vec::new(),
         embedded_player_urls: Vec::new(),
@@ -283,8 +342,6 @@ fn parse_graphql_node(node: &Value) -> Option<MediaItem> {
                     if seen.insert(cleaned.clone()) {
                         let w = res.get("config_width").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
                         let h = res.get("config_height").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-                        
-                        // GraphQL does not expose byte size; parse if present in custom nodes, else None
                         let file_size_bytes = res.get("file_size_bytes").and_then(|v| v.as_u64());
 
                         variants.push(MediaVariant {
@@ -302,9 +359,6 @@ fn parse_graphql_node(node: &Value) -> Option<MediaItem> {
             }
         }
 
-        // Sort ascending by area (w * h):
-        // index 0 = smallest resolution (thumbnail)
-        // index last = highest resolution (master asset)
         variants.sort_by_key(|v| {
             v.dimensions
                 .as_ref()
@@ -312,19 +366,16 @@ fn parse_graphql_node(node: &Value) -> Option<MediaItem> {
                 .unwrap_or(0)
         });
 
-        // 1. Master High-Res URL: pick largest variant, or fallback to display_url
         let high_res_url = variants
             .last()
             .map(|v| v.url.clone())
             .unwrap_or_else(|| display_url.clone());
 
-        // 2. Best Dimensions: pick from largest variant, or fallback to node dims
         let best_dims = variants
             .last()
             .and_then(|v| v.dimensions.clone())
             .or(dims);
 
-        // 3. Thumbnail URL: pick smallest variant (~150w-640w), or fallback to display_url
         let thumb_url = variants
             .first()
             .map(|v| v.url.clone())
@@ -412,9 +463,10 @@ async fn extract_highlight_links(input_url: &str, client: &Client) -> Result<Ext
         author: user_name,
         caption: format!("Highlight {highlight_id}"),
         post_text: None,
-        published_at: published_at,
+        published_at,
         tags: Vec::new(),
         items,
+        location: None,
         next_page_url: None,
         discovered_post_urls: Vec::new(),
         embedded_player_urls: Vec::new(),
@@ -437,7 +489,7 @@ async fn extract_user_profile_feed(input_url: &str, client: &Client) -> Result<E
     let mut discovered_post_urls = Vec::new();
     let mut current_max_id: Option<String> = None;
     let mut page_count = 0;
-    const MAX_PAGES: usize = 100; // Safety cap (e.g. 100 * 12 = 1200 items) to avoid infinite loops or rate bans
+    const MAX_PAGES: usize = 100;
 
     loop {
         page_count += 1;
@@ -453,7 +505,6 @@ async fn extract_user_profile_feed(input_url: &str, client: &Client) -> Result<E
             .await?;
 
         if !resp.status().is_success() {
-            // If the first page fails, return an error. If later pages fail, keep what we have.
             if items.is_empty() {
                 bail!("Instagram feed API returned HTTP {}", resp.status());
             } else {
@@ -495,7 +546,6 @@ async fn extract_user_profile_feed(input_url: &str, client: &Client) -> Result<E
         }
 
         current_max_id = next_max_id;
-        // Mild throttle to avoid getting IP-flagged during multi-page pagination
         tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
     }
 
@@ -511,6 +561,7 @@ async fn extract_user_profile_feed(input_url: &str, client: &Client) -> Result<E
         published_at: None,
         tags: Vec::new(),
         items,
+        location: None,
         next_page_url: None,
         discovered_post_urls,
         embedded_player_urls: Vec::new(),
@@ -580,6 +631,7 @@ async fn extract_story_links(input_url: &str, client: &Client) -> Result<Extract
         published_at: None,
         tags: Vec::new(),
         items,
+        location: None,
         next_page_url: None,
         discovered_post_urls: Vec::new(),
         embedded_player_urls: Vec::new(),
@@ -615,14 +667,17 @@ async fn extract_direct_pk_links(
         .and_then(|t| t.as_i64())
         .and_then(format_epoch_timestamp);
 
+    let location = extract_and_resolve_location(item.get("location"), client).await;
+
     Ok(ExtractedMediaMetadata {
         platform: "instagram".to_string(),
         author: username.to_string(),
         caption: format!("Story item {media_pk} from @{username}"),
         post_text: None,
-        published_at: published_at,
+        published_at,
         tags: Vec::new(),
         items,
+        location,
         next_page_url: None,
         discovered_post_urls: Vec::new(),
         embedded_player_urls: Vec::new(),
@@ -643,7 +698,6 @@ fn parse_media_item(item: &Value) -> Option<MediaItem> {
             return None;
         }
 
-        // Struct for intermediate sorting: (width, height, url, file_size)
         let mut parsed_variants: Vec<(usize, usize, String, Option<u64>)> = Vec::new();
         let mut seen_urls = HashSet::new();
 
@@ -678,7 +732,7 @@ fn parse_media_item(item: &Value) -> Option<MediaItem> {
             dims,
             best_size,
             best_url.clone(),
-            thumbnail_url, // Lowest resolution poster
+            thumbnail_url,
             None,
             None,
             Some("https://www.instagram.com/".to_string()),
@@ -729,7 +783,6 @@ fn parse_media_item(item: &Value) -> Option<MediaItem> {
             None
         };
 
-        // Smallest candidate variant acts as the lightweight thumbnail
         let thumb = parsed_variants
             .last()
             .map(|(_, _, u, _)| u.clone())
@@ -741,7 +794,7 @@ fn parse_media_item(item: &Value) -> Option<MediaItem> {
             dims,
             best_size,
             best_url.clone(),
-            thumb, // Populated with lightweight thumbnail
+            thumb,
             None,
             None,
             Some("https://www.instagram.com/".to_string()),
@@ -853,7 +906,6 @@ fn build_guest_client() -> Result<Client> {
     Ok(Client::builder().cookie_store(true).default_headers(headers).build()?)
 }
 
-// Fixed: Now explicitly accepts `&DownloaderConfig`
 fn build_auth_client(cfg: &DownloaderConfig) -> Result<Client> {
     let cookie = cfg
         .ig_cookie

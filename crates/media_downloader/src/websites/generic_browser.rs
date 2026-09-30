@@ -291,6 +291,7 @@ pub async fn sniff(url: &str, config: Option<&DownloaderConfig>) -> Result<Extra
         published_at: None,
         tags: Vec::new(),
         items,
+        location: None,
         next_page_url: None,
         discovered_post_urls: Vec::new(),
         embedded_player_urls: Vec::new(),

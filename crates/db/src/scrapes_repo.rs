@@ -11,6 +11,9 @@ pub struct ScrapedPostRecord {
     pub author: String,
     pub caption: Option<String>,
     pub tags: Vec<String>,
+    pub location_name: Option<String>,
+    pub latitude: Option<f64>,
+    pub longitude: Option<f64>,
     pub published_at: Option<String>, 
     pub next_page_url: Option<String>,
 }
@@ -44,6 +47,9 @@ pub struct ScrapedItemContext {
     pub author: String,
     pub caption: Option<String>,
     pub tags: Vec<String>,
+    pub location_name: Option<String>,
+    pub latitude: Option<f64>,
+    pub longitude: Option<f64>,
     pub source_url: String,
     pub published_at: Option<String>, 
 }
@@ -60,7 +66,8 @@ impl ScrapesRepo {
     ) -> Result<Option<ScrapedPostRecord>, sqlx::Error> {
         let row = sqlx::query(
             r#"
-            SELECT id, platform, external_post_id, source_url, author, caption, tags, published_at, next_page_url
+            SELECT id, platform, external_post_id, source_url, author, caption, tags,
+                   location_name, latitude, longitude, published_at, next_page_url
             FROM scraped_posts
             WHERE user_id = ?1 AND platform = ?2 AND external_post_id = ?3
             "#,
@@ -83,6 +90,9 @@ impl ScrapesRepo {
                 author: r.get("author"),
                 caption: r.get("caption"),
                 tags,
+                location_name: r.get("location_name"),
+                latitude: r.get("latitude"),
+                longitude: r.get("longitude"),
                 published_at: r.get("published_at"),
                 next_page_url: r.get("next_page_url"),
             }
@@ -150,7 +160,7 @@ impl ScrapesRepo {
         Ok(items)
     }
 
-    /// Full atomic save: post metadata, discovered links, media items, and all variant streams
+    /// Full atomic save: post metadata with coordinates, discovered links, media items, and all variant streams
     pub async fn save_scraped_post_and_items(
         pool: &SqlitePool,
         post_id: &str,
@@ -161,7 +171,10 @@ impl ScrapesRepo {
         author: &str,
         caption: Option<&str>,
         tags: &[String],
-        published_at: Option<&str>, // Added parameter
+        location_name: Option<&str>,
+        latitude: Option<f64>,
+        longitude: Option<f64>,
+        published_at: Option<&str>,
         discovered_urls: &[String],
         next_page_url: Option<&str>,
         items: &[ScrapedMediaItemRecord],
@@ -169,17 +182,21 @@ impl ScrapesRepo {
         let mut tx = pool.begin().await?;
         let tags_json = serde_json::to_string(tags).unwrap_or_else(|_| "[]".to_string());
 
-        // 1. Upsert Post Record with published_at
+        // 1. Upsert Post Record with location fields & published_at
         let resolved_post_id: String = sqlx::query_scalar(
             r#"
             INSERT INTO scraped_posts (
-                id, user_id, platform, external_post_id, source_url, author, caption, tags, published_at, next_page_url
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                id, user_id, platform, external_post_id, source_url, author, caption, tags,
+                location_name, latitude, longitude, published_at, next_page_url
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)
             ON CONFLICT(user_id, platform, external_post_id) DO UPDATE SET
                 source_url = excluded.source_url,
                 author = excluded.author,
                 caption = excluded.caption,
                 tags = excluded.tags,
+                location_name = excluded.location_name,
+                latitude = excluded.latitude,
+                longitude = excluded.longitude,
                 published_at = excluded.published_at,
                 next_page_url = excluded.next_page_url
             RETURNING id
@@ -193,6 +210,9 @@ impl ScrapesRepo {
         .bind(author)
         .bind(caption)
         .bind(tags_json)
+        .bind(location_name)
+        .bind(latitude)
+        .bind(longitude)
         .bind(published_at)
         .bind(next_page_url)
         .fetch_one(&mut *tx)
@@ -295,7 +315,8 @@ impl ScrapesRepo {
     ) -> Result<Option<ScrapedPostRecord>, sqlx::Error> {
         let row = sqlx::query(
             r#"
-            SELECT id, platform, external_post_id, source_url, author, caption, tags, published_at, next_page_url
+            SELECT id, platform, external_post_id, source_url, author, caption, tags,
+                   location_name, latitude, longitude, published_at, next_page_url
             FROM scraped_posts
             WHERE user_id = ?1 AND source_url = ?2
             "#,
@@ -317,6 +338,9 @@ impl ScrapesRepo {
                 author: r.get("author"),
                 caption: r.get("caption"),
                 tags,
+                location_name: r.get("location_name"),
+                latitude: r.get("latitude"),
+                longitude: r.get("longitude"),
                 published_at: r.get("published_at"),
                 next_page_url: r.get("next_page_url"),
             }
@@ -330,7 +354,8 @@ impl ScrapesRepo {
     ) -> Result<Option<ScrapedItemContext>, sqlx::Error> {
         let row = sqlx::query(
             r#"
-            SELECT sp.platform, sp.author, sp.caption, sp.tags, sp.source_url, sp.published_at
+            SELECT sp.platform, sp.author, sp.caption, sp.tags, sp.location_name,
+                   sp.latitude, sp.longitude, sp.source_url, sp.published_at
             FROM scraped_media_items smi
             JOIN scraped_posts sp ON smi.scraped_post_id = sp.id
             WHERE smi.id = ?1
@@ -350,6 +375,9 @@ impl ScrapesRepo {
                 author: r.get("author"),
                 caption: r.get("caption"),
                 tags,
+                location_name: r.get("location_name"),
+                latitude: r.get("latitude"),
+                longitude: r.get("longitude"),
                 source_url: r.get("source_url"),
                 published_at: r.get("published_at"),
             }

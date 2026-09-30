@@ -1,4 +1,5 @@
 // src/models.rs
+use serde::{Serialize, Deserialize};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MediaType {
@@ -72,6 +73,14 @@ impl MediaItem {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExtractedLocation {
+    pub name: String,
+    pub latitude: Option<f64>,
+    pub longitude: Option<f64>,
+    pub location_id: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct ExtractedMediaMetadata {
     pub platform: String,
@@ -81,6 +90,7 @@ pub struct ExtractedMediaMetadata {
     pub published_at: Option<String>,
     pub tags: Vec<String>,
     pub items: Vec<MediaItem>,
+    pub location: Option<ExtractedLocation>,
     pub next_page_url: Option<String>,
     pub discovered_post_urls: Vec<String>,
     pub embedded_player_urls: Vec<String>,

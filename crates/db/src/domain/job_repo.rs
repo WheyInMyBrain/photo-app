@@ -20,6 +20,10 @@ pub struct JobPayload {
     pub tags: Vec<String>,
     #[serde(default)]
     pub scraped_item_id: Option<String>,
+    #[serde(default)]
+    pub latitude: Option<f64>,
+    #[serde(default)]
+    pub longitude: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

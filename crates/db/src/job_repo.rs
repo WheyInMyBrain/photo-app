@@ -14,11 +14,16 @@ impl JobRepo {
             &job.job_type
         };
 
-        // Serialize the structured payload to JSON string (or None)
-        let payload_json = job
-            .payload
-            .as_ref()
-            .and_then(|p| serde_json::to_string(p).ok());
+        // Serialize structured payload to JSON string
+        let payload_json = match &job.payload {
+            Some(p) => Some(serde_json::to_string(p).map_err(|e| {
+                sqlx::Error::ColumnDecode {
+                    index: "payload".to_string(),
+                    source: Box::new(e),
+                }
+            })?),
+            None => None,
+        };
 
         sqlx::query(
             r#"
@@ -108,6 +113,30 @@ impl JobRepo {
         } else {
             Ok(None)
         }
+    }
+
+    /// Updates or enriches the job's payload JSON (e.g., adding coordinates or reverse-geocoded location)
+    pub async fn update_payload(
+        pool: &SqlitePool,
+        job_id: &str,
+        payload: &JobPayload,
+    ) -> Result<(), sqlx::Error> {
+        let payload_json = serde_json::to_string(payload).map_err(|e| {
+            sqlx::Error::ColumnDecode {
+                index: "payload".to_string(),
+                source: Box::new(e),
+            }
+        })?;
+
+        sqlx::query(
+            "UPDATE processing_jobs SET payload = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+        )
+        .bind(payload_json)
+        .bind(job_id)
+        .execute(pool)
+        .await?;
+
+        Ok(())
     }
 
     pub async fn mark_completed(pool: &SqlitePool, job_id: &str) -> Result<(), sqlx::Error> {

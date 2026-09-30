@@ -1,8 +1,6 @@
 // src/downloader/metadata.rs
 
 use anyhow::{bail, Context, Result};
-use little_exif::exif_tag::ExifTag;
-use little_exif::metadata::Metadata;
 use std::path::Path;
 use std::process::Stdio;
 use tokio::process::Command;
@@ -14,9 +12,11 @@ pub struct MediaMetadataPayload<'a> {
     pub source_url: Option<&'a str>,
     pub tags: &'a [String],
     pub published_at: Option<&'a str>,
+    pub location_name: Option<&'a str>,
+    pub latitude: Option<f64>,
+    pub longitude: Option<f64>,
 }
 
-/// Dispatches metadata injection based on file extension / media type
 pub async fn inject_metadata<P: AsRef<Path>>(
     file_path: P,
     meta: &MediaMetadataPayload<'_>,
@@ -30,62 +30,72 @@ pub async fn inject_metadata<P: AsRef<Path>>(
 
     match ext.as_str() {
         "jpg" | "jpeg" | "png" | "webp" => {
-            // little_exif is synchronous, execute inside spawn_blocking
-            let owned_path = path.to_path_buf();
-            let author = meta.author.map(|s| s.to_string());
-            let caption = meta.caption.map(|s| s.to_string());
-            let published_at = meta.published_at.map(|s| s.to_string());
-            let tags = meta.tags.to_vec();
-
-            tokio::task::spawn_blocking(move || {
-                inject_image_exif(&owned_path, author.as_deref(), caption.as_deref(), published_at.as_deref(), &tags)
-            })
-            .await??;
+            inject_image_exiftool(path, meta).await?;
         }
         "mp4" | "mov" | "m4v" => {
             inject_video_ffmpeg(path, meta).await?;
         }
-        _ => {
-            // Unsupported formats (e.g. raw gif, webm) safely pass through
-        }
+        _ => {}
     }
 
     Ok(())
 }
 
-fn inject_image_exif(
-    path: &Path,
-    author: Option<&str>,
-    caption: Option<&str>,
-    published_at: Option<&str>,
-    tags: &[String],
-) -> Result<()> {
-    let mut exif = Metadata::new_from_path(path).unwrap_or_else(|_| Metadata::new());
+async fn inject_image_exiftool(path: &Path, meta: &MediaMetadataPayload<'_>) -> Result<()> {
+    let mut cmd = Command::new("exiftool");
+    cmd.arg("-overwrite_original");
 
-    if let Some(author_val) = author {
-        exif.set_tag(ExifTag::Artist(author_val.to_string()));
+    if let Some(author) = meta.author {
+        cmd.arg(format!("-Artist={author}"));
+        cmd.arg(format!("-By-line={author}"));
     }
 
-    if let Some(cap) = caption {
-        exif.set_tag(ExifTag::ImageDescription(cap.to_string()));
+    if let Some(caption) = meta.caption {
+        cmd.arg(format!("-ImageDescription={caption}"));
+        cmd.arg(format!("-Description={caption}"));
     }
 
-    if !tags.is_empty() {
-        let tag_line = tags.join(", ");
-        let mut comment_bytes = b"ASCII\0\0\0".to_vec();
-        comment_bytes.extend_from_slice(tag_line.as_bytes());
-        exif.set_tag(ExifTag::UserComment(comment_bytes));
+    if let Some(url) = meta.source_url {
+        cmd.arg(format!("-Source={url}"));
     }
 
-    if let Some(pub_date) = published_at {
-        // EXIF standard format: "YYYY:MM:DD HH:MM:SS"
-        let clean_date = pub_date.replace('-', ":").replace('T', " ").replace('Z', "");
+    if !meta.tags.is_empty() {
+        for tag in meta.tags {
+            cmd.arg(format!("-Keywords={tag}"));
+        }
+    }
+
+    if let Some(published) = meta.published_at {
+        // EXIF date standard: "YYYY:MM:DD HH:MM:SS"
+        let clean_date = published.replace('-', ":").replace('T', " ").replace('Z', "");
         let exif_date = clean_date.split('.').next().unwrap_or(&clean_date);
-        exif.set_tag(ExifTag::DateTimeOriginal(exif_date.to_string()));
+        cmd.arg(format!("-DateTimeOriginal={exif_date}"));
+        cmd.arg(format!("-CreateDate={exif_date}"));
     }
 
-    // Write directly into the existing file header
-    let _ = exif.write_to_file(path);
+    if let Some(loc_name) = meta.location_name {
+        cmd.arg(format!("-City={loc_name}"));
+        cmd.arg(format!("-Location={loc_name}"));
+    }
+
+    if let (Some(lat), Some(lng)) = (meta.latitude, meta.longitude) {
+        cmd.arg(format!("-GPSLatitude={lat}"));
+        cmd.arg(format!("-GPSLatitudeRef={}", if lat >= 0.0 { "N" } else { "S" }));
+        cmd.arg(format!("-GPSLongitude={lng}"));
+        cmd.arg(format!("-GPSLongitudeRef={}", if lng >= 0.0 { "E" } else { "W" }));
+    }
+
+    cmd.arg(path);
+
+    cmd.stdout(Stdio::null());
+    cmd.stderr(Stdio::piped());
+
+    let output = cmd.output().await.context("Failed executing exiftool")?;
+    if !output.status.success() {
+        let err = String::from_utf8_lossy(&output.stderr);
+        bail!("exiftool metadata injection failed: {err}");
+    }
+
     Ok(())
 }
 
@@ -93,7 +103,9 @@ async fn inject_video_ffmpeg(path: &Path, meta: &MediaMetadataPayload<'_>) -> Re
     let temp_out = path.with_extension("meta_tmp.mp4");
 
     let mut cmd = Command::new("ffmpeg");
-    cmd.arg("-y").arg("-i").arg(path);
+    cmd.arg("-y")
+        .arg("-loglevel").arg("error")
+        .arg("-i").arg(path);
 
     if let Some(author) = meta.author {
         cmd.arg("-metadata").arg(format!("artist={author}"));
@@ -120,21 +132,30 @@ async fn inject_video_ffmpeg(path: &Path, meta: &MediaMetadataPayload<'_>) -> Re
         cmd.arg("-metadata").arg(format!("creation_time={published}"));
     }
 
-    cmd.args(["-c", "copy", "-movflags", "+faststart"])
+    if let Some(loc_name) = meta.location_name {
+        cmd.arg("-metadata").arg(format!("location_name={loc_name}"));
+    }
+
+    if let (Some(lat), Some(lng)) = (meta.latitude, meta.longitude) {
+        let iso_location = format!("{:+08.4}{:+09.4}/", lat, lng);
+        cmd.arg("-metadata").arg(format!("location={iso_location}"));
+        cmd.arg("-metadata").arg(format!("location-eng={iso_location}"));
+    }
+
+    cmd.args(["-map", "0", "-map_metadata", "0", "-c", "copy", "-movflags", "+faststart"])
         .arg(&temp_out);
 
     cmd.stdout(Stdio::null());
     cmd.stderr(Stdio::piped());
 
-    let output = cmd.output().await.context("Failed executing ffmpeg metadata tagging")?;
+    let output = cmd.output().await.context("Failed launching ffmpeg for video tagging")?;
 
     if !output.status.success() {
         let _ = tokio::fs::remove_file(&temp_out).await;
         let err_msg = String::from_utf8_lossy(&output.stderr);
-        bail!("ffmpeg metadata injection failed: {err_msg}");
+        bail!("ffmpeg video tagging failed: {err_msg}");
     }
 
-    // Replace downloaded file with tagged file
     tokio::fs::rename(&temp_out, path).await?;
     Ok(())
 }

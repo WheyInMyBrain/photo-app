@@ -604,7 +604,12 @@ async fn resolve_or_scrape_manifest(
         });
     }
 
-    // 3. Persist post and its items (including published_at)
+    // Extract optional location attributes
+    let location_name = extracted.location.as_ref().map(|l| l.name.as_str());
+    let latitude = extracted.location.as_ref().and_then(|l| l.latitude);
+    let longitude = extracted.location.as_ref().and_then(|l| l.longitude);
+
+    // 3. Persist post and its items (including location details and published_at)
     ScrapesRepo::save_scraped_post_and_items(
         &state.db,
         &post_uuid,
@@ -615,6 +620,9 @@ async fn resolve_or_scrape_manifest(
         &extracted.author,
         Some(&extracted.caption),
         &extracted.tags,
+        location_name,
+        latitude,
+        longitude,
         extracted.published_at.as_deref(),
         &extracted.discovered_post_urls,
         extracted.next_page_url.as_deref(),
@@ -692,25 +700,32 @@ async fn execute_item_downloads(
             .await
             .unwrap_or(None);
 
-        let (platform_val, author, caption, tags, source_url, published_at) = if let Some(c) = ctx {
-            (
-                Some(c.platform),
-                Some(c.author),
-                c.caption,
-                c.tags,
-                Some(c.source_url),
-                c.published_at,
-            )
-        } else {
-            (
-                Some(platform.to_string()),
-                None,
-                None,
-                Vec::new(),
-                item.referer.clone(),
-                None,
-            )
-        };
+        let (platform_val, author, caption, tags, source_url, published_at, location_name, latitude, longitude) =
+            if let Some(c) = ctx {
+                (
+                    Some(c.platform),
+                    Some(c.author),
+                    c.caption,
+                    c.tags,
+                    Some(c.source_url),
+                    c.published_at,
+                    c.location_name,
+                    c.latitude,
+                    c.longitude,
+                )
+            } else {
+                (
+                    Some(platform.to_string()),
+                    None,
+                    None,
+                    Vec::new(), // Fixed typo: was Vec::new>,
+                    item.referer.clone(),
+                    None,
+                    None,
+                    None,
+                    None,
+                )
+            };
 
         // 4. Inject EXIF / QuickTime/MP4 tags into file headers
         let meta_payload = MediaMetadataPayload {
@@ -719,6 +734,9 @@ async fn execute_item_downloads(
             source_url: source_url.as_deref(),
             tags: &tags,
             published_at: published_at.as_deref(),
+            location_name: location_name.as_deref(),
+            latitude,
+            longitude,
         };
 
         if let Err(err) = inject_metadata(&temp_file_path, &meta_payload).await {
@@ -735,8 +753,10 @@ async fn execute_item_downloads(
             source_url,
             source_post_id: None,
             caption,
-            tags,
+            tags: tags.clone(), // Cloned so ownership transfers cleanly to JobPayload
             scraped_item_id: Some(item.id.clone()),
+            latitude,
+            longitude,
         };
 
         // 5. Delegate hashing, deduplication, moving to disk, and queueing

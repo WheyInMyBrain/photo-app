@@ -36,6 +36,7 @@ RUN cargo build --release -p backend
 FROM debian:trixie-slim
 WORKDIR /app
 
+# perl-base is required to execute exiftool without installing heavy perl build tooling
 RUN apt-get update && apt-get install -y \
     ca-certificates \
     libsqlite3-0 \
@@ -43,14 +44,25 @@ RUN apt-get update && apt-get install -y \
     libx265-dev \
     libsharpyuv0 \
     libwebp7 \
+    perl-base \
     curl \
     tar \
+    gzip \
     xz-utils \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy compiled libheif shared libraries from builder
 COPY --from=builder /usr/local/lib /usr/local/lib
 RUN ldconfig
+
+# Install ExifTool 13.59
+RUN curl -fsSL "https://github.com/exiftool/exiftool/archive/refs/tags/13.59.tar.gz" -o /tmp/exiftool.tar.gz \
+    && mkdir -p /tmp/exiftool \
+    && tar -xzf /tmp/exiftool.tar.gz -C /tmp/exiftool --strip-components=1 \
+    && cp /tmp/exiftool/exiftool /usr/local/bin/exiftool \
+    && cp -r /tmp/exiftool/lib /usr/local/bin/lib \
+    && chmod +x /usr/local/bin/exiftool \
+    && rm -rf /tmp/exiftool /tmp/exiftool.tar.gz
 
 # Copy backend binary
 COPY --from=builder /app/target/release/backend /app/backend
