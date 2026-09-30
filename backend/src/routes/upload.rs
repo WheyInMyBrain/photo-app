@@ -6,9 +6,8 @@ use axum::{
 };
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
-use std::io::SeekFrom;
-use tokio::fs::{self, create_dir_all, File, OpenOptions, metadata};
-use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+use tokio::fs::{self, create_dir_all, File, OpenOptions};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use uuid::Uuid;
 use chrono::Local;
 
@@ -973,29 +972,24 @@ pub async fn upload_chunk(
         )));
     }
 
-    let temp_dir = resolve_user_temp_dir(&state, &auth_user.id, "chunks").await?;
-    let part_path = temp_dir.join(format!("{}.part", query.upload_id));
+    let temp_root = resolve_user_temp_dir(&state, &auth_user.id, "chunks").await?;
+    // Isolated session directory: /temp/chunks/{upload_id}/
+    let session_dir = temp_root.join(&query.upload_id);
+    fs::create_dir_all(&session_dir).await.map_err(|e| {
+        AppError::Internal(format!("Failed to create chunk session dir: {e}"))
+    })?;
 
-    let mut file = OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(false)
-        .open(&part_path)
-        .await
-        .map_err(|e| AppError::Internal(format!("Failed to open chunk file: {e}")))?;
+    // Record expected total_chunks in the session dir if not already recorded
+    let meta_path = session_dir.join("total_chunks");
+    if !meta_path.exists() {
+        let _ = fs::write(&meta_path, query.total_chunks.to_string()).await;
+    }
 
-    let offset = (query.chunk_index as u64) * query.chunk_size;
-    file.seek(SeekFrom::Start(offset))
-        .await
-        .map_err(|e| AppError::Internal(format!("Failed to seek to offset {offset}: {e}")))?;
-
-    file.write_all(&body)
-        .await
-        .map_err(|e| AppError::Internal(format!("Failed writing chunk at offset {offset}: {e}")))?;
-
-    file.flush()
-        .await
-        .map_err(|e| AppError::Internal(format!("Failed flushing chunk buffer: {e}")))?;
+    // Write chunk to its own isolated file in the session dir: e.g. "00003.part"
+    let chunk_path = session_dir.join(format!("{:06}.part", query.chunk_index));
+    fs::write(&chunk_path, &body).await.map_err(|e| {
+        AppError::Internal(format!("Failed writing chunk {}: {e}", query.chunk_index))
+    })?;
 
     Ok(Json(ChunkUploadResponse {
         upload_id: query.upload_id,
@@ -1010,29 +1004,70 @@ pub async fn finalize_chunk(
     auth_user: AuthUser,
     Query(query): Query<FinalizeChunkQuery>,
 ) -> Result<Json<UploadItemResult>, AppError> {
-    let temp_dir = resolve_user_temp_dir(&state, &auth_user.id, "chunks").await?;
-    let part_path = temp_dir.join(format!("{}.part", query.upload_id));
+    let temp_root = resolve_user_temp_dir(&state, &auth_user.id, "chunks").await?;
+    let session_dir = temp_root.join(&query.upload_id);
 
-    let meta = metadata(&part_path).await.map_err(|_| {
-        AppError::NotFound("Upload session not found or chunks missing".to_string())
-    })?;
-
-    if meta.len() == 0 {
-        return Err(AppError::BadRequest("Finalized file cannot be empty".to_string()));
+    if !session_dir.exists() {
+        return Err(AppError::NotFound(
+            "Upload session directory not found or expired".into(),
+        ));
     }
 
-    // Default to the same dynamic camera roll subfolder if no folder is passed
-    let final_folder = query.folder.unwrap_or_else(default_camera_folder);
+    // Read total_chunks recorded by upload_chunk
+    let meta_path = session_dir.join("total_chunks");
+    let total_chunks_str = fs::read_to_string(&meta_path).await.map_err(|_| {
+        AppError::BadRequest("Upload session missing metadata; no chunks received".into())
+    })?;
 
+    let total_chunks: u32 = total_chunks_str.trim().parse().map_err(|_| {
+        AppError::Internal("Corrupted total_chunks metadata".into())
+    })?;
+
+    let final_assembled_path = temp_root.join(format!("{}.complete", query.upload_id));
+    let mut assembled_file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&final_assembled_path)
+        .await
+        .map_err(|e| AppError::Internal(format!("Failed creating final assembled file: {e}")))?;
+
+    // Validate and stream-stitch all parts in order
+    for idx in 0..total_chunks {
+        let chunk_path = session_dir.join(format!("{:06}.part", idx));
+        
+        let chunk_data = fs::read(&chunk_path).await.map_err(|_| {
+            AppError::BadRequest(format!(
+                "Incomplete upload: chunk {} of {} is missing",
+                idx, total_chunks
+            ))
+        })?;
+
+        assembled_file.write_all(&chunk_data).await.map_err(|e| {
+            AppError::Internal(format!("Failed assembling chunk {idx}: {e}"))
+        })?;
+    }
+
+    assembled_file.flush().await.map_err(|e| {
+        AppError::Internal(format!("Failed flushing final file: {e}"))
+    })?;
+    drop(assembled_file);
+
+    // Ingest the file into storage & db
+    let final_folder = query.folder.unwrap_or_else(default_camera_folder);
     let result = persist_and_enqueue_staged_file(
         &state,
         &auth_user.id,
-        &part_path,
+        &final_assembled_path,
         &query.file_name,
         &final_folder,
         None,
     )
     .await?;
+
+    // Cleanup: Remove the temporary session directory and assembled file
+    let _ = fs::remove_dir_all(&session_dir).await;
+    let _ = fs::remove_file(&final_assembled_path).await;
 
     Ok(Json(result))
 }
