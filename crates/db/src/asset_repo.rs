@@ -81,11 +81,11 @@ impl AssetRepo {
         user_id: &str,
         q: &MediaQuery,
     ) -> Result<MediaPageResponse, sqlx::Error> {
-        let limit = q.limit.unwrap_or(50).clamp(1, 200);
-        let fetch_limit = limit + 1;
+        let limit = q.limit.unwrap_or(50).clamp(1, 200) as usize;
+        let fetch_limit = (limit + 1) as i64;
         let show_trash = q.show_trash.unwrap_or(false);
 
-        // 1. SELECT query with latitude and longitude included
+        // 1. SELECT query
         let mut builder: QueryBuilder<Sqlite> = QueryBuilder::new(
             "SELECT \
                 a.id, a.file_name, a.thumb_path, a.preview_path, \
@@ -110,6 +110,7 @@ impl AssetRepo {
             builder.push(" AND a.deleted_at IS NULL ");
         }
 
+        // --- FULL TEXT SEARCH ---
         if let Some(ref expr) = fts_query {
             builder.push(" AND fts.user_id = ");
             builder.push_bind(user_id);
@@ -117,15 +118,20 @@ impl AssetRepo {
             builder.push_bind(expr);
         }
 
-        // --- PHOTO vs VIDEO SEPARATION ---
+        // --- ROBUST PHOTO vs VIDEO SEPARATION ---
         if let Some(ref m_type) = q.media_type {
             match m_type.as_str() {
-                "photos" => { builder.push(" AND a.duration_seconds IS NULL "); }
-                "videos" => { builder.push(" AND a.duration_seconds IS NOT NULL "); }
+                "photos" => {
+                    builder.push(" AND (a.mime_type NOT LIKE 'video/%' OR a.mime_type IS NULL) ");
+                }
+                "videos" => {
+                    builder.push(" AND a.mime_type LIKE 'video/%' ");
+                }
                 _ => {}
             }
         }
 
+        // --- FAVORITES ---
         if let Some(fav) = q.is_favorite {
             builder.push(" AND a.is_favorite = ");
             builder.push_bind(if fav { 1 } else { 0 });
@@ -134,7 +140,7 @@ impl AssetRepo {
         // --- VECTOR SEARCH CANDIDATE INJECTION ---
         if let Some(ref cids) = q.candidate_ids {
             if cids.is_empty() {
-                builder.push(" AND 1 = 0 ");
+                builder.push(" AND 0 = 1 ");
             } else {
                 builder.push(" AND a.id IN (");
                 let mut sep = builder.separated(", ");
@@ -145,47 +151,80 @@ impl AssetRepo {
             }
         }
 
-        // --- ROBUST MULTI-PERSON (USER-SCOPED) ---
+        // --- MULTI-PERSON FILTER ---
         if let Some(ref pids_str) = q.person_id {
-            let pids: Vec<&str> = pids_str.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
-            let count = pids.len() as i64;
-            if count > 0 {
-                builder.push(" AND a.id IN (SELECT af.asset_id FROM asset_faces af JOIN persons p ON af.person_id = p.id WHERE p.user_id = ");
+            let pids: Vec<&str> = pids_str
+                .split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .collect();
+
+            if !pids.is_empty() {
+                let count = pids.len() as i64;
+                builder.push(
+                    " AND a.id IN ( \
+                        SELECT af.asset_id \
+                        FROM asset_faces af \
+                        JOIN persons p ON af.person_id = p.id \
+                        WHERE p.user_id = "
+                );
                 builder.push_bind(user_id);
                 builder.push(" AND af.person_id IN (");
                 let mut sep = builder.separated(", ");
-                for pid in &pids { sep.push_bind(pid); }
+                for pid in &pids {
+                    sep.push_bind(pid);
+                }
                 sep.push_unseparated(") GROUP BY af.asset_id HAVING COUNT(DISTINCT af.person_id) = ");
                 builder.push_bind(count);
                 builder.push(") ");
             }
         }
 
-        // --- ROBUST MULTI-TAG (USER-SCOPED) ---
+        // --- MULTI-TAG FILTER ---
         if let Some(ref tags_str) = q.tag {
-            let tags: Vec<String> = tags_str.split(',').map(|s| s.trim().to_lowercase()).filter(|s| !s.is_empty()).collect();
-            let count = tags.len() as i64;
-            if count > 0 {
-                builder.push(" AND a.id IN (SELECT at.asset_id FROM asset_tags at JOIN tags t ON at.tag_id = t.id WHERE t.user_id = ");
+            let tags: Vec<String> = tags_str
+                .split(',')
+                .map(|s| s.trim().to_lowercase())
+                .filter(|s| !s.is_empty())
+                .collect();
+
+            if !tags.is_empty() {
+                let count = tags.len() as i64;
+                builder.push(
+                    " AND a.id IN ( \
+                        SELECT at.asset_id \
+                        FROM asset_tags at \
+                        JOIN tags t ON at.tag_id = t.id \
+                        WHERE t.user_id = "
+                );
                 builder.push_bind(user_id);
                 builder.push(" AND LOWER(t.name) IN (");
                 let mut sep = builder.separated(", ");
-                for t in &tags { sep.push_bind(t); }
+                for t in &tags {
+                    sep.push_bind(t);
+                }
                 sep.push_unseparated(") GROUP BY at.asset_id HAVING COUNT(DISTINCT LOWER(t.name)) = ");
                 builder.push_bind(count);
                 builder.push(") ");
             }
         }
 
-        // --- CUSTOM ALBUM FILTER (USER-SCOPED) ---
+        // --- ALBUM FILTER ---
         if let Some(ref album_id) = q.album_id {
-            builder.push(" AND a.id IN (SELECT aa.asset_id FROM album_assets aa JOIN albums alb ON aa.album_id = alb.id WHERE alb.id = ");
+            builder.push(
+                " AND a.id IN ( \
+                    SELECT aa.asset_id \
+                    FROM album_assets aa \
+                    JOIN albums alb ON aa.album_id = alb.id \
+                    WHERE alb.id = "
+            );
             builder.push_bind(album_id);
             builder.push(" AND alb.user_id = ");
             builder.push_bind(user_id);
             builder.push(") ");
         }
 
+        // --- DIRECTORY / EXIF FILTERS ---
         if let Some(ref folder) = q.folder_path {
             builder.push(" AND a.folder_path = ");
             builder.push_bind(folder);
@@ -199,33 +238,37 @@ impl AssetRepo {
             builder.push_bind(model);
         }
         if let Some(ref from_date) = q.from {
-            builder.push(" AND a.captured_at >= ");
+            builder.push(" AND COALESCE(a.captured_at, a.created_at) >= ");
             builder.push_bind(from_date);
         }
         if let Some(ref to_date) = q.to {
-            builder.push(" AND a.captured_at <= ");
+            builder.push(" AND COALESCE(a.captured_at, a.created_at) <= ");
             builder.push_bind(to_date);
         }
 
-        // Keyset pagination
+        // --- DETERMINISTIC KEYSET PAGINATION (NULL-SAFE) ---
+        // Uses COALESCE to guarantee items without captured_at don't break pagination
         if let (Some(cat), Some(cid)) = (&q.cursor_captured_at, &q.cursor_id) {
-            builder.push(" AND (a.captured_at < ");
+            builder.push(" AND ( \
+                COALESCE(a.captured_at, '') < ");
             builder.push_bind(cat);
-            builder.push(" OR (a.captured_at = ");
+            builder.push(" OR ( \
+                COALESCE(a.captured_at, '') = ");
             builder.push_bind(cat);
             builder.push(" AND a.id < ");
             builder.push_bind(cid);
             builder.push(")) ");
         }
 
+        // Deterministic ordering that strictly matches the keyset condition above
         if fts_query.is_some() {
-            builder.push(" ORDER BY fts.rank, a.captured_at DESC, a.created_at DESC, a.id DESC LIMIT ");
+            builder.push(" ORDER BY fts.rank ASC, COALESCE(a.captured_at, '') DESC, a.id DESC LIMIT ");
         } else {
-            builder.push(" ORDER BY a.captured_at DESC, a.created_at DESC, a.id DESC LIMIT ");
+            builder.push(" ORDER BY COALESCE(a.captured_at, '') DESC, a.id DESC LIMIT ");
         }
         builder.push_bind(fetch_limit);
 
-        // Sub-album retrieval (scoped by user_id and omitted when querying a custom album)
+        // Sub-album retrieval
         let albums = if q.cursor_id.is_none() && !show_trash && q.album_id.is_none() {
             let curr = q.folder_path.as_deref().unwrap_or("");
             Self::get_sub_albums(pool, user_id, curr, q.media_type.as_deref()).await.unwrap_or_default()
@@ -233,15 +276,15 @@ impl AssetRepo {
             Vec::new()
         };
 
-        // 2. Fetch rows into RawMediaRow
+        // 2. Fetch rows
         let mut rows = builder.build_query_as::<RawMediaRow>().fetch_all(pool).await?;
-        let has_more = rows.len() as i64 > limit;
-        if has_more { 
-            rows.pop(); 
+        let has_more = rows.len() > limit;
+        if has_more {
+            rows.truncate(limit);
         }
 
-        // 3. Extract cursors from the last raw item
-        let next_cursor_captured_at = rows.last().and_then(|i| i.captured_at.clone());
+        // 3. Extract cursors from the last item
+        let next_cursor_captured_at = rows.last().map(|i| i.captured_at.clone().unwrap_or_default());
         let next_cursor_id = rows.last().map(|i| i.id.clone());
 
         // 4. Pre-group into ready-to-render sections
