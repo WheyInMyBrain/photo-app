@@ -89,6 +89,7 @@
     scale = 1.0;
     translateX = 0;
     translateY = 0;
+    isDragging = false;
     dismissOffsetY = 0;
     dismissProgress = 0;
   }
@@ -323,6 +324,49 @@
       dispatch('toggleFavorite', { id: asset.id, is_favorite: isFavorite });
     } catch {
       isFavorite = prev;
+    }
+  }
+
+  async function handleSaveFaceName(e: CustomEvent<{ face: FaceDetail; cleanName: string }>) {
+    const { face, cleanName } = e.detail;
+    const matched = knownPeople.find((p) => p.name?.toLowerCase() === cleanName.toLowerCase());
+
+    if (matched && matched.id !== face.person_id) {
+      const res = await fetch(`/api/faces/${face.face_id}/reassign`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'include',
+        body: JSON.stringify({ target_person_id: matched.id })
+      });
+      if (res.ok) {
+        face.person_id = matched.id;
+        face.person_name = matched.name;
+        faces = [...faces];
+      }
+    } else if (face.person_id) {
+      const res = await fetch(`/api/persons/${face.person_id}/name`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        credentials: 'include',
+        body: JSON.stringify({ name: cleanName })
+      });
+      if (res.ok) {
+        face.person_name = cleanName;
+        faces = [...faces];
+        if (!knownPeople.some((p) => p.id === face.person_id)) {
+          knownPeople = [...knownPeople, { id: face.person_id, name: cleanName }];
+        }
+      }
+    }
+  }
+
+  async function handleDeleteFace(e: CustomEvent<{ faceId: string }>) {
+    const { faceId } = e.detail;
+    try {
+      await deleteFace(faceId);
+      faces = faces.filter((f) => f.face_id !== faceId);
+    } catch (err) {
+      console.error('Failed to delete face:', err);
     }
   }
 
@@ -643,6 +687,27 @@
       on:togglePoses={() => (showPoses = !showPoses)}
       on:closeMobile={() => (showMobileInfo = false)}
       on:selectAsset={(e) => dispatch('selectAsset', e.detail)}
+      on:saveFaceName={handleSaveFaceName}
+      on:deleteFace={handleDeleteFace}
+      on:reassignFace={async (e) => {
+        const { faceId, targetPersonId } = e.detail;
+        await fetch(`/api/faces/${faceId}/reassign`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ target_person_id: targetPersonId })
+        });
+        loadDetails(asset.id);
+      }}
+      on:splitFace={async (e) => {
+        const { faceId } = e.detail;
+        await fetch(`/api/faces/${faceId}/split-new`, { method: 'POST' });
+        loadDetails(asset.id);
+      }}
+      on:unlinkFace={async (e) => {
+        const { faceId } = e.detail;
+        await fetch(`/api/faces/${faceId}/unlink`, { method: 'POST' });
+        loadDetails(asset.id);
+      }}
     />
   </div>
 {/if}
