@@ -25,6 +25,7 @@ services:
     restart: unless-stopped
     expose:
       - "3000"
+    user: "${UID:-1000}:${GID:-1000}"
     volumes:
       - ./storage:/data
     env_file:

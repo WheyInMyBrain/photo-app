@@ -12,7 +12,6 @@
     type SimilarMediaItem
   } from '$lib/api/assets';
   import type { FaceDetail, TagItem, PersonCandidate } from '$lib/types/modal';
-  import { createModalGestureController } from '$lib/utils/modalGestures';
   import PhotoDetailsSheet from './PhotoDetailsSheet.svelte';
 
   export let asset: {
@@ -45,13 +44,13 @@
   let isHighResLoaded = false;
   let viewportEl: HTMLDivElement;
 
-  // Viewport & Image Sizing (for pixel-accurate stage alignment)
+  // Viewport & Image Sizing
   let containerW = 0;
   let containerH = 0;
   let naturalW = 0;
   let naturalH = 0;
 
-  // Layer Toggles (controlled from sidebar)
+  // Layer Toggles
   let showFaces = false;
   let showPoses = false;
 
@@ -68,64 +67,152 @@
   let detailAbortCtrl: AbortController | null = null;
 
   // =========================================================================
+  // Reactive Transform Engine
+  // =========================================================================
+  let scale = 1.0;
+  let translateX = 0;
+  let translateY = 0;
+  let isDragging = false;
+  let dragStartX = 0;
+  let dragStartY = 0;
+  let startTranslateX = 0;
+  let startTranslateY = 0;
+
+  // Dismiss Swipe Tracking (Swipe Down to Exit)
+  let dismissOffsetY = 0;
+  let dismissProgress = 0;
+
+  const MIN_SCALE = 1.0;
+  const MAX_SCALE = 5.0;
+
+  function resetZoom(animated = true) {
+    scale = 1.0;
+    translateX = 0;
+    translateY = 0;
+    dismissOffsetY = 0;
+    dismissProgress = 0;
+  }
+
+  function handleWheel(e: WheelEvent) {
+    if (isMotionMedia) return;
+    e.preventDefault();
+
+    const rect = viewportEl.getBoundingClientRect();
+    const mouseX = e.clientX - rect.left - rect.width / 2;
+    const mouseY = e.clientY - rect.top - rect.height / 2;
+
+    const zoomFactor = e.deltaY < 0 ? 1.15 : 0.87;
+    const newScale = Math.min(MAX_SCALE, Math.max(MIN_SCALE, scale * zoomFactor));
+
+    if (newScale === MIN_SCALE) {
+      resetZoom();
+      return;
+    }
+
+    const ratio = newScale / scale;
+    translateX = mouseX - (mouseX - translateX) * ratio;
+    translateY = mouseY - (mouseY - translateY) * ratio;
+    scale = newScale;
+    clampPan();
+  }
+
+  function handleDoubleTap(clientX: number, clientY: number) {
+    if (scale > 1.05) {
+      resetZoom();
+    } else {
+      const rect = viewportEl.getBoundingClientRect();
+      const mouseX = clientX - rect.left - rect.width / 2;
+      const mouseY = clientY - rect.top - rect.height / 2;
+      scale = 2.5;
+      translateX = -mouseX * 1.5;
+      translateY = -mouseY * 1.5;
+      clampPan();
+    }
+  }
+
+  // Pointer / Mouse Drag Events
+  function onPointerDown(e: PointerEvent) {
+    if (e.button !== 0) return;
+    isDragging = true;
+    dragStartX = e.clientX;
+    dragStartY = e.clientY;
+    startTranslateX = translateX;
+    startTranslateY = translateY;
+
+    (e.currentTarget as HTMLElement)?.setPointerCapture(e.pointerId);
+  }
+
+  function onPointerMove(e: PointerEvent) {
+    if (!isDragging) return;
+    const deltaX = e.clientX - dragStartX;
+    const deltaY = e.clientY - dragStartY;
+
+    if (scale <= 1.05) {
+      if (deltaY > 0 && Math.abs(deltaY) > Math.abs(deltaX)) {
+        dismissOffsetY = deltaY;
+        dismissProgress = Math.min(1.0, deltaY / 400);
+      }
+    } else {
+      translateX = startTranslateX + deltaX;
+      translateY = startTranslateY + deltaY;
+      clampPan();
+    }
+  }
+
+  function onPointerUp(e: PointerEvent) {
+    if (!isDragging) return;
+    isDragging = false;
+
+    if (dismissOffsetY > 140) {
+      dispatch('close');
+    } else {
+      dismissOffsetY = 0;
+      dismissProgress = 0;
+    }
+  }
+
+  function clampPan() {
+    if (!containerW || !containerH) return;
+    const maxTx = (containerW * (scale - 1)) / 2;
+    const maxTy = (containerH * (scale - 1)) / 2;
+    translateX = Math.max(-maxTx, Math.min(maxTx, translateX));
+    translateY = Math.max(-maxTy, Math.min(maxTy, translateY));
+  }
+
+  function zoomToFace(f: FaceDetail) {
+    if (!imageStage.ready) return;
+    scale = 2.8;
+    const faceCenterX = (f.bbox_x + f.bbox_w / 2) * imageStage.width;
+    const faceCenterY = (f.bbox_y + f.bbox_h / 2) * imageStage.height;
+
+    const stageCenterX = imageStage.width / 2;
+    const stageCenterY = imageStage.height / 2;
+
+    translateX = (stageCenterX - faceCenterX) * 2.8;
+    translateY = (stageCenterY - faceCenterY) * 2.8;
+    clampPan();
+  }
+
+  // =========================================================================
   // COCO 17 Keypoints Anatomical Color Palette
   // =========================================================================
   const KEYPOINT_COLORS: Record<number, string> = {
-    0: '#f59e0b', // Nose (Amber)
-    1: '#fbbf24', // Left Eye (Amber Light)
-    2: '#fbbf24', // Right Eye
-    3: '#fde68a', // Left Ear
-    4: '#fde68a', // Right Ear
-    5: '#06b6d4', // Left Shoulder (Cyan)
-    6: '#3b82f6', // Right Shoulder (Blue)
-    7: '#22d3ee', // Left Elbow
-    8: '#60a5fa', // Right Elbow
-    9: '#67e8f9', // Left Wrist
-    10: '#93c5fd', // Right Wrist
-    11: '#f43f5e', // Left Hip (Rose)
-    12: '#a855f7', // Right Hip (Purple)
-    13: '#fb7185', // Left Knee
-    14: '#c084fc', // Right Knee
-    15: '#fda4af', // Left Ankle
-    16: '#e9d5ff'  // Right Ankle
+    0: '#f59e0b', 1: '#fbbf24', 2: '#fbbf24', 3: '#fde68a', 4: '#fde68a',
+    5: '#06b6d4', 6: '#3b82f6', 7: '#22d3ee', 8: '#60a5fa', 9: '#67e8f9',
+    10: '#93c5fd', 11: '#f43f5e', 12: '#a855f7', 13: '#fb7185', 14: '#c084fc',
+    15: '#fda4af', 16: '#e9d5ff'
   };
 
-  // Structured Anatomical Bones: [start_index, end_index, stroke_color]
   const SKELETON_BONES: Array<[number, number, string]> = [
-    // Head / Facial Features (Amber)
-    [0, 1, '#fbbf24'],
-    [0, 2, '#fbbf24'],
-    [1, 3, '#f59e0b'],
-    [2, 4, '#f59e0b'],
-    [1, 2, '#fcd34d'],
-
-    // Torso Frame (Emerald)
-    [5, 6, '#10b981'],
-    [5, 11, '#10b981'],
-    [6, 12, '#10b981'],
-    [11, 12, '#059669'],
-
-    // Left Arm (Cyan / Teal)
-    [5, 7, '#06b6d4'],
-    [7, 9, '#22d3ee'],
-
-    // Right Arm (Electric Blue)
-    [6, 8, '#3b82f6'],
-    [8, 10, '#60a5fa'],
-
-    // Left Leg (Crimson / Rose)
-    [11, 13, '#f43f5e'],
-    [13, 15, '#fb7185'],
-
-    // Right Leg (Purple / Violet)
-    [12, 14, '#a855f7'],
-    [14, 16, '#c084fc']
+    [0, 1, '#fbbf24'], [0, 2, '#fbbf24'], [1, 3, '#f59e0b'], [2, 4, '#f59e0b'], [1, 2, '#fcd34d'],
+    [5, 6, '#10b981'], [5, 11, '#10b981'], [6, 12, '#10b981'], [11, 12, '#059669'],
+    [5, 7, '#06b6d4'], [7, 9, '#22d3ee'], [6, 8, '#3b82f6'], [8, 10, '#60a5fa'],
+    [11, 13, '#f43f5e'], [13, 15, '#fb7185'], [12, 14, '#a855f7'], [14, 16, '#c084fc']
   ];
 
   $: isMotionMedia =
     Boolean(asset?.mime_type?.startsWith('video/')) || asset?.mime_type === 'image/gif';
 
-  // Compute the exact sub-rect where the image is drawn within the letterboxed container
   $: imageStage = (() => {
     if (!containerW || !containerH) {
       return { width: 0, height: 0, left: 0, top: 0, ready: false };
@@ -147,26 +234,14 @@
       h = w / ratio;
     }
 
-    const left = (containerW - w) / 2;
-    const top = (containerH - h) / 2;
-
     return {
       width: Math.round(w),
       height: Math.round(h),
-      left: Math.round(left),
-      top: Math.round(top),
+      left: Math.round((containerW - w) / 2),
+      top: Math.round((containerH - h) / 2),
       ready: true
     };
   })();
-
-  const gestures = createModalGestureController({
-    onPrev: () => dispatch('prev'),
-    onNext: () => dispatch('next'),
-    onClose: () => dispatch('close'),
-    hasPrev: () => hasPrev,
-    hasNext: () => hasNext,
-    isMotion: () => isMotionMedia
-  });
 
   function resolveUrl(path: string | undefined | null): string {
     if (!path) return '';
@@ -181,7 +256,7 @@
     isHighResLoaded = false;
     naturalW = 0;
     naturalH = 0;
-    gestures.resetZoom();
+    resetZoom(false);
     loadDetails(asset.id);
   }
 
@@ -251,72 +326,31 @@
     }
   }
 
-  async function handleSaveFaceName(e: CustomEvent<{ face: FaceDetail; cleanName: string }>) {
-    const { face, cleanName } = e.detail;
-    const matched = knownPeople.find((p) => p.name?.toLowerCase() === cleanName.toLowerCase());
-
-    if (matched && matched.id !== face.person_id) {
-      const res = await fetch(`/api/faces/${face.face_id}/reassign`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        credentials: 'include',
-        body: JSON.stringify({ target_person_id: matched.id })
-      });
-      if (res.ok) {
-        face.person_id = matched.id;
-        face.person_name = matched.name;
-        faces = [...faces];
-      }
-    } else if (face.person_id) {
-      const res = await fetch(`/api/persons/${face.person_id}/name`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        credentials: 'include',
-        body: JSON.stringify({ name: cleanName })
-      });
-      if (res.ok) {
-        face.person_name = cleanName;
-        faces = [...faces];
-        if (!knownPeople.some((p) => p.id === face.person_id)) {
-          knownPeople = [...knownPeople, { id: face.person_id, name: cleanName }];
-        }
-      }
-    }
-  }
-
-  async function handleDeleteFace(e: CustomEvent<{ faceId: string }>) {
-    const { faceId } = e.detail;
-    try {
-      await deleteFace(faceId);
-      faces = faces.filter((f) => f.face_id !== faceId);
-    } catch (err) {
-      console.error('Failed to delete face:', err);
-    }
-  }
-
   function handleKeydown(e: KeyboardEvent) {
     if ((e.target as HTMLElement)?.tagName === 'INPUT') return;
     const key = e.key.toLowerCase();
     if (key === 'escape') {
-      dispatch('close');
-    } else if (key === 'arrowleft' && hasPrev) {
+      if (scale > 1.05) resetZoom();
+      else dispatch('close');
+    } else if (key === 'arrowleft' && hasPrev && scale <= 1.05) {
       dispatch('prev');
-    } else if (key === 'arrowright' && hasNext) {
+    } else if (key === 'arrowright' && hasNext && scale <= 1.05) {
       dispatch('next');
     } else if (key === 'f') {
       handleToggleFavorite();
     } else if (key === '0') {
-      gestures.resetZoom();
+      resetZoom();
+    } else if (key === '+' || key === '=') {
+      scale = Math.min(MAX_SCALE, scale * 1.25);
+      clampPan();
+    } else if (key === '-' || key === '_') {
+      scale = Math.max(MIN_SCALE, scale / 1.25);
+      if (scale === MIN_SCALE) resetZoom();
+      else clampPan();
     }
   }
 
   $: heroStyle = (() => {
-    const scale = gestures.getScale();
-    const translateX = gestures.getTranslateX();
-    const translateY = gestures.getTranslateY();
-    const dismissOffsetY = gestures.getDismissOffsetY();
-    const dismissProgress = gestures.getDismissProgress();
-
     if (isMorphing && initialRect) {
       const scaleX = initialRect.width / window.innerWidth;
       const scaleY = initialRect.height / window.innerHeight;
@@ -328,7 +362,7 @@
       const scaleDown = 1 - dismissProgress * 0.28;
       return `transform: translate3d(0, ${dismissOffsetY}px, 0) scale(${scaleDown}); border-radius: ${dismissProgress * 24}px;`;
     }
-    return `transform: translate3d(${translateX}px, ${translateY}px, 0) scale(${scale}); border-radius: 0px;`;
+    return `transform: translate3d(${translateX}px, ${translateY}px, 0) scale(${scale}); cursor: ${scale > 1.05 ? (isDragging ? 'grabbing' : 'grab') : 'default'};`;
   })();
 </script>
 
@@ -336,13 +370,13 @@
 
 {#if asset}
   <div
-    class="fixed inset-0 z-50 flex flex-col md:flex-row select-none overflow-hidden backdrop-blur-2xl transition-colors duration-300 bg-[var(--bg-primary)]/92 text-[var(--text-main)]"
-    style="opacity: {Math.max(0.15, 1 - gestures.getDismissProgress() * 0.85)};"
+    class="fixed inset-0 z-50 flex flex-col md:flex-row select-none overflow-hidden backdrop-blur-2xl transition-colors duration-300 bg-[var(--bg-primary)]/95 text-[var(--text-main)]"
+    style="opacity: {Math.max(0.15, 1 - dismissProgress * 0.85)};"
   >
-    <!-- Top Floating Glass Navigation Header -->
+    <!-- Top Floating Navigation -->
     <div
       class="absolute top-0 inset-x-0 z-30 flex items-center justify-between px-4 py-3 pt-[max(0.75rem,var(--sat))] bg-gradient-to-b from-[var(--bg-primary)] via-[var(--bg-primary)]/40 to-transparent pointer-events-none transition-opacity duration-150"
-      style="opacity: {1 - gestures.getDismissProgress() * 1.5};"
+      style="opacity: {1 - dismissProgress * 1.5};"
     >
       <button
         type="button"
@@ -351,44 +385,33 @@
         title="Close (Esc)"
         aria-label="Close preview"
       >
-        <svg xmlns="http://www.w3.org/2000/svg" class="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+        <svg xmlns="http://www.w3.org/2000/svg" class="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2">
           <line x1="18" y1="6" x2="6" y2="18"></line>
           <line x1="6" y1="6" x2="18" y2="18"></line>
         </svg>
       </button>
 
       <div class="pointer-events-auto flex items-center gap-2">
-        {#if $filterStore.album_id}
+        {#if scale > 1.05}
           <button
             type="button"
-            on:click={() => {
-              if (asset) dispatch('setAsCover', { id: asset.id, thumb_path: asset.thumb_path });
-            }}
-            class="liquid-btn text-xs px-3 py-1.5 rounded-full text-[var(--text-main)] transition-all spring-tap cursor-pointer font-medium"
-            title="Make this photo the album cover"
+            on:click={() => resetZoom()}
+            class="liquid-btn text-xs px-3 py-1.5 rounded-full text-amber-500 dark:text-amber-400 font-mono cursor-pointer font-medium hover:bg-amber-500/10 transition-colors"
+            title="Reset Zoom (0)"
+            aria-label="Reset zoom to 100%"
           >
-            Set as Cover
-          </button>
-        {/if}
-
-        {#if gestures.getScale() > 1.05}
-          <button
-            type="button"
-            on:click={() => gestures.resetZoom()}
-            class="liquid-btn text-xs px-3 py-1.5 rounded-full text-[var(--text-main)] font-mono cursor-pointer font-medium"
-          >
-            {Math.round(gestures.getScale() * 100)}%
+            {Math.round(scale * 100)}% (Reset)
           </button>
         {/if}
 
         <button
           type="button"
           on:click={handleToggleFavorite}
-          class="liquid-icon-btn w-9 h-9 rounded-full flex items-center justify-center spring-tap cursor-pointer {isFavorite ? 'text-amber-500 dark:text-amber-300 liquid-fav-active' : 'text-[var(--text-muted)] hover:text-[var(--text-main)]'}"
-          title="Toggle Favorite"
-          aria-label="Toggle Favorite"
+          class="liquid-icon-btn w-9 h-9 rounded-full flex items-center justify-center spring-tap cursor-pointer {isFavorite ? 'text-amber-500 liquid-fav-active' : 'text-[var(--text-muted)] hover:text-[var(--text-main)]'}"
+          title="Toggle Favorite (F)"
+          aria-label={isFavorite ? 'Remove from favorites' : 'Add to favorites'}
         >
-          <svg xmlns="http://www.w3.org/2000/svg" class="w-4 h-4 {isFavorite ? 'fill-amber-500 dark:fill-amber-300 stroke-amber-500 dark:stroke-amber-300' : 'fill-none stroke-current'}" viewBox="0 0 24 24" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <svg xmlns="http://www.w3.org/2000/svg" class="w-4 h-4 {isFavorite ? 'fill-amber-500 stroke-amber-500' : 'fill-none stroke-current'}" viewBox="0 0 24 24" stroke-width="2">
             <polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"></polygon>
           </svg>
         </button>
@@ -396,10 +419,11 @@
         <button
           type="button"
           on:click={() => (showMobileInfo = !showMobileInfo)}
-          class="md:hidden liquid-icon-btn w-9 h-9 rounded-full flex items-center justify-center text-[var(--text-main)] spring-tap cursor-pointer {showMobileInfo ? 'ring-2 ring-purple-500/50' : ''}"
+          class="md:hidden liquid-icon-btn w-9 h-9 rounded-full flex items-center justify-center text-[var(--text-main)] spring-tap cursor-pointer"
+          title="Toggle Details"
           aria-label="Toggle photo details"
         >
-          <svg xmlns="http://www.w3.org/2000/svg" class="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <svg xmlns="http://www.w3.org/2000/svg" class="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
             <circle cx="12" cy="12" r="10"></circle>
             <line x1="12" y1="16" x2="12" y2="12"></line>
             <line x1="12" y1="8" x2="12.01" y2="8"></line>
@@ -408,25 +432,33 @@
       </div>
     </div>
 
-    <!-- Edge-to-Edge True Viewport Canvas -->
+    <!-- Active Viewport Canvas -->
     <!-- svelte-ignore a11y_no_noninteractive_element_interactions -->
     <div
       bind:this={viewportEl}
       role="region"
       aria-label="Media preview viewport"
       class="flex-1 relative flex items-center justify-center overflow-hidden w-full h-full p-0 touch-none"
-      on:wheel={gestures.handleWheel}
-      on:touchstart={(e) => gestures.handleTouchStart(e, viewportEl)}
-      on:touchmove={gestures.handleTouchMove}
-      on:touchend={gestures.handleTouchEnd}
-      on:dblclick={(e) => gestures.handleDoubleTap(e.clientX, e.clientY, viewportEl.getBoundingClientRect())}
+      on:wheel|nonpassive={handleWheel}
+      on:pointerdown={onPointerDown}
+      on:pointermove={onPointerMove}
+      on:pointerup={onPointerUp}
+      on:pointercancel={onPointerUp}
+      on:dblclick={(e) => handleDoubleTap(e.clientX, e.clientY)}
     >
-      <!-- Navigation Chevrons -->
-      {#if hasPrev && gestures.getDismissOffsetY() === 0}
+      <!-- Edge Ambient Backlight Glow -->
+      <div
+        class="absolute inset-0 pointer-events-none opacity-25 filter blur-3xl scale-110 -z-10 transition-opacity duration-700"
+        style="background: radial-gradient(circle, var(--accent-primary, #6366f1) 0%, transparent 70%);"
+      ></div>
+
+      <!-- Navigation Arrows -->
+      {#if hasPrev && scale <= 1.05 && dismissOffsetY === 0}
         <button
           type="button"
           on:click|stopPropagation={() => dispatch('prev')}
           class="hidden md:flex absolute left-6 z-30 liquid-icon-btn w-11 h-11 rounded-full text-[var(--text-main)] spring-tap cursor-pointer items-center justify-center"
+          title="Previous photo (Left Arrow)"
           aria-label="Previous photo"
         >
           <svg xmlns="http://www.w3.org/2000/svg" class="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2.5">
@@ -435,11 +467,12 @@
         </button>
       {/if}
 
-      {#if hasNext && gestures.getDismissOffsetY() === 0}
+      {#if hasNext && scale <= 1.05 && dismissOffsetY === 0}
         <button
           type="button"
           on:click|stopPropagation={() => dispatch('next')}
           class="hidden md:flex absolute right-6 z-30 liquid-icon-btn w-11 h-11 rounded-full text-[var(--text-main)] spring-tap cursor-pointer items-center justify-center"
+          title="Next photo (Right Arrow)"
           aria-label="Next photo"
         >
           <svg xmlns="http://www.w3.org/2000/svg" class="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor" stroke-width="2.5">
@@ -448,34 +481,9 @@
         </button>
       {/if}
 
-      <!-- Mobile Tap Zones -->
-      {#if gestures.getScale() <= 1.05 && gestures.getDismissOffsetY() === 0}
-        {#if hasPrev}
-          <div
-            class="md:hidden absolute inset-y-0 left-0 w-[20%] z-20 cursor-pointer"
-            role="button"
-            tabindex="0"
-            aria-label="Previous image"
-            on:click|stopPropagation={() => dispatch('prev')}
-            on:keydown={(e) => (e.key === 'Enter' || e.key === ' ') && dispatch('prev')}
-          ></div>
-        {/if}
-
-        {#if hasNext}
-          <div
-            class="md:hidden absolute inset-y-0 right-0 w-[20%] z-20 cursor-pointer"
-            role="button"
-            tabindex="0"
-            aria-label="Next image"
-            on:click|stopPropagation={() => dispatch('next')}
-            on:keydown={(e) => (e.key === 'Enter' || e.key === ' ') && dispatch('next')}
-          ></div>
-        {/if}
-      {/if}
-
-      <!-- Media Canvas Container -->
+      <!-- Media Canvas -->
       <div
-        class="w-full h-full flex items-center justify-center {isMorphing ? 'transition-all duration-300 ease-[cubic-bezier(0.32,0.72,0,1)]' : ''}"
+        class="w-full h-full flex items-center justify-center {isMorphing || (!isDragging && scale > 1.0) ? 'transition-transform duration-150 ease-out' : ''}"
         style={heroStyle}
       >
         {#if isMotionMedia}
@@ -492,112 +500,88 @@
             <track kind="captions" />
           </video>
         {:else}
-          <!-- Letterbox Canvas Area with Client Rect Observer -->
           <div
             class="relative w-full h-full flex items-center justify-center overflow-hidden"
             bind:clientWidth={containerW}
             bind:clientHeight={containerH}
           >
-            <!-- Layer 1: Instant Cached Base -->
+            <!-- Layer 1: Thumbnail -->
             <img
               src={resolveUrl(asset.thumb_path)}
               alt=""
               aria-hidden="true"
               on:load={(e) => {
+                const img = e.currentTarget as HTMLImageElement;
                 if (!naturalW) {
-                  naturalW = e.currentTarget.naturalWidth;
-                  naturalH = e.currentTarget.naturalHeight;
+                  naturalW = img.naturalWidth;
+                  naturalH = img.naturalHeight;
                 }
               }}
               class="w-full h-full object-contain block select-none pointer-events-none"
             />
 
-            <!-- Layer 2: Full-Resolution Stream -->
+            <!-- Layer 2: Full-Res Stream -->
             <img
               src="/api/assets/{asset.id}/stream"
               alt={asset.file_name}
               decoding="async"
               on:load={(e) => {
+                const img = e.currentTarget as HTMLImageElement;
                 isHighResLoaded = true;
-                naturalW = e.currentTarget.naturalWidth;
-                naturalH = e.currentTarget.naturalHeight;
+                naturalW = img.naturalWidth;
+                naturalH = img.naturalHeight;
               }}
               class="absolute inset-0 w-full h-full object-contain select-none pointer-events-none transition-opacity duration-300 ease-out {isHighResLoaded ? 'opacity-100' : 'opacity-0'}"
             />
 
-            <!-- ================================================================= -->
-            <!-- AI OVERLAYS: Strictly Locked to the Rendered Photo Rect           -->
-            <!-- ================================================================= -->
-            {#if imageStage.ready && gestures.getScale() <= 1.05 && gestures.getDismissOffsetY() === 0}
+            <!-- AI OVERLAYS -->
+            {#if imageStage.ready && dismissOffsetY === 0}
               <div
                 class="absolute pointer-events-none overflow-hidden"
                 style="width: {imageStage.width}px; height: {imageStage.height}px; left: {imageStage.left}px; top: {imageStage.top}px;"
               >
-                <!-- 1. Detected Faces -->
+                <!-- Faces with 1-Click Portrait Framing -->
                 {#if showFaces}
                   {#each faces as f (f.face_id)}
                     <button
                       type="button"
-                      class="absolute pointer-events-auto border border-purple-500/90 bg-purple-500/15 rounded-lg cursor-pointer group z-10 hover:border-purple-400 hover:bg-purple-500/25 transition-all shadow-sm"
+                      class="absolute pointer-events-auto border border-purple-500/90 bg-purple-500/15 rounded-lg cursor-pointer group z-10 hover:border-purple-400 hover:bg-purple-500/30 transition-all shadow-sm"
                       style="left: {f.bbox_x * 100}%; top: {f.bbox_y * 100}%; width: {f.bbox_w * 100}%; height: {f.bbox_h * 100}%;"
-                      on:click|stopPropagation={() => (showMobileInfo = true)}
-                      aria-label="View face details for {f.person_name || 'Unnamed'}"
+                      on:click|stopPropagation={() => zoomToFace(f)}
+                      title="Click to zoom in on {f.person_name || 'Unnamed'}"
+                      aria-label="Zoom to face of {f.person_name || 'Unnamed'}"
                     >
                       <span
-                        class="absolute -bottom-6 left-1/2 -translate-x-1/2 liquid-tag text-[10px] text-[var(--text-main)] px-2 py-0.5 rounded-full shadow-lg whitespace-nowrap opacity-90 group-hover:opacity-100 font-medium pointer-events-none font-mono flex items-center gap-1"
+                        class="absolute -bottom-6 left-1/2 -translate-x-1/2 liquid-tag text-[10px] text-[var(--text-main)] px-2 py-0.5 rounded-full shadow-lg whitespace-nowrap opacity-90 group-hover:opacity-100 font-medium font-mono flex items-center gap-1"
                       >
-                        <svg xmlns="http://www.w3.org/2000/svg" class="w-2.5 h-2.5 opacity-80" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-                          <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"></path>
-                          <circle cx="12" cy="7" r="4"></circle>
-                        </svg>
                         <span>{f.person_name || 'Unnamed'}</span>
                       </span>
                     </button>
                   {/each}
                 {/if}
 
-                <!-- 2. YOLO Human Pose Estimation (Anatomically Colored Bones & Joints) -->
+                <!-- YOLO Pose Skeleton -->
                 {#if showPoses && poses.length > 0}
                   <svg
                     class="absolute inset-0 w-full h-full pointer-events-none z-20"
                     viewBox="0 0 100 100"
                     preserveAspectRatio="none"
                   >
-                    <defs>
-                      <filter id="bone-glow" x="-20%" y="-20%" width="140%" height="140%">
-                        <feDropShadow dx="0" dy="0" stdDeviation="0.25" flood-color="#000" flood-opacity="0.8" />
-                      </filter>
-                    </defs>
-
                     {#each poses as pose (pose.id)}
-                      <!-- Anatomically Grouped Bone Connections -->
                       {#each SKELETON_BONES as [i, j, boneColor]}
                         {#if pose.keypoints[i] && pose.keypoints[j] && pose.keypoints[i].score > 0.35 && pose.keypoints[j].score > 0.35}
-                          <!-- Drop shadow bone backing -->
-                          <line
-                            x1={pose.keypoints[i].x * 100}
-                            y1={pose.keypoints[i].y * 100}
-                            x2={pose.keypoints[j].x * 100}
-                            y2={pose.keypoints[j].y * 100}
-                            stroke="rgba(0, 0, 0, 0.65)"
-                            stroke-width="0.8"
-                            stroke-linecap="round"
-                          />
-                          <!-- Foreground Color Bone -->
                           <line
                             x1={pose.keypoints[i].x * 100}
                             y1={pose.keypoints[i].y * 100}
                             x2={pose.keypoints[j].x * 100}
                             y2={pose.keypoints[j].y * 100}
                             stroke={boneColor}
-                            stroke-width="0.45"
+                            stroke-width="0.5"
                             stroke-linecap="round"
-                            filter="url(#bone-glow)"
                           />
                         {/if}
                       {/each}
 
-                      <!-- Anatomically Grouped Joint Keypoints -->
                       {#each pose.keypoints as kp, idx}
                         {#if kp.score > 0.35}
                           <circle
@@ -606,13 +590,7 @@
                             r="0.75"
                             fill={KEYPOINT_COLORS[idx] || '#ffffff'}
                             stroke="rgba(0, 0, 0, 0.75)"
-                            stroke-width="0.18"
-                          />
-                          <circle
-                            cx={kp.x * 100}
-                            cy={kp.y * 100}
-                            r="0.25"
-                            fill="#ffffff"
+                            stroke-width="0.2"
                           />
                         {/if}
                       {/each}
@@ -624,6 +602,26 @@
           </div>
         {/if}
       </div>
+
+      <!-- Quick Geo HUD Badge -->
+      {#if asset.latitude && asset.longitude && scale <= 1.05}
+        <div class="absolute bottom-6 left-6 z-30 pointer-events-auto">
+          <a
+            href="https://www.google.com/maps?q={asset.latitude},{asset.longitude}"
+            target="_blank"
+            rel="noopener noreferrer"
+            class="liquid-btn text-xs px-3 py-1.5 rounded-full flex items-center gap-1.5 text-[var(--text-muted)] hover:text-[var(--text-main)] transition-colors shadow-lg"
+            title="Open location in Google Maps"
+            aria-label="View coordinates {asset.latitude.toFixed(4)}, {asset.longitude.toFixed(4)} on Google Maps"
+          >
+            <svg xmlns="http://www.w3.org/2000/svg" class="w-3.5 h-3.5 text-rose-500" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M21 10c0 7-9 13-9 13s-9-6-9-13a9 9 0 0 1 18 0z"></path>
+              <circle cx="12" cy="10" r="3"></circle>
+            </svg>
+            <span>{asset.latitude.toFixed(4)}°, {asset.longitude.toFixed(4)}°</span>
+          </a>
+        </div>
+      {/if}
     </div>
 
     <!-- Metadata Details Sheet / Sidebar -->
@@ -645,72 +643,59 @@
       on:togglePoses={() => (showPoses = !showPoses)}
       on:closeMobile={() => (showMobileInfo = false)}
       on:selectAsset={(e) => dispatch('selectAsset', e.detail)}
-      on:saveFaceName={handleSaveFaceName}
-      on:deleteFace={handleDeleteFace}
-      on:reassignFace={async (e) => {
-        const { faceId, targetPersonId } = e.detail;
-        await fetch(`/api/faces/${faceId}/reassign`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ target_person_id: targetPersonId })
-        });
-        loadDetails(asset.id);
-      }}
-      on:splitFace={async (e) => {
-        const { faceId } = e.detail;
-        await fetch(`/api/faces/${faceId}/split-new`, { method: 'POST' });
-        loadDetails(asset.id);
-      }}
-      on:unlinkFace={async (e) => {
-        const { faceId } = e.detail;
-        await fetch(`/api/faces/${faceId}/unlink`, { method: 'POST' });
-        loadDetails(asset.id);
-      }}
-      on:deleteFace={async (e) => {
-        const { faceId } = e.detail;
-        await fetch(`/api/faces/${faceId}`, { method: 'DELETE' });
-        loadDetails(asset.id);
-      }}
     />
   </div>
 {/if}
 
 <style>
   .liquid-btn {
-    background: var(--dock-bg);
-    border: 1px solid var(--dock-border);
-    box-shadow: 0 4px 14px var(--dock-shadow), inset 0 1px 0 var(--dock-highlight);
+    background: var(--dock-bg, rgba(255, 255, 255, 0.08));
+    border: 1px solid var(--dock-border, rgba(255, 255, 255, 0.12));
+    backdrop-filter: blur(20px) saturate(180%);
+    -webkit-backdrop-filter: blur(20px) saturate(180%);
+    box-shadow: 0 4px 14px var(--dock-shadow, rgba(0, 0, 0, 0.25)), inset 0 1px 0 var(--dock-highlight, rgba(255, 255, 255, 0.15));
+    transition: all 0.2s cubic-bezier(0.16, 1, 0.3, 1);
   }
 
   .liquid-btn:hover {
-    background: var(--dock-bg-hover);
-    border-color: var(--border-subtle);
+    background: var(--dock-bg-hover, rgba(255, 255, 255, 0.14));
+    border-color: var(--border-subtle, rgba(255, 255, 255, 0.22));
+    transform: translateY(-1px);
   }
 
   .liquid-icon-btn {
-    background: var(--dock-bg);
-    border: 1px solid var(--dock-border);
+    background: var(--dock-bg, rgba(255, 255, 255, 0.08));
+    border: 1px solid var(--dock-border, rgba(255, 255, 255, 0.12));
     backdrop-filter: blur(20px) saturate(180%);
     -webkit-backdrop-filter: blur(20px) saturate(180%);
-    box-shadow: 0 4px 14px var(--dock-shadow), inset 0 1px 0 var(--dock-highlight);
+    box-shadow: 0 4px 14px var(--dock-shadow, rgba(0, 0, 0, 0.25)), inset 0 1px 0 var(--dock-highlight, rgba(255, 255, 255, 0.15));
+    transition: all 0.2s cubic-bezier(0.16, 1, 0.3, 1);
   }
 
   .liquid-icon-btn:hover {
-    background: var(--dock-bg-hover);
-    border-color: var(--border-subtle);
+    background: var(--dock-bg-hover, rgba(255, 255, 255, 0.14));
+    border-color: var(--border-subtle, rgba(255, 255, 255, 0.22));
+    transform: translateY(-1px);
   }
 
   .liquid-fav-active {
-    background: rgba(245, 158, 11, 0.15);
-    border-color: rgba(245, 158, 11, 0.35);
-    box-shadow: 0 4px 14px rgba(245, 158, 11, 0.2), inset 0 1px 0 rgba(255, 255, 255, 0.3);
+    background: rgba(245, 158, 11, 0.18) !important;
+    border-color: rgba(245, 158, 11, 0.45) !important;
+    box-shadow: 0 4px 18px rgba(245, 158, 11, 0.3), inset 0 1px 0 rgba(255, 255, 255, 0.35) !important;
   }
 
   .liquid-tag {
-    background: var(--bg-surface-elevated);
-    border: 1px solid var(--border-glass);
-    backdrop-filter: blur(14px);
-    -webkit-backdrop-filter: blur(14px);
-    box-shadow: 0 4px 12px var(--dock-shadow);
+    background: var(--bg-surface-elevated, rgba(17, 24, 39, 0.75));
+    border: 1px solid var(--border-glass, rgba(255, 255, 255, 0.14));
+    backdrop-filter: blur(16px) saturate(160%);
+    -webkit-backdrop-filter: blur(16px) saturate(160%);
+    box-shadow: 0 4px 14px rgba(0, 0, 0, 0.35);
+  }
+
+  .spring-tap {
+    transition: transform 0.15s cubic-bezier(0.34, 1.56, 0.64, 1);
+  }
+  .spring-tap:active {
+    transform: scale(0.92);
   }
 </style>

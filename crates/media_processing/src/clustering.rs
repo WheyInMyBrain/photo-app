@@ -9,6 +9,54 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use uuid::Uuid;
 
+fn get_match_threshold() -> f32 {
+    std::env::var("FACE_MATCH_THRESHOLD")
+        .ok()
+        .and_then(|v| v.parse::<f32>().ok())
+        .unwrap_or(0.72)
+}
+
+fn get_diversity_threshold() -> f32 {
+    std::env::var("FACE_DIVERSITY_THRESHOLD")
+        .ok()
+        .and_then(|v| v.parse::<f32>().ok())
+        .unwrap_or(0.82)
+}
+
+fn get_max_exemplars() -> usize {
+    std::env::var("FACE_MAX_EXEMPLARS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(16)
+}
+
+// Helper to compute L2-normalized vector for 512 dimensions
+fn normalize_512(vec: &mut [f32; EMBEDDING_DIM]) {
+    let norm_sq: f32 = vec.iter().map(|v| v * v).sum();
+    let norm = norm_sq.sqrt();
+    if norm > 1e-8 {
+        let inv = 1.0 / norm;
+        for v in vec.iter_mut() {
+            *v *= inv;
+        }
+    }
+}
+
+// Compute the average centroid across all current exemplars (or use cluster.centroid)
+fn compute_centroid(exemplars: &[[f32; EMBEDDING_DIM]]) -> [f32; EMBEDDING_DIM] {
+    let mut centroid = [0.0f32; EMBEDDING_DIM];
+    if exemplars.is_empty() {
+        return centroid;
+    }
+    for exemplar in exemplars {
+        for (c, e) in centroid.iter_mut().zip(exemplar.iter()) {
+            *c += e;
+        }
+    }
+    normalize_512(&mut centroid);
+    centroid
+}
+
 pub struct FaceClusterer;
 
 impl FaceClusterer {
@@ -222,43 +270,66 @@ impl FaceClusterer {
         updated_clusters: &mut Vec<ClusterUpdate>,
         new_persons: &mut Vec<NewPersonRecord>,
     ) -> (String, bool) {
+        let match_threshold = get_match_threshold();
+        let diversity_threshold = get_diversity_threshold();
+        let max_exemplars = get_max_exemplars();
+
         let mut best_person_idx: Option<usize> = None;
         let mut highest_sim: f32 = -1.0;
+        let mut best_centroid_sim: f32 = -1.0;
 
         for (idx, cluster) in existing_clusters.iter().enumerate() {
             if claimed_persons.contains(&cluster.person_id) {
                 continue;
             }
 
-            // Find the best matching exemplar for this person
+            // 1. Find the best matching exemplar in this cluster
+            let mut cluster_max_sim: f32 = -1.0;
             for exemplar in &cluster.exemplars {
                 let sim = dot_product_512(normalized_embedding, exemplar);
-                if sim > highest_sim {
-                    highest_sim = sim;
-                    best_person_idx = Some(idx);
+                if sim > cluster_max_sim {
+                    cluster_max_sim = sim;
                 }
+            }
+
+            // 2. Compute similarity with the cluster's average centroid
+            let cluster_centroid = compute_centroid(&cluster.exemplars);
+            let centroid_sim = dot_product_512(normalized_embedding, &cluster_centroid);
+
+            if cluster_max_sim > highest_sim {
+                highest_sim = cluster_max_sim;
+                best_centroid_sim = centroid_sim;
+                best_person_idx = Some(idx);
             }
         }
 
-        // Match threshold (0.50 - 0.55 works best with InsightFace / ArcFace embeddings)
+        // Two-pass validation:
+        // - highest_sim: must match an exemplar closely (e.g. >= 0.72)
+        // - best_centroid_sim: must also stay close to the global average (e.g. >= 0.67)
+        // This stops A -> B -> C drift dead in its tracks.
+        let centroid_threshold = (match_threshold - 0.05).max(0.60);
+
         if let Some(idx) = best_person_idx {
-            if highest_sim >= 0.55 {
+            if highest_sim >= match_threshold && best_centroid_sim >= centroid_threshold {
                 let cluster = &mut existing_clusters[idx];
                 let pid = cluster.person_id.clone();
                 cluster.face_count += 1;
 
-                // If this face captures a noticeably different look (e.g., sim between 0.42 and 0.65)
-                // and we have fewer than 5 exemplars, store it as an additional representative angle
-                if highest_sim < 0.65 && cluster.exemplars.len() < 5 {
+                // Store new exemplar if it represents a novel view and under cap
+                if highest_sim < diversity_threshold && cluster.exemplars.len() < max_exemplars {
                     cluster.exemplars.push(*normalized_embedding);
                 }
 
+                // Recalculate the refreshed normalized centroid
+                let updated_centroid = compute_centroid(&cluster.exemplars);
+
                 if let Some(existing_update) = updated_clusters.iter_mut().find(|u| u.person_id == pid) {
                     existing_update.new_face_count = cluster.face_count;
+                    existing_update.new_centroid = updated_centroid.to_vec();
                 } else if !new_persons.iter().any(|np| np.person_id == pid) {
                     updated_clusters.push(ClusterUpdate {
                         person_id: pid.clone(),
-                        new_centroid: normalized_embedding.to_vec(),
+                        new_centroid: updated_centroid.to_vec(),
                         new_face_count: cluster.face_count,
                         new_cover_face_id: None,
                     });
@@ -268,7 +339,7 @@ impl FaceClusterer {
             }
         }
 
-        // No match found -> create a new identity with this face as its first exemplar
+        // No match satisfied both exemplar and centroid checks -> Create new person
         let new_pid = Uuid::new_v4().to_string();
         existing_clusters.push(KnownPersonCluster {
             person_id: new_pid.clone(),
