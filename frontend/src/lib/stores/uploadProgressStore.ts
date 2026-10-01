@@ -1,3 +1,4 @@
+// photo-app/frontend/src/lib/stores/uploadProgressStore.ts
 import { writable } from 'svelte/store';
 import { authStore } from '$lib/stores/authStore';
 import { CHUNK_THRESHOLD_BYTES, uploadChunked } from '$lib/utils/uploader';
@@ -37,6 +38,12 @@ const initialState: UploadProgressState = {
   error: null
 };
 
+interface IndexedFile {
+  file: File;
+  fileIdx: number;
+  isLarge: boolean;
+}
+
 function createUploadProgressStore() {
   const { subscribe, update, set } = writable<UploadProgressState>(initialState);
 
@@ -71,13 +78,10 @@ function createUploadProgressStore() {
         error: null
       });
 
-      // Max slots for regular photos; large chunked items run with strict single concurrency
-      const MAX_PHOTO_CONCURRENCY = 2;
-      let nextIdx = 0;
       let completedCount = 0;
       let failedCount = 0;
 
-      // Track individual file bytes loaded to ensure accurate global progress
+      // Track per-file byte progress for accurate aggregated progress
       const fileBytesMap = new Map<number, number>();
 
       function recalculateLoadedBytes(): number {
@@ -88,6 +92,7 @@ function createUploadProgressStore() {
         return sum;
       }
 
+      // XHR for small files
       const uploadSingle = (file: File, folder: string, fileIdx: number): Promise<void> => {
         return new Promise((resolve, reject) => {
           const xhr = new XMLHttpRequest();
@@ -135,93 +140,114 @@ function createUploadProgressStore() {
         });
       };
 
-      const worker = async () => {
-        while (nextIdx < totalFiles) {
-          const fileIdx = nextIdx++;
-          const file = files[fileIdx];
-          const isLargeFile = file.size > CHUNK_THRESHOLD_BYTES;
+      // Segregate files into Small (concurrency 2-3) vs Large (strict sequential 1-by-1)
+      const indexedFiles: IndexedFile[] = files.map((file, fileIdx) => ({
+        file,
+        fileIdx,
+        isLarge: file.size > CHUNK_THRESHOLD_BYTES || file.type.startsWith('video/')
+      }));
 
-          fileBytesMap.set(fileIdx, 0);
+      const smallFiles = indexedFiles.filter((item) => !item.isLarge);
+      const largeFiles = indexedFiles.filter((item) => item.isLarge);
 
-          // Register in UI
+      const runFile = async (item: IndexedFile) => {
+        const { file, fileIdx, isLarge } = item;
+        fileBytesMap.set(fileIdx, 0);
+
+        update((s) => ({
+          ...s,
+          activeUploads: [
+            ...s.activeUploads,
+            {
+              fileIdx,
+              name: file.name,
+              size: file.size,
+              loaded: 0,
+              percent: 0,
+              status: isLarge ? 'chunking' : 'uploading'
+            }
+          ]
+        }));
+
+        try {
+          if (isLarge) {
+            await uploadChunked(file, folderPath, (part, totalParts) => {
+              const approxLoaded = Math.min(file.size, (part / totalParts) * file.size);
+              fileBytesMap.set(fileIdx, approxLoaded);
+              const currentLoaded = recalculateLoadedBytes();
+
+              update((s) => ({
+                ...s,
+                loadedBytes: currentLoaded,
+                activeUploads: s.activeUploads.map((act) =>
+                  act.fileIdx === fileIdx
+                    ? {
+                        ...act,
+                        loaded: approxLoaded,
+                        percent: Math.min(100, Math.round((part / totalParts) * 100))
+                      }
+                    : act
+                )
+              }));
+            });
+            fileBytesMap.set(fileIdx, file.size);
+          } else {
+            await uploadSingle(file, folderPath, fileIdx);
+          }
+
+          completedCount++;
+          const currentLoaded = recalculateLoadedBytes();
+
           update((s) => ({
             ...s,
-            activeUploads: [
-              ...s.activeUploads,
-              {
-                fileIdx,
-                name: file.name,
-                size: file.size,
-                loaded: 0,
-                percent: 0,
-                status: isLargeFile ? 'chunking' : 'uploading'
-              }
-            ]
+            completedFiles: completedCount,
+            loadedBytes: currentLoaded,
+            activeUploads: s.activeUploads.filter((act) => act.fileIdx !== fileIdx)
           }));
+        } catch (err: any) {
+          failedCount++;
+          fileBytesMap.set(fileIdx, 0); // Rollback partial bytes
+          const currentLoaded = recalculateLoadedBytes();
 
-          try {
-            if (isLargeFile) {
-              await uploadChunked(file, folderPath, (part, totalParts) => {
-                const approxLoaded = Math.min(file.size, (part / totalParts) * file.size);
-                fileBytesMap.set(fileIdx, approxLoaded);
-                const currentLoaded = recalculateLoadedBytes();
-
-                update((s) => ({
-                  ...s,
-                  loadedBytes: currentLoaded,
-                  activeUploads: s.activeUploads.map((item) =>
-                    item.fileIdx === fileIdx
-                      ? {
-                          ...item,
-                          loaded: approxLoaded,
-                          percent: Math.min(100, Math.round((part / totalParts) * 100))
-                        }
-                      : item
-                  )
-                }));
-              });
-              // Ensure 100% byte count on completion
-              fileBytesMap.set(fileIdx, file.size);
-            } else {
-              await uploadSingle(file, folderPath, fileIdx);
-            }
-
-            completedCount++;
-            const currentLoaded = recalculateLoadedBytes();
-
-            // Clear finished item from active progress list
-            update((s) => ({
-              ...s,
-              completedFiles: completedCount,
-              loadedBytes: currentLoaded,
-              activeUploads: s.activeUploads.filter((item) => item.fileIdx !== fileIdx)
-            }));
-          } catch (err: any) {
-            failedCount++;
-            // Revert failed partial bytes so global math stays accurate
-            fileBytesMap.set(fileIdx, 0);
-            const currentLoaded = recalculateLoadedBytes();
-
-            update((s) => ({
-              ...s,
-              failedFiles: failedCount,
-              loadedBytes: currentLoaded,
-              activeUploads: s.activeUploads.map((item) =>
-                item.fileIdx === fileIdx ? { ...item, status: 'failed', percent: 0 } : item
-              ),
-              error: `Upload failed for "${file.name}": ${err.message}`
-            }));
-          }
+          update((s) => ({
+            ...s,
+            failedFiles: failedCount,
+            loadedBytes: currentLoaded,
+            activeUploads: s.activeUploads.map((act) =>
+              act.fileIdx === fileIdx ? { ...act, status: 'failed', percent: 0 } : act
+            ),
+            error: `Upload failed for "${file.name}": ${err.message}`
+          }));
         }
       };
 
       try {
-        // Run workers with controlled pool size
-        const poolSize = Math.min(MAX_PHOTO_CONCURRENCY, totalFiles);
-        const pool = Array.from({ length: poolSize }, () => worker());
-        await Promise.all(pool);
+        // =========================================================
+        // PHASE 1: Process all small files with concurrency (2-3)
+        // =========================================================
+        if (smallFiles.length > 0) {
+          const SMALL_CONCURRENCY = 3;
+          let smallCursor = 0;
+
+          const smallWorker = async () => {
+            while (smallCursor < smallFiles.length) {
+              const item = smallFiles[smallCursor++];
+              await runFile(item);
+            }
+          };
+
+          const poolSize = Math.min(SMALL_CONCURRENCY, smallFiles.length);
+          await Promise.all(Array.from({ length: poolSize }, () => smallWorker()));
+        }
+
+        // =========================================================
+        // PHASE 2: Process large files STRICTLY ONE-BY-ONE (Series)
+        // =========================================================
+        for (const item of largeFiles) {
+          await runFile(item);
+        }
       } catch (e: any) {
-        update((s) => ({ ...s, error: e.message || 'Batch upload encountered an unexpected error.' }));
+        update((s) => ({ ...s, error: e.message || 'Batch upload failed.' }));
       } finally {
         onDone?.({ completed: completedCount, failed: failedCount });
       }

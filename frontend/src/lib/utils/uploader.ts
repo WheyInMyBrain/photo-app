@@ -122,6 +122,7 @@ export async function uploadChunked(
           method: 'POST',
           headers: { 'Content-Type': 'application/octet-stream' },
           body: slice,
+          credentials: 'include',
         },
         CHUNK_TIMEOUT_MS
       );

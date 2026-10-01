@@ -85,7 +85,9 @@ export default defineConfig({
             },
             '/api': {
                 target: 'http://127.0.0.1:3000',
-                changeOrigin: true
+                changeOrigin: true,
+                timeout: 0,       // 0 disables the proxy timeout
+                proxyTimeout: 0,  // 0 disables upstream response timeout
             },
             '/users': {
                 target: 'http://127.0.0.1:3000',
