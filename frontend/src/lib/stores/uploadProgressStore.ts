@@ -1,4 +1,3 @@
-// photo-app/frontend/src/lib/stores/uploadProgressStore.ts
 import { writable } from 'svelte/store';
 import { authStore } from '$lib/stores/authStore';
 import { CHUNK_THRESHOLD_BYTES, uploadChunked } from '$lib/utils/uploader';
@@ -17,10 +16,11 @@ export interface UploadProgressState {
   isMinimized: boolean;
   totalFiles: number;
   completedFiles: number;
+  failedFiles: number;
   totalBytes: number;
   loadedBytes: number;
   startTime: number;
-  activeUploads: ActiveFileProgress[]; // Array for direct Svelte reactivity
+  activeUploads: ActiveFileProgress[];
   error: string | null;
 }
 
@@ -29,6 +29,7 @@ const initialState: UploadProgressState = {
   isMinimized: false,
   totalFiles: 0,
   completedFiles: 0,
+  failedFiles: 0,
   totalBytes: 0,
   loadedBytes: 0,
   startTime: 0,
@@ -44,8 +45,17 @@ function createUploadProgressStore() {
     toggleMinimize: () => update((s) => ({ ...s, isMinimized: !s.isMinimized })),
     close: () => set(initialState),
 
-    startBatch: async (files: File[], folderPath: string, onDone: () => void) => {
+    startBatch: async (
+      files: File[],
+      folderPath: string,
+      onDone?: (summary: { completed: number; failed: number }) => void
+    ) => {
       const totalFiles = files.length;
+      if (totalFiles === 0) {
+        onDone?.({ completed: 0, failed: 0 });
+        return;
+      }
+
       const totalBytes = files.reduce((acc, f) => acc + f.size, 0);
 
       set({
@@ -53,6 +63,7 @@ function createUploadProgressStore() {
         isMinimized: false,
         totalFiles,
         completedFiles: 0,
+        failedFiles: 0,
         totalBytes,
         loadedBytes: 0,
         startTime: Date.now(),
@@ -60,11 +71,22 @@ function createUploadProgressStore() {
         error: null
       });
 
-      const CONCURRENCY = 3;
+      // Max slots for regular photos; large chunked items run with strict single concurrency
+      const MAX_PHOTO_CONCURRENCY = 2;
       let nextIdx = 0;
       let completedCount = 0;
-      let totalLoadedAccumulator = 0;
-      const fileBytesLoaded = new Array(totalFiles).fill(0);
+      let failedCount = 0;
+
+      // Track individual file bytes loaded to ensure accurate global progress
+      const fileBytesMap = new Map<number, number>();
+
+      function recalculateLoadedBytes(): number {
+        let sum = 0;
+        for (const bytes of fileBytesMap.values()) {
+          sum += bytes;
+        }
+        return sum;
+      }
 
       const uploadSingle = (file: File, folder: string, fileIdx: number): Promise<void> => {
         return new Promise((resolve, reject) => {
@@ -75,28 +97,28 @@ function createUploadProgressStore() {
 
           xhr.upload.onprogress = (e) => {
             if (e.lengthComputable) {
-              const diff = e.loaded - fileBytesLoaded[fileIdx];
-              fileBytesLoaded[fileIdx] = e.loaded;
-              totalLoadedAccumulator += diff;
+              fileBytesMap.set(fileIdx, e.loaded);
+              const currentLoaded = recalculateLoadedBytes();
 
-              update((s) => {
-                const updatedActive = s.activeUploads.map((item) => {
-                  if (item.fileIdx === fileIdx) {
-                    return {
-                      ...item,
-                      loaded: e.loaded,
-                      percent: Math.round((e.loaded / e.total) * 100)
-                    };
-                  }
-                  return item;
-                });
-                return { ...s, loadedBytes: totalLoadedAccumulator, activeUploads: updatedActive };
-              });
+              update((s) => ({
+                ...s,
+                loadedBytes: currentLoaded,
+                activeUploads: s.activeUploads.map((item) =>
+                  item.fileIdx === fileIdx
+                    ? {
+                        ...item,
+                        loaded: e.loaded,
+                        percent: Math.min(100, Math.round((e.loaded / e.total) * 100))
+                      }
+                    : item
+                )
+              }));
             }
           };
 
           xhr.onload = () => {
             if (xhr.status >= 200 && xhr.status < 300) {
+              fileBytesMap.set(fileIdx, file.size);
               resolve();
             } else if (xhr.status === 401) {
               authStore.checkStatus();
@@ -117,8 +139,11 @@ function createUploadProgressStore() {
         while (nextIdx < totalFiles) {
           const fileIdx = nextIdx++;
           const file = files[fileIdx];
+          const isLargeFile = file.size > CHUNK_THRESHOLD_BYTES;
 
-          // Add to active uploads array (up to 3 concurrent slots)
+          fileBytesMap.set(fileIdx, 0);
+
+          // Register in UI
           update((s) => ({
             ...s,
             activeUploads: [
@@ -129,63 +154,76 @@ function createUploadProgressStore() {
                 size: file.size,
                 loaded: 0,
                 percent: 0,
-                status: file.size > CHUNK_THRESHOLD_BYTES ? 'chunking' : 'uploading'
+                status: isLargeFile ? 'chunking' : 'uploading'
               }
             ]
           }));
 
           try {
-            if (file.size > CHUNK_THRESHOLD_BYTES) {
-              let prevPartLoaded = 0;
+            if (isLargeFile) {
               await uploadChunked(file, folderPath, (part, totalParts) => {
                 const approxLoaded = Math.min(file.size, (part / totalParts) * file.size);
-                const diff = approxLoaded - prevPartLoaded;
-                prevPartLoaded = approxLoaded;
-                totalLoadedAccumulator += diff;
+                fileBytesMap.set(fileIdx, approxLoaded);
+                const currentLoaded = recalculateLoadedBytes();
 
-                update((s) => {
-                  const updatedActive = s.activeUploads.map((item) => {
-                    if (item.fileIdx === fileIdx) {
-                      return {
-                        ...item,
-                        loaded: approxLoaded,
-                        percent: Math.round((part / totalParts) * 100)
-                      };
-                    }
-                    return item;
-                  });
-                  return { ...s, loadedBytes: totalLoadedAccumulator, activeUploads: updatedActive };
-                });
+                update((s) => ({
+                  ...s,
+                  loadedBytes: currentLoaded,
+                  activeUploads: s.activeUploads.map((item) =>
+                    item.fileIdx === fileIdx
+                      ? {
+                          ...item,
+                          loaded: approxLoaded,
+                          percent: Math.min(100, Math.round((part / totalParts) * 100))
+                        }
+                      : item
+                  )
+                }));
               });
+              // Ensure 100% byte count on completion
+              fileBytesMap.set(fileIdx, file.size);
             } else {
               await uploadSingle(file, folderPath, fileIdx);
             }
 
             completedCount++;
-            // Remove completed item from active slots array
+            const currentLoaded = recalculateLoadedBytes();
+
+            // Clear finished item from active progress list
             update((s) => ({
               ...s,
               completedFiles: completedCount,
+              loadedBytes: currentLoaded,
               activeUploads: s.activeUploads.filter((item) => item.fileIdx !== fileIdx)
             }));
           } catch (err: any) {
+            failedCount++;
+            // Revert failed partial bytes so global math stays accurate
+            fileBytesMap.set(fileIdx, 0);
+            const currentLoaded = recalculateLoadedBytes();
+
             update((s) => ({
               ...s,
+              failedFiles: failedCount,
+              loadedBytes: currentLoaded,
               activeUploads: s.activeUploads.map((item) =>
-                item.fileIdx === fileIdx ? { ...item, status: 'failed' } : item
+                item.fileIdx === fileIdx ? { ...item, status: 'failed', percent: 0 } : item
               ),
-              error: `Failed "${file.name}": ${err.message}`
+              error: `Upload failed for "${file.name}": ${err.message}`
             }));
           }
         }
       };
 
       try {
-        const pool = Array.from({ length: Math.min(CONCURRENCY, totalFiles) }, () => worker());
+        // Run workers with controlled pool size
+        const poolSize = Math.min(MAX_PHOTO_CONCURRENCY, totalFiles);
+        const pool = Array.from({ length: poolSize }, () => worker());
         await Promise.all(pool);
-        onDone();
       } catch (e: any) {
-        update((s) => ({ ...s, error: e.message || 'Batch upload failed.' }));
+        update((s) => ({ ...s, error: e.message || 'Batch upload encountered an unexpected error.' }));
+      } finally {
+        onDone?.({ completed: completedCount, failed: failedCount });
       }
     }
   };

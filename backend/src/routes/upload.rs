@@ -958,7 +958,7 @@ pub async fn upload_chunk(
     State(state): State<AppState>,
     auth_user: AuthUser,
     Query(query): Query<ChunkUploadQuery>,
-    body: Body, // Stream data directly rather than buffering into RAM
+    body: Body,
 ) -> Result<Json<ChunkUploadResponse>, AppError> {
     if query.total_chunks == 0 {
         return Err(AppError::BadRequest("total_chunks must be greater than 0".into()));
@@ -976,7 +976,7 @@ pub async fn upload_chunk(
         AppError::Internal(format!("Failed to create chunk session dir: {e}"))
     })?;
 
-    // Record expected total_chunks once
+    // Record total_chunks once
     let meta_path = session_dir.join("total_chunks");
     if !meta_path.exists() {
         let _ = fs::write(&meta_path, query.total_chunks.to_string()).await;
@@ -991,7 +991,7 @@ pub async fn upload_chunk(
         .await
         .map_err(|e| AppError::Internal(format!("Failed creating chunk file: {e}")))?;
 
-    // Stream the body chunks directly to disk
+    // Stream incoming bytes directly to disk
     let mut stream = body.into_data_stream();
     let mut total_written = 0usize;
 
@@ -1038,7 +1038,7 @@ pub async fn finalize_chunk(
         ));
     }
 
-    // Read total_chunks recorded by upload_chunk
+    // Read total_chunks metadata
     let meta_path = session_dir.join("total_chunks");
     let total_chunks_str = fs::read_to_string(&meta_path).await.map_err(|_| {
         AppError::BadRequest("Upload session missing metadata; no chunks received".into())
@@ -1057,28 +1057,30 @@ pub async fn finalize_chunk(
         .await
         .map_err(|e| AppError::Internal(format!("Failed creating final assembled file: {e}")))?;
 
-    // Validate and stream-stitch all parts in order
+    // Stream-stitch all parts using fixed-size buffer copy (ZERO memory bloat)
     for idx in 0..total_chunks {
         let chunk_path = session_dir.join(format!("{:06}.part", idx));
-        
-        let chunk_data = fs::read(&chunk_path).await.map_err(|_| {
+
+        let mut part_file = fs::File::open(&chunk_path).await.map_err(|_| {
             AppError::BadRequest(format!(
                 "Incomplete upload: chunk {} of {} is missing",
                 idx, total_chunks
             ))
         })?;
 
-        assembled_file.write_all(&chunk_data).await.map_err(|e| {
-            AppError::Internal(format!("Failed assembling chunk {idx}: {e}"))
-        })?;
+        // Copies directly at kernel/filesystem level via standard 64KB buffer
+        tokio::io::copy(&mut part_file, &mut assembled_file)
+            .await
+            .map_err(|e| AppError::Internal(format!("Failed stitching chunk {idx}: {e}")))?;
     }
 
-    assembled_file.flush().await.map_err(|e| {
-        AppError::Internal(format!("Failed flushing final file: {e}"))
-    })?;
+    assembled_file
+        .flush()
+        .await
+        .map_err(|e| AppError::Internal(format!("Failed flushing final file: {e}")))?;
     drop(assembled_file);
 
-    // Ingest the file into storage & db
+    // Ingest the file into storage & DB
     let final_folder = query.folder.unwrap_or_else(default_camera_folder);
     let result = persist_and_enqueue_staged_file(
         &state,
@@ -1088,11 +1090,14 @@ pub async fn finalize_chunk(
         &final_folder,
         None,
     )
-    .await?;
+    .await;
 
-    // Cleanup: Remove the temporary session directory and assembled file
+    // Guaranteed Cleanup: Runs whether ingest succeeded or failed
     let _ = fs::remove_dir_all(&session_dir).await;
     let _ = fs::remove_file(&final_assembled_path).await;
 
-    Ok(Json(result))
+    // Bubble ingest error after cleanup
+    let final_result = result?;
+
+    Ok(Json(final_result))
 }

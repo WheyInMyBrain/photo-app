@@ -1,7 +1,8 @@
 <!-- photo-app/frontend/src/lib/components/UploadModal.svelte -->
 <script lang="ts">
-  import { createEventDispatcher, onMount, tick } from 'svelte';
+  import { createEventDispatcher, onMount, onDestroy, tick } from 'svelte';
   import { fade, scale } from 'svelte/transition';
+  import { browser } from '$app/environment';
   import { fetchCustomAlbums } from '$lib/api/albums';
   import { uploadQueue } from '$lib/stores/uploadQueueStore';
   import { uploadProgressStore } from '$lib/stores/uploadProgressStore';
@@ -29,11 +30,24 @@
   let browsingDir = '';
   let searchQuery = '';
 
-  $: if (initialFiles && initialFiles.length > 0) {
+  // Prevent direct prop mutation on initialFiles
+  let lastProcessedFiles: File[] = [];
+  $: if (initialFiles && initialFiles.length > 0 && initialFiles !== lastProcessedFiles) {
+    lastProcessedFiles = initialFiles;
     uploadQueue.setMode('files');
     uploadQueue.addFiles(initialFiles);
-    initialFiles = [];
   }
+
+  // Reactive scroll lock: only lock body when modal is actually open
+  $: if (browser) {
+    document.body.style.overflow = isOpen ? 'hidden' : '';
+  }
+
+  onDestroy(() => {
+    if (browser) {
+      document.body.style.overflow = '';
+    }
+  });
 
   // Can upload if files are staged OR if there's a link preview with selections OR a raw URL typed in
   $: canUpload =
@@ -76,21 +90,8 @@
     }
   });
 
-  onMount(() => {
-    const originalOverflow = document.body.style.overflow;
-    document.body.style.overflow = 'hidden';
-    return () => {
-      document.body.style.overflow = originalOverflow;
-    };
-  });
-
-  async function toggleFolderDropdown() {
-    if (isFolderDropdownOpen) {
-      isFolderDropdownOpen = false;
-      return;
-    }
-
-    if (folderTriggerBtn) {
+  function updatePopoverGeometry() {
+    if (folderTriggerBtn && isFolderDropdownOpen) {
       const rect = folderTriggerBtn.getBoundingClientRect();
       popoverRect = {
         top: rect.bottom + 6,
@@ -98,17 +99,24 @@
         width: rect.width
       };
     }
+  }
+
+  async function toggleFolderDropdown() {
+    if (isFolderDropdownOpen) {
+      isFolderDropdownOpen = false;
+      return;
+    }
     isFolderDropdownOpen = true;
+    await tick();
+    updatePopoverGeometry();
   }
 
   function handleFileSelect(e: Event) {
     const input = e.target as HTMLInputElement;
     if (input.files && input.files.length > 0) {
       const selected = Array.from(input.files);
-      setTimeout(() => {
-        uploadQueue.addFiles(selected);
-        input.value = '';
-      }, 50);
+      uploadQueue.addFiles(selected);
+      input.value = '';
     }
   }
 
@@ -154,12 +162,13 @@
 
       forceClose();
 
-      uploadProgressStore.startBatch(filesToUpload, targetFolder, () => {
-        dispatch('uploaded', { count: filesToUpload.length });
+      uploadProgressStore.startBatch(filesToUpload, targetFolder, (summary) => {
+        const count = summary ? summary.completed : filesToUpload.length;
+        if (count > 0) {
+          dispatch('uploaded', { count });
+        }
       });
     } else if (state.uploadMode === 'link') {
-      forceClose();
-
       try {
         if (state.linkPreview && state.selectedLinkItems.size > 0) {
           const selectedIds = Array.from(state.selectedLinkItems);
@@ -178,6 +187,10 @@
 
           if (res.ok) {
             dispatch('uploaded', { count: selectedIds.length });
+            forceClose();
+          } else {
+            const errData = await res.json().catch(() => ({}));
+            console.error('Ingest failed:', errData);
           }
         } else if (state.linkUrl.trim()) {
           const urlToSend = state.linkUrl.trim();
@@ -195,6 +208,7 @@
 
           if (res.ok) {
             dispatch('uploaded', { count: 1 });
+            forceClose();
           } else {
             const errData = await res.json().catch(() => ({}));
             console.error('Ingest failed:', errData);
@@ -215,6 +229,7 @@
   }
 
   function handleKeydown(e: KeyboardEvent) {
+    if (!isOpen) return;
     if (e.key === 'Escape') {
       if (isFolderDropdownOpen) {
         isFolderDropdownOpen = false;
@@ -225,7 +240,12 @@
   }
 </script>
 
-<svelte:window on:keydown={handleKeydown} on:resize={() => { if (isFolderDropdownOpen) isFolderDropdownOpen = false; }} />
+<svelte:window
+  on:keydown={handleKeydown}
+  on:resize={() => {
+    if (isFolderDropdownOpen) updatePopoverGeometry();
+  }}
+/>
 
 {#if isOpen}
   <!-- svelte-ignore a11y_click_events_have_key_events -->

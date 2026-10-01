@@ -1,11 +1,14 @@
 // photo-app/frontend/src/lib/utils/uploader.ts
 
-export const CHUNK_THRESHOLD_BYTES = 5000 * 1024 * 1024; // 1GB
-export const CHUNK_SIZE_BYTES = 1000 * 1024 * 1024;      // 1GB
-const MAX_RETRIES = 3;
-const CHUNK_TIMEOUT_MS = 30_000; // 60s hard timeout per chunk
+// Any file over 25MB will use the reliable chunked uploader
+export const CHUNK_THRESHOLD_BYTES = 25 * 1024 * 1024; // 25MB
+// 25MB per chunk: optimal for local Wi-Fi and proxy stability
+export const CHUNK_SIZE_BYTES = 25 * 1024 * 1024;      // 25MB
 
-// Universal RFC4122 v4 UUID generator (works on HTTP, HTTPS, and mobile Safari)
+const MAX_RETRIES = 3;
+const CHUNK_TIMEOUT_MS = 90_000; // 90 seconds timeout per 25MB chunk
+const FINALIZE_TIMEOUT_MS = 180_000; // 3 minutes for stitching & indexing
+
 export function generateUUID(): string {
   if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
     try {
@@ -13,14 +16,12 @@ export function generateUUID(): string {
     } catch {}
   }
 
-  // Fallback for non-HTTPS local IP access & older mobile WebKit
   if (typeof crypto !== 'undefined' && typeof crypto.getRandomValues === 'function') {
     return (([1e7] as any) + -1e3 + -4e3 + -8e3 + -1e11).replace(/[018]/g, (c: number) =>
       (c ^ (crypto.getRandomValues(new Uint8Array(1))[0] & (15 >> (c / 4)))).toString(16)
     );
   }
 
-  // Pure Math.random fallback
   return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) => {
     const r = (Math.random() * 16) | 0;
     const v = c === 'x' ? r : (r & 0x3) | 0x8;
@@ -41,7 +42,11 @@ export async function uploadDirect(file: File, folderPath: string): Promise<void
   formData.append('folder', folderPath.trim() || 'root');
   formData.append('file', file);
 
-  const res = await fetch('/api/upload', { method: 'POST', body: formData });
+  const res = await fetch('/api/upload', {
+    method: 'POST',
+    body: formData,
+    credentials: 'include',
+  });
   if (res.status === 401) throw new Error('Session expired.');
   if (!res.ok) throw new Error(await res.text());
 }
@@ -49,20 +54,21 @@ export async function uploadDirect(file: File, folderPath: string): Promise<void
 async function fetchWithRetryAndTimeout(
   url: string,
   options: RequestInit,
+  timeoutMs: number,
   retries = MAX_RETRIES
 ): Promise<Response> {
   for (let attempt = 0; attempt < retries; attempt++) {
     const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), CHUNK_TIMEOUT_MS);
+    const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
 
     try {
       const res = await fetch(url, {
         ...options,
         signal: controller.signal,
+        credentials: 'include',
       });
       clearTimeout(timeoutId);
 
-      // Immediately bubble 401 Unauthorized without retrying
       if (res.status === 401) {
         throw new Error('Session expired.');
       }
@@ -71,16 +77,18 @@ async function fetchWithRetryAndTimeout(
         return res;
       }
 
-      // If server returned 4xx (except 408/429), retry will not help
-      if (res.status >= 400 && res.status < 500 && res.status !== 408 && res.status !== 429) {
-        throw new Error(`Server rejected chunk with status ${res.status}`);
+      // Retry on 502, 503, 504, 408, 429
+      const isRetryable = res.status >= 500 || res.status === 408 || res.status === 429;
+      if (!isRetryable) {
+        const errText = await res.text().catch(() => '');
+        throw new Error(`Server rejected with status ${res.status}: ${errText}`);
       }
     } catch (err: any) {
       clearTimeout(timeoutId);
       if (err.message === 'Session expired.') throw err;
       if (attempt === retries - 1) throw err;
 
-      // Exponential backoff before retry (1s, 2s, etc.)
+      // Exponential backoff: 1s, 2s, 3s
       await new Promise((resolve) => setTimeout(resolve, 1000 * (attempt + 1)));
     }
   }
@@ -108,11 +116,15 @@ export async function uploadChunked(
     });
 
     try {
-      await fetchWithRetryAndTimeout(`/api/upload/chunk?${params.toString()}`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/octet-stream' },
-        body: slice,
-      });
+      await fetchWithRetryAndTimeout(
+        `/api/upload/chunk?${params.toString()}`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/octet-stream' },
+          body: slice,
+        },
+        CHUNK_TIMEOUT_MS
+      );
     } catch (err: any) {
       throw new Error(`Failed uploading chunk ${chunkIdx + 1} of ${totalChunks}: ${err.message}`);
     }
@@ -128,7 +140,8 @@ export async function uploadChunked(
 
   const finalizeRes = await fetchWithRetryAndTimeout(
     `/api/upload/chunk/finalize?${finalizeParams.toString()}`,
-    { method: 'POST' }
+    { method: 'POST' },
+    FINALIZE_TIMEOUT_MS
   );
 
   if (!finalizeRes.ok) {
