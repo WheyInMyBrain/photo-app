@@ -9,6 +9,12 @@ const MAX_RETRIES = 3;
 const CHUNK_TIMEOUT_MS = 90_000; // 90 seconds timeout per 25MB chunk
 const FINALIZE_TIMEOUT_MS = 180_000; // 3 minutes for stitching & indexing
 
+export interface DuplicateCheckResult {
+  exists: boolean;
+  assetId?: string;
+  message?: string;
+}
+
 export function generateUUID(): string {
   if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
     try {
@@ -148,4 +154,37 @@ export async function uploadChunked(
   if (!finalizeRes.ok) {
     throw new Error(`Failed to finalize ${file.name}`);
   }
+}
+
+export async function checkDuplicate(
+  sha256: string,
+  fileName: string,
+  folderPath: string
+): Promise<DuplicateCheckResult> {
+  try {
+    const res = await fetch('/api/upload/check', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'include',
+      body: JSON.stringify({
+        sha256,
+        file_name: fileName,
+        folder: folderPath.trim() || 'root'
+      })
+    });
+
+    if (res.ok) {
+      const data = await res.json();
+      return {
+        exists: Boolean(data.exists),
+        assetId: data.asset_id,
+        message: data.message
+      };
+    }
+  } catch (err) {
+    // If the check endpoint fails, fall through to regular upload
+    console.warn('Duplicate pre-check failed, continuing to upload:', err);
+  }
+
+  return { exists: false };
 }

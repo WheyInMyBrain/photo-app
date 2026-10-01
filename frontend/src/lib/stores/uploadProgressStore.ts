@@ -1,7 +1,8 @@
 // photo-app/frontend/src/lib/stores/uploadProgressStore.ts
 import { writable } from 'svelte/store';
 import { authStore } from '$lib/stores/authStore';
-import { CHUNK_THRESHOLD_BYTES, uploadChunked } from '$lib/utils/uploader';
+import { CHUNK_THRESHOLD_BYTES, uploadChunked, checkDuplicate } from '$lib/utils/uploader';
+import { computeFileSHA256 } from '$lib/utils/hasher';
 
 export interface ActiveFileProgress {
   fileIdx: number;
@@ -9,7 +10,7 @@ export interface ActiveFileProgress {
   size: number;
   loaded: number;
   percent: number;
-  status: 'uploading' | 'chunking' | 'completed' | 'failed';
+  status: 'hashing' | 'uploading' | 'chunking' | 'completed' | 'failed';
 }
 
 export interface UploadProgressState {
@@ -154,6 +155,7 @@ function createUploadProgressStore() {
         const { file, fileIdx, isLarge } = item;
         fileBytesMap.set(fileIdx, 0);
 
+        // Step 1: Register as hashing in progress UI
         update((s) => ({
           ...s,
           activeUploads: [
@@ -164,12 +166,49 @@ function createUploadProgressStore() {
               size: file.size,
               loaded: 0,
               percent: 0,
-              status: isLarge ? 'chunking' : 'uploading'
+              status: 'hashing'
             }
           ]
         }));
 
         try {
+          // Compute client-side SHA-256 for duplicate check
+          let isDuplicate = false;
+          try {
+            const hash = await computeFileSHA256(file);
+            const dupResult = await checkDuplicate(hash, file.name, folderPath);
+            if (dupResult.exists) {
+              isDuplicate = true;
+            }
+          } catch (hashErr) {
+            console.warn('Fast hashing bypassed:', hashErr);
+          }
+
+          // If duplicate exists on server, skip uploading completely!
+          if (isDuplicate) {
+            fileBytesMap.set(fileIdx, file.size);
+            completedCount++;
+            const currentLoaded = recalculateLoadedBytes();
+
+            update((s) => ({
+              ...s,
+              completedFiles: completedCount,
+              loadedBytes: currentLoaded,
+              activeUploads: s.activeUploads.filter((act) => act.fileIdx !== fileIdx)
+            }));
+            return;
+          }
+
+          // Step 2: Proceed with upload if unique
+          update((s) => ({
+            ...s,
+            activeUploads: s.activeUploads.map((act) =>
+              act.fileIdx === fileIdx
+                ? { ...act, status: isLarge ? 'chunking' : 'uploading' }
+                : act
+            )
+          }));
+
           if (isLarge) {
             await uploadChunked(file, folderPath, (part, totalParts) => {
               const approxLoaded = Math.min(file.size, (part / totalParts) * file.size);
@@ -222,9 +261,7 @@ function createUploadProgressStore() {
       };
 
       try {
-        // =========================================================
-        // PHASE 1: Process all small files with concurrency (2-3)
-        // =========================================================
+        // Phase 1: Small files in parallel
         if (smallFiles.length > 0) {
           const SMALL_CONCURRENCY = 3;
           let smallCursor = 0;
@@ -240,9 +277,7 @@ function createUploadProgressStore() {
           await Promise.all(Array.from({ length: poolSize }, () => smallWorker()));
         }
 
-        // =========================================================
-        // PHASE 2: Process large files STRICTLY ONE-BY-ONE (Series)
-        // =========================================================
+        // Phase 2: Large files strictly in series
         for (const item of largeFiles) {
           await runFile(item);
         }

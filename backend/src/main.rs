@@ -13,6 +13,8 @@ use axum::{
 use config::Config;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::{broadcast, Notify};
 use tower_http::{
     services::ServeDir,
@@ -44,6 +46,28 @@ pub struct AppState {
     pub queue_notify: Arc<Notify>,
     pub tx_events: broadcast::Sender<WsMediaEvent>,
     pub coordinator: EngineCoordinator,
+    pub last_upload_activity: std::sync::Arc<AtomicI64>,
+}
+
+impl AppState {
+    /// Call whenever any upload packet or file is received
+    pub fn touch_upload_activity(&self) {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        self.last_upload_activity.store(now, Ordering::Relaxed);
+    }
+
+    /// Check seconds elapsed since the last upload activity
+    pub fn seconds_since_last_upload(&self) -> i64 {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        let last = self.last_upload_activity.load(Ordering::Relaxed);
+        now.saturating_sub(last)
+    }
 }
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
@@ -72,23 +96,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let queue_notify = Arc::new(Notify::new());
     let (tx_events, _) = broadcast::channel::<WsMediaEvent>(100);
 
+    let last_upload_activity = Arc::new(AtomicI64::new(0));
+
     // 2. Start worker with the coordinator (Idle worker consumes ~0 MB until a job arrives)
+    let state = AppState {
+        db: pool.clone(),
+        config: config.clone(),
+        queue_notify: queue_notify.clone(),
+        tx_events: tx_events.clone(),
+        coordinator: coordinator.clone(),
+        last_upload_activity,
+    };
+
+    // Start worker with `state`
     QueueService::start_worker(
-        pool.clone(),
+        state.clone(),
         config.storage_root.clone(),
         coordinator.clone(),
         config.worker_concurrency,
         queue_notify.clone(),
         tx_events.clone(),
     );
-
-    let state = AppState {
-        db: pool.clone(),
-        config: config.clone(),
-        queue_notify,
-        tx_events,
-        coordinator,
-    };
 
     // Serves /users/<user_id>/thumbs/<shard>/<file> from <storage_root>/users/
     let users_static_router = Router::new()
@@ -124,6 +152,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         // Upload
         .route("/api/upload", post(routes::upload::upload_photo))
+        .route("/upload/check", post(routes::upload::check_upload))
         .route("/api/upload/chunk", post(routes::upload::upload_chunk))
         .route("/api/upload/chunk/finalize", post(routes::upload::finalize_chunk))
         .route("/api/upload/inspect", post(routes::upload::inspect_link))

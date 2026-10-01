@@ -1,4 +1,4 @@
-// photo-app/crates/server/src/services/queue_service.rs
+// photo-app/backend/src/services/queue.rs
 
 use sqlx::SqlitePool;
 use std::path::PathBuf;
@@ -9,11 +9,12 @@ use tracing::{error, info, warn};
 
 use db::domain::{DbJob, NewAssetRecord};
 use db::tag_repo::{IngestionTagInput, TagRepo};
-use db::{AssetRepo, IngestionRepo, JobRepo, AlbumRepo};
+use db::{AlbumRepo, AssetRepo, IngestionRepo, JobRepo};
 
 use crate::services::engine_coordinator::EngineCoordinator;
+use crate::AppState;
 use crate::WsMediaEvent;
-use media_processing::{AiEnrichmentResult, DerivativeResult, MediaEngine};
+use media_processing::{AiEnrichmentResult, DerivativeResult, MediaEngine, StorageService};
 
 pub type ProcessJob = DbJob;
 
@@ -26,7 +27,7 @@ impl QueueService {
         mut job: ProcessJob,
     ) -> Result<(), sqlx::Error> {
         if job.job_type.trim().is_empty() {
-            job.job_type = "thumbnail".to_string();
+            job.job_type = "assemble".to_string();
         }
         JobRepo::enqueue(pool, &job).await?;
         notify.notify_one();
@@ -34,36 +35,256 @@ impl QueueService {
     }
 
     pub fn start_worker(
-        pool: SqlitePool,
+        state: AppState,
         storage_root: PathBuf,
         coordinator: EngineCoordinator,
         concurrency: usize,
         notify: Arc<Notify>,
         tx_events: broadcast::Sender<WsMediaEvent>,
     ) {
+        let pool = state.db.clone();
         let thumb_semaphore = Arc::new(Semaphore::new(concurrency.max(1)));
-        // Keep AI worker concurrency strictly constrained to avoid CPU/GPU lockup
         let ai_semaphore = Arc::new(Semaphore::new(1));
 
         info!(
             thumb_concurrency = concurrency,
             ai_concurrency = 1,
-            "Dual-stage media queue workers active (Thumbnail + Background AI)"
+            "Three-stage prioritized media queue workers active (Assemble -> Thumbnail -> Background AI)"
         );
 
         // =========================================================================
-        // WORKER 1: High-Speed Thumbnail & Preview Generation
+        // WORKER 0: High-Priority Background Ingest (Zero Double-Copy Direct Stitch)
+        // =========================================================================
+        {
+            let pool = pool.clone();
+            let storage_root = storage_root.clone();
+            let notify = notify.clone();
+
+            tokio::spawn(async move {
+                let _ = JobRepo::reset_interrupted(&pool).await;
+
+                loop {
+                    match JobRepo::fetch_next_job(&pool, "assemble").await {
+                        Ok(Some(job)) => {
+                            let pool = pool.clone();
+                            let storage_root = storage_root.clone();
+                            let notify = notify.clone();
+
+                            tokio::task::spawn(async move {
+                                let job_id = job.id.clone();
+                                let input_path = job.disk_path.clone();
+                                let asset_id = job.asset_id.clone();
+                                let user_id = job.user_id.clone();
+                                let file_name = job.file_name.clone();
+                                let folder_path = job.folder_path.clone();
+
+                                // Resolve target originals directory upfront
+                                let target_dir = StorageService::resolve_upload_dir(
+                                    &storage_root,
+                                    &user_id,
+                                    &folder_path,
+                                );
+
+                                if let Err(e) = tokio::fs::create_dir_all(&target_dir).await {
+                                    error!("Failed creating storage directory for {}: {}", asset_id, e);
+                                    let _ = JobRepo::mark_failed(&pool, &job_id, &e.to_string()).await;
+                                    return;
+                                }
+
+                                let disk_filename = StorageService::generate_disk_filename(&asset_id, &file_name);
+                                let final_destination = target_dir.join(&disk_filename);
+                                let destination_tmp = target_dir.join(format!("{}.tmp", disk_filename));
+
+                                let dest_tmp_clone = destination_tmp.clone();
+
+                                // Heavy disk I/O & SHA-256 calculation offloaded to blocking thread
+                                let res = tokio::task::spawn_blocking(move || -> Result<(String, i64), String> {
+                                    use std::io::{Read, Write};
+                                    use sha2::{Digest, Sha256};
+
+                                    let mut hasher = Sha256::new();
+                                    let mut buffer = [0u8; 128 * 1024]; // 128KB stream buffer
+                                    let mut total_bytes = 0i64;
+
+                                    if input_path.is_dir() {
+                                        // Case A: Chunked upload directory
+                                        // Write directly into destination_tmp on the destination filesystem!
+                                        let meta_path = input_path.join("total_chunks");
+                                        let total_chunks_str = std::fs::read_to_string(&meta_path)
+                                            .map_err(|e| format!("Missing total_chunks metadata: {e}"))?;
+                                        let total_chunks: u32 = total_chunks_str.trim().parse()
+                                            .map_err(|e| format!("Invalid total_chunks value: {e}"))?;
+
+                                        let mut assembled = std::fs::OpenOptions::new()
+                                            .create(true)
+                                            .write(true)
+                                            .truncate(true)
+                                            .open(&dest_tmp_clone)
+                                            .map_err(|e| format!("Failed creating destination file: {e}"))?;
+
+                                        for idx in 0..total_chunks {
+                                            let part_path = input_path.join(format!("{:06}.part", idx));
+                                            let mut part = std::fs::File::open(&part_path)
+                                                .map_err(|e| format!("Missing chunk part {idx}: {e}"))?;
+
+                                            loop {
+                                                let n = part.read(&mut buffer).map_err(|e| e.to_string())?;
+                                                if n == 0 { break; }
+                                                assembled.write_all(&buffer[..n]).map_err(|e| e.to_string())?;
+                                                hasher.update(&buffer[..n]);
+                                                total_bytes += n as i64;
+                                            }
+                                        }
+
+                                        assembled.flush().map_err(|e| e.to_string())?;
+                                        drop(assembled);
+                                    } else {
+                                        // Case B: Staged temporary file from direct / multipart upload
+                                        // Read & hash the staged file
+                                        let mut f = std::fs::File::open(&input_path)
+                                            .map_err(|e| format!("Failed opening staged file: {e}"))?;
+
+                                        loop {
+                                            let n = f.read(&mut buffer).map_err(|e| e.to_string())?;
+                                            if n == 0 { break; }
+                                            hasher.update(&buffer[..n]);
+                                            total_bytes += n as i64;
+                                        }
+                                        drop(f);
+
+                                        // Move staged file directly to destination_tmp
+                                        if let Err(_) = std::fs::rename(&input_path, &dest_tmp_clone) {
+                                            std::fs::copy(&input_path, &dest_tmp_clone)
+                                                .map_err(|e| format!("Failed copying to destination: {e}"))?;
+                                            let _ = std::fs::remove_file(&input_path);
+                                        }
+                                    }
+
+                                    let sha256 = hex::encode(hasher.finalize());
+                                    Ok((sha256, total_bytes))
+                                }).await;
+
+                                let (sha256, file_size_bytes) = match res {
+                                    Ok(Ok(val)) => val,
+                                    Ok(Err(e)) => {
+                                        error!("Assemble processing error on {}: {}", asset_id, e);
+                                        let _ = tokio::fs::remove_file(&destination_tmp).await;
+                                        let _ = JobRepo::mark_failed(&pool, &job_id, &e).await;
+                                        return;
+                                    }
+                                    Err(join_err) => {
+                                        error!("Assemble thread panic on {}: {}", asset_id, join_err);
+                                        let _ = tokio::fs::remove_file(&destination_tmp).await;
+                                        let _ = JobRepo::mark_failed(&pool, &job_id, &join_err.to_string()).await;
+                                        return;
+                                    }
+                                };
+
+                                // Deduplication check in SQLite
+                                if let Ok(Some(existing_id)) = AssetRepo::find_user_asset_by_sha256(&pool, &user_id, &sha256).await {
+                                    // Remove temporary destination file
+                                    let _ = tokio::fs::remove_file(&destination_tmp).await;
+
+                                    // Clean chunk session directory if present
+                                    if job.disk_path.is_dir() {
+                                        let _ = tokio::fs::remove_dir_all(&job.disk_path).await;
+                                    }
+
+                                    // If destination folder/album requested, link existing asset
+                                    if !folder_path.is_empty() && folder_path != "root" {
+                                        if let Ok(mut tx) = pool.begin().await {
+                                            let _ = AlbumRepo::link_asset_to_folder_albums_tx(
+                                                &mut tx,
+                                                &user_id,
+                                                &existing_id,
+                                                &folder_path,
+                                            ).await;
+                                            let _ = tx.commit().await;
+                                        }
+                                    }
+
+                                    let _ = JobRepo::mark_completed(&pool, &job_id).await;
+                                    info!(asset_id = %existing_id, "Duplicate resolved and linked to folder");
+                                    return;
+                                }
+
+                                // Instant atomic in-place rename on the same directory / filesystem
+                                if let Err(e) = tokio::fs::rename(&destination_tmp, &final_destination).await {
+                                    error!("Failed final rename for {}: {}", asset_id, e);
+                                    let _ = tokio::fs::remove_file(&destination_tmp).await;
+                                    let _ = JobRepo::mark_failed(&pool, &job_id, &e.to_string()).await;
+                                    return;
+                                }
+
+                                // Clean chunk directory
+                                if job.disk_path.is_dir() {
+                                    let _ = tokio::fs::remove_dir_all(&job.disk_path).await;
+                                }
+
+                                let rel_path = if folder_path.is_empty() || folder_path == "root" {
+                                    disk_filename
+                                } else {
+                                    format!("{}/{}", folder_path, disk_filename)
+                                };
+
+                                // Mark Stage 0 complete
+                                let _ = JobRepo::mark_completed(&pool, &job_id).await;
+
+                                // Enqueue Stage 1: "thumbnail"
+                                let thumb_job = DbJob {
+                                    id: uuid::Uuid::new_v4().to_string(),
+                                    user_id,
+                                    asset_id,
+                                    file_name,
+                                    rel_path,
+                                    folder_path,
+                                    disk_path: final_destination,
+                                    sha256,
+                                    job_type: "thumbnail".to_string(),
+                                    file_size_bytes,
+                                    payload: job.payload,
+                                };
+
+                                if let Err(e) = JobRepo::enqueue(&pool, &thumb_job).await {
+                                    error!("Failed scheduling thumbnail job: {}", e);
+                                } else {
+                                    notify.notify_one();
+                                }
+                            });
+                        }
+                        Ok(None) => {
+                            tokio::select! {
+                                _ = notify.notified() => {},
+                                _ = tokio::time::sleep(Duration::from_secs(5)) => {},
+                            }
+                        }
+                        Err(e) => {
+                            error!(error = %e, "Failed polling assemble jobs");
+                            tokio::time::sleep(Duration::from_secs(3)).await;
+                        }
+                    }
+                }
+            });
+        }
+
+        // =========================================================================
+        // WORKER 1: Interactive Thumbnail & Preview Generation
         // =========================================================================
         {
             let pool = pool.clone();
             let storage_root = storage_root.clone();
             let notify = notify.clone();
             let tx_events = tx_events.clone();
+            let state_tracker = state.clone();
 
             tokio::spawn(async move {
-                let _ = JobRepo::reset_interrupted(&pool).await;
-
                 loop {
+                    // YIELD TO ACTIVE UPLOADS: Allow network streaming priority
+                    if state_tracker.seconds_since_last_upload() < 5 {
+                        tokio::time::sleep(Duration::from_millis(500)).await;
+                        continue;
+                    }
+
                     match JobRepo::fetch_next_job(&pool, "thumbnail").await {
                         Ok(Some(job)) => {
                             let permit = match thumb_semaphore.clone().acquire_owned().await {
@@ -155,7 +376,7 @@ impl QueueService {
                                     }
                                 };
 
-                                // Enqueue background AI enrichment job (preserves payload)
+                                // Enqueue background AI enrichment job (Tier 2)
                                 let ai_job = DbJob {
                                     id: uuid::Uuid::new_v4().to_string(),
                                     user_id: job.user_id,
@@ -180,7 +401,7 @@ impl QueueService {
                         Ok(None) => {
                             tokio::select! {
                                 _ = notify.notified() => {},
-                                _ = tokio::time::sleep(Duration::from_secs(10)) => {},
+                                _ = tokio::time::sleep(Duration::from_secs(5)) => {},
                             }
                         }
                         Err(e) => {
@@ -193,16 +414,23 @@ impl QueueService {
         }
 
         // =========================================================================
-        // WORKER 2: Background AI Enrichment (Faces, Tags, CLIP)
+        // WORKER 2: Low-Priority Background AI Enrichment (Faces, Tags, CLIP)
         // =========================================================================
         {
             let pool = pool.clone();
             let storage_root = storage_root.clone();
             let notify = notify.clone();
             let coordinator = coordinator.clone();
+            let state_tracker = state.clone();
 
             tokio::spawn(async move {
                 loop {
+                    // IDLE GUARD: AI jobs run only after a quiet window (>= 30 seconds since last upload activity)
+                    if state_tracker.seconds_since_last_upload() < 30 {
+                        tokio::time::sleep(Duration::from_secs(5)).await;
+                        continue;
+                    }
+
                     // Poll next pending AI job
                     let job = match JobRepo::fetch_next_job(&pool, "ai_enrichment").await {
                         Ok(Some(job)) => job,
@@ -220,7 +448,7 @@ impl QueueService {
                         }
                     };
 
-                    // Concurrency limit 1 to protect CPU/RAM/VRAM
+                    // Strict concurrency 1 to keep host memory and compute cool
                     let _permit = match ai_semaphore.clone().acquire_owned().await {
                         Ok(p) => p,
                         Err(_) => break,

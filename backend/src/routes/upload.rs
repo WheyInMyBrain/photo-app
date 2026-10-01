@@ -1,279 +1,82 @@
 use axum::{
-    body::{Bytes, Body},
+    body::{Body, Bytes},
     extract::{Multipart, Query, State},
-    response::Json,
     http::HeaderMap,
+    response::Json,
 };
-use futures_util::StreamExt;
-use sha2::{Digest, Sha256};
-use std::path::{Path, PathBuf};
-use tokio::fs::{self, create_dir_all, File, OpenOptions};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use uuid::Uuid;
 use chrono::Local;
+use futures_util::StreamExt;
+use std::path::{Path, PathBuf};
+use tokio::fs::{self, create_dir_all, OpenOptions};
+use tokio::io::AsyncWriteExt;
+use uuid::Uuid;
 
 use crate::error::AppError;
-use crate::services::queue::{QueueService};
 use crate::middleware::auth::AuthUser;
+use crate::services::queue::QueueService;
 use crate::AppState;
 
 use media_processing::StorageService;
 
 use db::domain::{
-    BatchUploadReceipt, CandidateItem, ChunkUploadQuery, ChunkUploadResponse,
-    CommitLinkRequest, FinalizeChunkQuery, IngestResponse, CandidateManifest,
-    InspectLinkResponse, RawUploadQuery, StagedFile, UploadItemResult, InspectLinkRequest,
-    InspectResult, DbJob, JobPayload,
+    BatchUploadReceipt, CandidateItem, CandidateManifest, CheckUploadRequest, CheckUploadResponse,
+    ChunkUploadQuery, ChunkUploadResponse, CommitLinkRequest, DbJob, FinalizeChunkQuery,
+    IngestResponse, InspectLinkRequest, InspectLinkResponse, InspectResult, JobPayload,
+    RawUploadQuery, UploadItemResult,
 };
-use db::AssetRepo;
 use db::scrapes_repo::{ScrapedMediaItemRecord, ScrapedVariantRecord, ScrapesRepo};
+use db::{AlbumRepo, AssetRepo};
 use media_downloader::{
-    download_media, extract_media, ExtractedMediaMetadata, MediaType, 
-    stream_thumbnail_base64, inject_metadata, MediaMetadataPayload,
+    download_media, extract_media, inject_metadata, stream_thumbnail_base64,
+    ExtractedMediaMetadata, MediaMetadataPayload, MediaType,
 };
-
-/// Pipeline for raw in-memory byte uploads (direct small files, single web uploads)
-async fn persist_and_enqueue_bytes(
-    state: &AppState,
-    user_id: &str,
-    file_name: &str,
-    bytes: &[u8],
-    folder: &str,
-) -> UploadItemResult {
-    let sanitized_folder = StorageService::sanitize_folder_path(folder);
-    let sha256 = hex::encode(Sha256::digest(bytes));
-
-    // Deduplication check scoped to this user
-    if let Ok(Some(existing_id)) =
-        AssetRepo::find_user_asset_by_sha256(&state.db, user_id, &sha256).await
-    {
-        // If a specific folder/album is provided, associate the existing asset into the album tables
-        if !sanitized_folder.is_empty() && sanitized_folder != "root" {
-            if let Ok(mut tx) = state.db.begin().await {
-                if db::AlbumRepo::link_asset_to_folder_albums_tx(
-                    &mut tx,
-                    user_id,
-                    &existing_id,
-                    &sanitized_folder,
-                )
-                .await
-                .is_ok()
-                {
-                    let _ = tx.commit().await;
-                }
-            }
-        }
-
-        return UploadItemResult {
-            file_name: file_name.to_string(),
-            status: "duplicate".to_string(),
-            id: Some(existing_id),
-            relative_path: None,
-            message: Some("File already exists in library (linked to album)".into()),
-        };
-    }
-
-    let asset_id = Uuid::new_v4().to_string();
-    let target_dir = StorageService::resolve_upload_dir(
-        &state.config.storage_root,
-        user_id,
-        &sanitized_folder,
-    );
-
-    if let Err(e) = tokio::fs::create_dir_all(&target_dir).await {
-        return UploadItemResult {
-            file_name: file_name.to_string(),
-            status: "error".to_string(),
-            id: None,
-            relative_path: None,
-            message: Some(format!("Failed creating directory: {e}")),
-        };
-    }
-
-    let disk_filename = StorageService::generate_disk_filename(&asset_id, file_name);
-    let disk_path = target_dir.join(&disk_filename);
-
-    let rel_path = if sanitized_folder.is_empty() || sanitized_folder == "root" {
-        disk_filename
-    } else {
-        format!("{}/{}", sanitized_folder, disk_filename)
-    };
-
-    if let Err(e) = tokio::fs::write(&disk_path, bytes).await {
-        return UploadItemResult {
-            file_name: file_name.to_string(),
-            status: "error".to_string(),
-            id: None,
-            relative_path: None,
-            message: Some(format!("Failed writing file to disk: {e}")),
-        };
-    }
-
-    let job = DbJob {
-        id: Uuid::new_v4().to_string(),
-        user_id: user_id.to_string(),
-        asset_id: asset_id.clone(),
-        file_name: file_name.to_string(),
-        rel_path: rel_path.clone(),
-        folder_path: sanitized_folder,
-        disk_path,
-        sha256,
-        job_type: "thumbnail".to_string(),
-        file_size_bytes: bytes.len() as i64,
-        payload: None, // No scraped context for generic file uploads
-    };
-
-    if let Err(e) = QueueService::enqueue(&state.db, &state.queue_notify, job).await {
-        return UploadItemResult {
-            file_name: file_name.to_string(),
-            status: "error".to_string(),
-            id: None,
-            relative_path: None,
-            message: Some(format!("Failed enqueuing job: {e}")),
-        };
-    }
-
-    UploadItemResult {
-        file_name: file_name.to_string(),
-        status: "queued".to_string(),
-        id: Some(asset_id),
-        relative_path: Some(rel_path),
-        message: None,
-    }
-}
-
-/// Core pipeline for files on disk: hashes, deduplicates, moves, and enqueues
-async fn persist_and_enqueue_staged_file(
-    state: &AppState,
-    user_id: &str,
-    part_path: &Path,
-    file_name: &str,
-    folder: &str,
-    payload: Option<JobPayload>,
-) -> Result<UploadItemResult, AppError> {
-    if !part_path.exists() {
-        return Err(AppError::NotFound("Temporary file not found".into()));
-    }
-
-    // 1. Stream-hash using 64KB buffers
-    let mut file_to_hash = File::open(part_path)
-        .await
-        .map_err(|e| AppError::Internal(format!("Failed opening file: {e}")))?;
-
-    file_to_hash.sync_all().await.ok();
-
-    let metadata = file_to_hash
-        .metadata()
-        .await
-        .map_err(|e| AppError::Internal(format!("Failed reading metadata: {e}")))?;
-    let bytes_len = metadata.len() as i64;
-
-    let mut hasher = Sha256::new();
-    let mut buffer = [0u8; 65536];
-
-    loop {
-        let bytes_read = file_to_hash
-            .read(&mut buffer)
-            .await
-            .map_err(|e| AppError::Internal(format!("Failed reading bytes: {e}")))?;
-        if bytes_read == 0 {
-            break;
-        }
-        hasher.update(&buffer[..bytes_read]);
-    }
-    drop(file_to_hash);
-
-    let sha256_hash = hex::encode(hasher.finalize());
-    let sanitized_folder = StorageService::sanitize_folder_path(folder);
-
-    // 2. Duplicate Check (Scoped to authenticated user)
-    if let Ok(Some(existing_id)) =
-        AssetRepo::find_user_asset_by_sha256(&state.db, user_id, &sha256_hash).await
-    {
-        let _ = fs::remove_file(part_path).await;
-
-        // If a specific folder/album is provided, associate the existing asset into the album tables
-        if !sanitized_folder.is_empty() && sanitized_folder != "root" {
-            if let Ok(mut tx) = state.db.begin().await {
-                if db::AlbumRepo::link_asset_to_folder_albums_tx(
-                    &mut tx,
-                    user_id,
-                    &existing_id,
-                    &sanitized_folder,
-                )
-                .await
-                .is_ok()
-                {
-                    let _ = tx.commit().await;
-                }
-            }
-        }
-
-        return Ok(UploadItemResult {
-            file_name: file_name.to_string(),
-            status: "duplicate".to_string(),
-            id: Some(existing_id),
-            relative_path: None,
-            message: Some("Duplicate file exists in your library (linked to album)".to_string()),
-        });
-    }
-
-    // 3. Resolve destination & move
-    let target_dir = StorageService::resolve_upload_dir(
-        &state.config.storage_root,
-        user_id,
-        &sanitized_folder,
-    );
-
-    fs::create_dir_all(&target_dir)
-        .await
-        .map_err(|e| AppError::Internal(format!("Failed creating directory: {e}")))?;
-
-    let asset_id = Uuid::new_v4().to_string();
-    let disk_file_name = StorageService::generate_disk_filename(&asset_id, file_name);
-    let destination_path = target_dir.join(&disk_file_name);
-
-    fs::rename(part_path, &destination_path)
-        .await
-        .map_err(|e| AppError::Internal(format!("Failed moving asset: {e}")))?;
-
-    let relative_path = if sanitized_folder.is_empty() || sanitized_folder == "root" {
-        disk_file_name
-    } else {
-        format!("{}/{}", sanitized_folder, disk_file_name)
-    };
-
-    // 4. Enqueue into DB-backed QueueService
-    let job = DbJob {
-        id: Uuid::new_v4().to_string(),
-        user_id: user_id.to_string(),
-        asset_id: asset_id.clone(),
-        file_name: file_name.to_string(),
-        rel_path: relative_path.clone(),
-        folder_path: sanitized_folder,
-        disk_path: destination_path,
-        sha256: sha256_hash,
-        job_type: "thumbnail".to_string(),
-        file_size_bytes: bytes_len,
-        payload,
-    };
-
-    QueueService::enqueue(&state.db, &state.queue_notify, job)
-        .await
-        .map_err(|e| AppError::Internal(format!("Failed enqueuing job: {e}")))?;
-
-    Ok(UploadItemResult {
-        file_name: file_name.to_string(),
-        status: "queued".to_string(),
-        id: Some(asset_id),
-        relative_path: Some(relative_path),
-        message: None,
-    })
-}
 
 // ==========================================
 // 1. FRONTEND HANDLER (Multipart Form-Data)
 // ==========================================
+
+/// POST /api/upload/check
+pub async fn check_upload(
+    State(state): State<AppState>,
+    auth_user: AuthUser,
+    Json(payload): Json<CheckUploadRequest>,
+) -> Result<Json<CheckUploadResponse>, AppError> {
+    let sha256 = payload.sha256.trim().to_lowercase();
+    if sha256.is_empty() {
+        return Err(AppError::BadRequest("sha256 hash cannot be empty".into()));
+    }
+
+    // 1. O(1) B-tree lookup on UNIQUE(user_id, sha256)
+    let check_res = AssetRepo::check_duplicate_by_sha256(&state.db, &auth_user.id, &sha256)
+        .await
+        .map_err(|e| AppError::Internal(format!("Database lookup error: {e}")))?;
+
+    // 2. If it exists and is active, link it into the destination folder/album if specified
+    if check_res.exists && !check_res.is_deleted {
+        if let Some(ref asset_id) = check_res.asset_id {
+            let folder_candidate = payload.folder.unwrap_or_default();
+            let sanitized_folder = StorageService::sanitize_folder_path(&folder_candidate);
+
+            if !sanitized_folder.is_empty() && sanitized_folder != "root" {
+                if let Ok(mut tx) = state.db.begin().await {
+                    if AlbumRepo::link_asset_to_folder_albums_tx(
+                        &mut tx,
+                        &auth_user.id,
+                        asset_id,
+                        &sanitized_folder,
+                    )
+                    .await
+                    .is_ok()
+                    {
+                        let _ = tx.commit().await;
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(Json(check_res))
+}
 
 pub async fn upload_photo(
     State(state): State<AppState>,
@@ -281,20 +84,20 @@ pub async fn upload_photo(
     Query(query): Query<RawUploadQuery>,
     mut multipart: Multipart,
 ) -> Result<Json<BatchUploadReceipt>, AppError> {
-    // 1. Initialize from URL query parameter fallback to "root"
+    state.touch_upload_activity();
+
     let mut raw_folder = query
         .folder
         .filter(|s| !s.trim().is_empty())
         .unwrap_or_else(|| "root".to_string());
 
-    let mut staged_files: Vec<StagedFile> = Vec::new();
     let mut results = Vec::new();
+    let staging_root = resolve_user_temp_dir(&state, &auth_user.id, "staging").await?;
 
-    while let Some(field) = multipart.next_field().await? {
+    while let Some(mut field) = multipart.next_field().await? {
         let field_name = field.name().unwrap_or("").to_string();
 
         match field_name.as_str() {
-            // Form body field can also set/override the folder
             "folder" => {
                 let txt = field.text().await.unwrap_or_default();
                 if !txt.trim().is_empty() {
@@ -303,49 +106,450 @@ pub async fn upload_photo(
             }
             "file" | "files" => {
                 let file_name = field.file_name().unwrap_or("media.raw").to_string();
+                let asset_id = Uuid::new_v4().to_string();
+                let staged_path = staging_root.join(format!("{}.staged", asset_id));
 
-                match field.bytes().await {
-                    Ok(b) => staged_files.push(StagedFile { file_name, bytes: b }),
+                // Stream incoming bytes directly to disk with zero memory buffering
+                let mut file = match OpenOptions::new()
+                    .create(true)
+                    .write(true)
+                    .truncate(true)
+                    .open(&staged_path)
+                    .await
+                {
+                    Ok(f) => f,
                     Err(err) => {
                         results.push(UploadItemResult {
                             file_name,
                             status: "error".to_string(),
                             id: None,
                             relative_path: None,
-                            message: Some(format!("Failed reading bytes: {err}")),
+                            message: Some(format!("Failed allocating disk file: {err}")),
                         });
+                        continue;
                     }
+                };
+
+                let mut total_bytes = 0i64;
+                let mut stream_error = false;
+
+                while let Ok(Some(chunk)) = field.chunk().await {
+                    state.touch_upload_activity();
+                    if let Err(err) = file.write_all(&chunk).await {
+                        results.push(UploadItemResult {
+                            file_name: file_name.clone(),
+                            status: "error".to_string(),
+                            id: None,
+                            relative_path: None,
+                            message: Some(format!("Failed writing stream to disk: {err}")),
+                        });
+                        stream_error = true;
+                        break;
+                    }
+                    total_bytes += chunk.len() as i64;
                 }
+
+                if stream_error {
+                    let _ = fs::remove_file(&staged_path).await;
+                    continue;
+                }
+
+                if total_bytes == 0 {
+                    let _ = fs::remove_file(&staged_path).await;
+                    results.push(UploadItemResult {
+                        file_name,
+                        status: "error".to_string(),
+                        id: None,
+                        relative_path: None,
+                        message: Some("Uploaded file was empty".to_string()),
+                    });
+                    continue;
+                }
+
+                let _ = file.flush().await;
+                drop(file);
+
+                let sanitized_folder = StorageService::sanitize_folder_path(&raw_folder);
+
+                // Queue "assemble" job: background worker hashes, deduplicates, and moves
+                let job = DbJob {
+                    id: Uuid::new_v4().to_string(),
+                    user_id: auth_user.id.clone(),
+                    asset_id: asset_id.clone(),
+                    file_name: file_name.clone(),
+                    rel_path: String::new(),
+                    folder_path: sanitized_folder,
+                    disk_path: staged_path.clone(),
+                    sha256: String::new(),
+                    job_type: "assemble".to_string(),
+                    file_size_bytes: total_bytes,
+                    payload: None,
+                };
+
+                if let Err(e) = QueueService::enqueue(&state.db, &state.queue_notify, job).await {
+                    let _ = fs::remove_file(&staged_path).await;
+                    results.push(UploadItemResult {
+                        file_name,
+                        status: "error".to_string(),
+                        id: None,
+                        relative_path: None,
+                        message: Some(format!("Failed enqueuing job: {e}")),
+                    });
+                    continue;
+                }
+
+                results.push(UploadItemResult {
+                    file_name,
+                    status: "queued".to_string(),
+                    id: Some(asset_id),
+                    relative_path: None,
+                    message: Some("File saved, queued for background processing".to_string()),
+                });
             }
             _ => {}
         }
-    }
-
-    let sanitized_folder = StorageService::sanitize_folder_path(&raw_folder);
-
-    for staged in staged_files {
-        let res = persist_and_enqueue_bytes(
-            &state,
-            &auth_user.id,
-            &staged.file_name,
-            &staged.bytes,
-            &sanitized_folder,
-        )
-        .await;
-        results.push(res);
     }
 
     let success_count = results.iter().filter(|r| r.status == "queued").count();
 
     Ok(Json(BatchUploadReceipt {
         total_uploaded: success_count,
-        folder: sanitized_folder,
+        folder: StorageService::sanitize_folder_path(&raw_folder),
         items: results,
     }))
 }
 
+/// POST /api/upload/inspect
+pub async fn inspect_link(
+    State(state): State<AppState>,
+    auth_user: AuthUser,
+    Json(payload): Json<InspectLinkRequest>,
+) -> Result<Json<InspectResult>, AppError> {
+    let mut manifest = resolve_or_scrape_manifest(&state, &auth_user, &payload.url).await?;
+    let target_folder = StorageService::sanitize_folder_path(&manifest.suggested_folder);
+
+    // Fast-path: single item posts are committed immediately without computing previews
+    if manifest.items.len() == 1 {
+        let receipt = execute_item_downloads(
+            &state,
+            &auth_user,
+            manifest.items,
+            &target_folder,
+            &manifest.platform,
+        )
+        .await?;
+        return Ok(Json(InspectResult::Committed(receipt)));
+    }
+
+    // Carousel path: stream lightweight base64 thumbnails in memory for user selection
+    for item in &mut manifest.items {
+        if item.thumbnail_base64.is_none() {
+            let thumb_target = if !item.thumbnail_url.is_empty() {
+                &item.thumbnail_url
+            } else {
+                &item.high_res_url
+            };
+            item.thumbnail_base64 = stream_thumbnail_base64(
+                thumb_target,
+                item.referer.as_deref().or(Some(&payload.url)),
+            )
+            .await;
+        }
+    }
+
+    Ok(Json(InspectResult::Preview(InspectLinkResponse {
+        suggested_folder: target_folder,
+        platform: manifest.platform,
+        author: manifest.author,
+        caption: manifest.caption,
+        total_items: manifest.items.len(),
+        items: manifest.items,
+    })))
+}
+
+/// POST /api/upload/ingest
+pub async fn upload_ingest(
+    State(state): State<AppState>,
+    auth_user: AuthUser,
+    headers: HeaderMap,
+    Query(query): Query<RawUploadQuery>,
+    body: Bytes,
+) -> Result<Json<IngestResponse>, AppError> {
+    state.touch_upload_activity();
+
+    if body.is_empty() {
+        return Err(AppError::BadRequest("Upload body cannot be empty".into()));
+    }
+
+    let content_type = headers
+        .get("content-type")
+        .and_then(|h| h.to_str().ok())
+        .unwrap_or("");
+
+    // Case 1: JSON Payloads (Handles both CommitLinkRequest AND Apple Shortcut {"url": "..."})
+    if content_type.starts_with("application/json") || body.starts_with(b"{") {
+        // 1a: Try CommitLinkRequest (web app selective import)
+        if let Ok(commit_req) = serde_json::from_slice::<CommitLinkRequest>(&body) {
+            let target_folder = commit_req
+                .folder
+                .unwrap_or_else(|| commit_req.platform.clone());
+
+            let receipt = execute_item_downloads(
+                &state,
+                &auth_user,
+                commit_req.selected_items,
+                &target_folder,
+                &commit_req.platform,
+            )
+            .await?;
+
+            return Ok(Json(IngestResponse::Batch(receipt)));
+        }
+
+        // 1b: Catch Apple Shortcut JSON: {"url": "https://..."} or {"link": "..."}
+        if let Ok(val) = serde_json::from_slice::<serde_json::Value>(&body) {
+            let extracted_url = val
+                .get("url")
+                .or_else(|| val.get("link"))
+                .or_else(|| val.get("target"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim());
+
+            if let Some(target_url) = extracted_url {
+                if target_url.starts_with("http://") || target_url.starts_with("https://") {
+                    let manifest =
+                        resolve_or_scrape_manifest(&state, &auth_user, target_url).await?;
+                    let target_folder = query.folder.unwrap_or(manifest.suggested_folder);
+
+                    let receipt = execute_item_downloads(
+                        &state,
+                        &auth_user,
+                        manifest.items,
+                        &target_folder,
+                        &manifest.platform,
+                    )
+                    .await?;
+
+                    return Ok(Json(IngestResponse::Batch(receipt)));
+                }
+            }
+        }
+    }
+
+    // Case 2: URL Auto-Commit (Raw text link)
+    let is_text_or_url = content_type.starts_with("text/")
+        || (body.len() < 2048
+            && std::str::from_utf8(&body)
+                .map(|s| s.trim().starts_with("http"))
+                .unwrap_or(false));
+
+    if is_text_or_url {
+        if let Ok(raw_str) = std::str::from_utf8(&body) {
+            let trimmed = raw_str.trim();
+            if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+                let manifest = resolve_or_scrape_manifest(&state, &auth_user, trimmed).await?;
+                let target_folder = query.folder.unwrap_or(manifest.suggested_folder);
+
+                let receipt = execute_item_downloads(
+                    &state,
+                    &auth_user,
+                    manifest.items,
+                    &target_folder,
+                    &manifest.platform,
+                )
+                .await?;
+
+                return Ok(Json(IngestResponse::Batch(receipt)));
+            }
+        }
+    }
+
+    // Case 3: Binary Media Upload (Pushed directly to staging disk and queued)
+    let file_name = resolve_incoming_filename(&query, &headers, &body);
+    let final_folder = query.folder.unwrap_or_else(default_camera_folder);
+    let sanitized_folder = StorageService::sanitize_folder_path(&final_folder);
+
+    let staging_root = resolve_user_temp_dir(&state, &auth_user.id, "staging").await?;
+    let asset_id = Uuid::new_v4().to_string();
+    let staged_path = staging_root.join(format!("{}.staged", asset_id));
+
+    fs::write(&staged_path, &body).await.map_err(|e| {
+        AppError::Internal(format!("Failed writing staged ingest file: {e}"))
+    })?;
+
+    let job = DbJob {
+        id: Uuid::new_v4().to_string(),
+        user_id: auth_user.id.clone(),
+        asset_id: asset_id.clone(),
+        file_name: file_name.clone(),
+        rel_path: String::new(),
+        folder_path: sanitized_folder,
+        disk_path: staged_path,
+        sha256: String::new(),
+        job_type: "assemble".to_string(),
+        file_size_bytes: body.len() as i64,
+        payload: None,
+    };
+
+    QueueService::enqueue(&state.db, &state.queue_notify, job)
+        .await
+        .map_err(|e| AppError::Internal(format!("Failed to enqueue ingest job: {e}")))?;
+
+    Ok(Json(IngestResponse::File(UploadItemResult {
+        file_name,
+        status: "queued".to_string(),
+        id: Some(asset_id),
+        relative_path: None,
+        message: Some("Queued for background processing".to_string()),
+    })))
+}
+
+/// POST /api/upload/chunk
+pub async fn upload_chunk(
+    State(state): State<AppState>,
+    auth_user: AuthUser,
+    Query(query): Query<ChunkUploadQuery>,
+    body: Body,
+) -> Result<Json<ChunkUploadResponse>, AppError> {
+    state.touch_upload_activity();
+
+    if query.total_chunks == 0 {
+        return Err(AppError::BadRequest("total_chunks must be greater than 0".into()));
+    }
+    if query.chunk_index >= query.total_chunks {
+        return Err(AppError::BadRequest(format!(
+            "chunk_index {} out of bounds for total_chunks {}",
+            query.chunk_index, query.total_chunks
+        )));
+    }
+
+    let temp_root = resolve_user_temp_dir(&state, &auth_user.id, "chunks").await?;
+    let session_dir = temp_root.join(&query.upload_id);
+    fs::create_dir_all(&session_dir).await.map_err(|e| {
+        AppError::Internal(format!("Failed to create chunk session dir: {e}"))
+    })?;
+
+    // Record total_chunks once
+    let meta_path = session_dir.join("total_chunks");
+    if !meta_path.exists() {
+        let _ = fs::write(&meta_path, query.total_chunks.to_string()).await;
+    }
+
+    let chunk_path = session_dir.join(format!("{:06}.part", query.chunk_index));
+    let mut file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&chunk_path)
+        .await
+        .map_err(|e| AppError::Internal(format!("Failed creating chunk file: {e}")))?;
+
+    // Stream incoming bytes directly to disk
+    let mut stream = body.into_data_stream();
+    let mut total_written = 0usize;
+
+    while let Some(chunk_result) = stream.next().await {
+        state.touch_upload_activity();
+        let data = chunk_result.map_err(|e| {
+            AppError::BadRequest(format!("Network stream read error: {e}"))
+        })?;
+
+        file.write_all(&data).await.map_err(|e| {
+            AppError::Internal(format!("Disk write error: {e}"))
+        })?;
+
+        total_written += data.len();
+    }
+
+    if total_written == 0 {
+        let _ = fs::remove_file(&chunk_path).await;
+        return Err(AppError::BadRequest("Chunk payload is empty".into()));
+    }
+
+    file.flush()
+        .await
+        .map_err(|e| AppError::Internal(format!("Failed flushing chunk file: {e}")))?;
+
+    Ok(Json(ChunkUploadResponse {
+        upload_id: query.upload_id,
+        chunk_index: query.chunk_index,
+        received: true,
+    }))
+}
+
+/// POST /api/upload/chunk/finalize
+pub async fn finalize_chunk(
+    State(state): State<AppState>,
+    auth_user: AuthUser,
+    Query(query): Query<FinalizeChunkQuery>,
+) -> Result<Json<UploadItemResult>, AppError> {
+    state.touch_upload_activity();
+
+    let temp_root = resolve_user_temp_dir(&state, &auth_user.id, "chunks").await?;
+    let session_dir = temp_root.join(&query.upload_id);
+
+    if !session_dir.exists() {
+        return Err(AppError::NotFound(
+            "Upload session directory not found or expired".into(),
+        ));
+    }
+
+    // Read total_chunks metadata
+    let meta_path = session_dir.join("total_chunks");
+    let total_chunks_str = fs::read_to_string(&meta_path).await.map_err(|_| {
+        AppError::BadRequest("Upload session missing metadata; no chunks received".into())
+    })?;
+
+    let total_chunks: u32 = total_chunks_str.trim().parse().map_err(|_| {
+        AppError::Internal("Corrupted total_chunks metadata".into())
+    })?;
+
+    // Quick verification: Do all .part files exist? (Microsecond point check)
+    for idx in 0..total_chunks {
+        let chunk_path = session_dir.join(format!("{:06}.part", idx));
+        if !chunk_path.exists() {
+            return Err(AppError::BadRequest(format!(
+                "Incomplete upload: chunk {} of {} is missing",
+                idx, total_chunks
+            )));
+        }
+    }
+
+    let asset_id = Uuid::new_v4().to_string();
+    let final_folder = query.folder.unwrap_or_else(default_camera_folder);
+    let sanitized_folder = StorageService::sanitize_folder_path(&final_folder);
+
+    // Enqueue Stage 0 "assemble" job pointing directly to session_dir
+    let job = DbJob {
+        id: Uuid::new_v4().to_string(),
+        user_id: auth_user.id.clone(),
+        asset_id: asset_id.clone(),
+        file_name: query.file_name.clone(),
+        rel_path: String::new(),
+        folder_path: sanitized_folder,
+        disk_path: session_dir, // Worker stitches parts from here
+        sha256: String::new(),
+        job_type: "assemble".to_string(),
+        file_size_bytes: 0,
+        payload: None,
+    };
+
+    QueueService::enqueue(&state.db, &state.queue_notify, job)
+        .await
+        .map_err(|e| AppError::Internal(format!("Failed to enqueue assemble job: {e}")))?;
+
+    // Immediate acknowledgement: browser socket disconnects cleanly in <20ms
+    Ok(Json(UploadItemResult {
+        file_name: query.file_name,
+        status: "queued".to_string(),
+        id: Some(asset_id),
+        relative_path: None,
+        message: Some("Upload verified; assembling in background".to_string()),
+    }))
+}
+
 // ==========================================
-// 2. SHORTCUTS HANDLER (Raw Binary Stream)
+// 2. SHORTCUTS & HELPERS (Raw Binary Stream)
 // ==========================================
 
 fn detect_extension_from_magic_bytes(bytes: &[u8]) -> Option<&'static str> {
@@ -353,28 +557,22 @@ fn detect_extension_from_magic_bytes(bytes: &[u8]) -> Option<&'static str> {
         return None;
     }
 
-    // JPEG: FF D8 FF
     if bytes.starts_with(&[0xFF, 0xD8, 0xFF]) {
         return Some("jpg");
     }
 
-    // PNG: 89 50 4E 47 0D 0A 1A 0A
     if bytes.starts_with(&[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]) {
         return Some("png");
     }
 
-    // GIF: GIF87a or GIF89a
     if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
         return Some("gif");
     }
 
-    // WebP: RIFF....WEBP
     if bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP" {
         return Some("webp");
     }
 
-    // ISO Base Media File Format (MP4, MOV, HEIC, HEIF)
-    // Box structure: 4 bytes length, then 'ftyp'
     if &bytes[4..8] == b"ftyp" {
         let brand = &bytes[8..12];
         return match brand {
@@ -387,7 +585,6 @@ fn detect_extension_from_magic_bytes(bytes: &[u8]) -> Option<&'static str> {
     None
 }
 
-/// Returns and creates a tenant-isolated temporary working directory.
 async fn resolve_user_temp_dir(state: &AppState, user_id: &str, sub: &str) -> Result<PathBuf, AppError> {
     let dir = state.config.storage_root.join("temp").join(sub).join(user_id);
     create_dir_all(&dir)
@@ -396,12 +593,10 @@ async fn resolve_user_temp_dir(state: &AppState, user_id: &str, sub: &str) -> Re
     Ok(dir)
 }
 
-/// Fallback camera roll folder: "Camera Roll/YYYY-MM"
 fn default_camera_folder() -> String {
     format!("Camera Roll/{}", Local::now().format("%Y-%m"))
 }
 
-/// Determines the file name and extension from query params, headers, or magic bytes.
 fn resolve_incoming_filename(
     query: &RawUploadQuery,
     headers: &HeaderMap,
@@ -493,7 +688,6 @@ async fn resolve_or_scrape_manifest(
 ) -> Result<CandidateManifest, AppError> {
     let clean_url = url.trim();
 
-    // 1. Check if post is already scraped and cached in DB
     if let Some(post) = ScrapesRepo::find_post_by_url(&state.db, &auth_user.id, clean_url)
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?
@@ -524,7 +718,6 @@ async fn resolve_or_scrape_manifest(
         });
     }
 
-    // 2. Fresh scrape: extracts items and runs probe_image_metadata for real mime and dimensions
     let extracted: ExtractedMediaMetadata = extract_media(clean_url, Some(&state.config.downloader))
         .await
         .map_err(|e| AppError::BadRequest(format!("Link extraction failed: {e}")))?;
@@ -547,7 +740,6 @@ async fn resolve_or_scrape_manifest(
             }
         };
 
-        // Determine extension strictly from probed MIME type
         let ext = ext_from_mime(&item.mime_type, &item.media_type);
         let suggested_filename = build_suggested_filename(&extracted.caption, idx, total_items, ext);
         let item_id = Uuid::new_v4().to_string();
@@ -604,12 +796,10 @@ async fn resolve_or_scrape_manifest(
         });
     }
 
-    // Extract optional location attributes
     let location_name = extracted.location.as_ref().map(|l| l.name.as_str());
     let latitude = extracted.location.as_ref().and_then(|l| l.latitude);
     let longitude = extracted.location.as_ref().and_then(|l| l.longitude);
 
-    // 3. Persist post and its items (including location details and published_at)
     ScrapesRepo::save_scraped_post_and_items(
         &state.db,
         &post_uuid,
@@ -643,7 +833,7 @@ async fn resolve_or_scrape_manifest(
 }
 
 // ============================================================================
-// Shared Download & Ingestion Engine
+// Shared Download & Ingestion Engine (Enqueues into Stage 0 "assemble")
 // ============================================================================
 
 async fn execute_item_downloads(
@@ -668,14 +858,13 @@ async fn execute_item_downloads(
     for item in items {
         let temp_file_path = temp_download_dir.join(format!("{}_{}", Uuid::new_v4(), item.suggested_filename));
 
-        // 1. Resolve referer: prioritize item's referer, fallback to platform defaults
         let referer = item.referer.as_deref().or_else(|| match platform {
             "instagram" => Some("https://www.instagram.com/"),
             "reddit" => Some("https://www.reddit.com/"),
             _ => None,
         });
 
-        // 2. Download asset directly to disk
+        // 1. Download asset directly to disk
         if let Err(e) = download_media(
             &item.high_res_url,
             item.audio_url.as_deref(),
@@ -695,7 +884,7 @@ async fn execute_item_downloads(
             continue;
         }
 
-        // 3. Query contextual metadata from DB
+        // 2. Query contextual metadata from DB
         let ctx = ScrapesRepo::get_item_context(&state.db, &item.id)
             .await
             .unwrap_or(None);
@@ -718,7 +907,7 @@ async fn execute_item_downloads(
                     Some(platform.to_string()),
                     None,
                     None,
-                    Vec::new(), // Fixed typo: was Vec::new>,
+                    Vec::new(),
                     item.referer.clone(),
                     None,
                     None,
@@ -727,7 +916,7 @@ async fn execute_item_downloads(
                 )
             };
 
-        // 4. Inject EXIF / QuickTime/MP4 tags into file headers
+        // 3. Inject EXIF / QuickTime/MP4 tags into file headers
         let meta_payload = MediaMetadataPayload {
             author: author.as_deref(),
             caption: caption.as_deref(),
@@ -747,46 +936,62 @@ async fn execute_item_downloads(
             );
         }
 
+        let asset_id = Uuid::new_v4().to_string();
+        let file_size_bytes = match tokio::fs::metadata(&temp_file_path).await {
+            Ok(m) => m.len() as i64,
+            Err(_) => 0,
+        };
+
         let job_payload = JobPayload {
             author,
             platform: platform_val,
             source_url,
             source_post_id: None,
             caption,
-            tags: tags.clone(), // Cloned so ownership transfers cleanly to JobPayload
+            tags,
             scraped_item_id: Some(item.id.clone()),
             latitude,
             longitude,
         };
 
-        // 5. Delegate hashing, deduplication, moving to disk, and queueing
-        match persist_and_enqueue_staged_file(
-            state,
-            &auth_user.id,
-            &temp_file_path,
-            &item.suggested_filename,
-            &sanitized_folder,
-            Some(job_payload),
-        )
-        .await
-        {
-            Ok(res) => results.push(res),
-            Err(e) => {
-                let _ = tokio::fs::remove_file(&temp_file_path).await;
-                results.push(UploadItemResult {
-                    file_name: item.suggested_filename,
-                    status: "error".to_string(),
-                    id: None,
-                    relative_path: None,
-                    message: Some(format!("{e:?}")),
-                });
-            }
+        // 4. Enqueue into Stage 0 "assemble" job (worker handles hash, duplicate check, and move)
+        let job = DbJob {
+            id: Uuid::new_v4().to_string(),
+            user_id: auth_user.id.clone(),
+            asset_id: asset_id.clone(),
+            file_name: item.suggested_filename.clone(),
+            rel_path: String::new(),
+            folder_path: sanitized_folder.clone(),
+            disk_path: temp_file_path.clone(),
+            sha256: String::new(),
+            job_type: "assemble".to_string(),
+            file_size_bytes,
+            payload: Some(job_payload),
+        };
+
+        if let Err(e) = QueueService::enqueue(&state.db, &state.queue_notify, job).await {
+            let _ = tokio::fs::remove_file(&temp_file_path).await;
+            results.push(UploadItemResult {
+                file_name: item.suggested_filename,
+                status: "error".to_string(),
+                id: None,
+                relative_path: None,
+                message: Some(format!("Failed to enqueue downloaded media: {e}")),
+            });
+        } else {
+            results.push(UploadItemResult {
+                file_name: item.suggested_filename,
+                status: "queued".to_string(),
+                id: Some(asset_id),
+                relative_path: None,
+                message: Some("Download landed, queued for background processing".to_string()),
+            });
         }
     }
 
     let success_count = results
         .iter()
-        .filter(|r| r.status == "queued" || r.status == "duplicate")
+        .filter(|r| r.status == "queued")
         .count();
 
     Ok(BatchUploadReceipt {
@@ -794,310 +999,4 @@ async fn execute_item_downloads(
         folder: sanitized_folder,
         items: results,
     })
-}
-
-/// POST /api/upload/inspect
-pub async fn inspect_link(
-    State(state): State<AppState>,
-    auth_user: AuthUser,
-    Json(payload): Json<InspectLinkRequest>,
-) -> Result<Json<InspectResult>, AppError> {
-    let mut manifest = resolve_or_scrape_manifest(&state, &auth_user, &payload.url).await?;
-    let target_folder = StorageService::sanitize_folder_path(&manifest.suggested_folder);
-
-    // Fast-path: single item posts are committed immediately without computing previews
-    if manifest.items.len() == 1 {
-        let receipt = execute_item_downloads(
-            &state,
-            &auth_user,
-            manifest.items,
-            &target_folder,
-            &manifest.platform,
-        )
-        .await?;
-        return Ok(Json(InspectResult::Committed(receipt)));
-    }
-
-    // Carousel path: stream lightweight base64 thumbnails in memory for user selection
-    for item in &mut manifest.items {
-        if item.thumbnail_base64.is_none() {
-            let thumb_target = if !item.thumbnail_url.is_empty() {
-                &item.thumbnail_url
-            } else {
-                &item.high_res_url
-            };
-            item.thumbnail_base64 = stream_thumbnail_base64(
-                thumb_target,
-                item.referer.as_deref().or(Some(&payload.url)),
-            )
-            .await;
-        }
-    }
-
-    Ok(Json(InspectResult::Preview(InspectLinkResponse {
-        suggested_folder: target_folder,
-        platform: manifest.platform,
-        author: manifest.author,
-        caption: manifest.caption,
-        total_items: manifest.items.len(),
-        items: manifest.items,
-    })))
-}
-
-/// POST /api/upload/ingest
-pub async fn upload_ingest(
-    State(state): State<AppState>,
-    auth_user: AuthUser,
-    headers: HeaderMap,
-    Query(query): Query<RawUploadQuery>,
-    body: Bytes,
-) -> Result<Json<IngestResponse>, AppError> {
-    if body.is_empty() {
-        return Err(AppError::BadRequest("Upload body cannot be empty".into()));
-    }
-
-    let content_type = headers
-        .get("content-type")
-        .and_then(|h| h.to_str().ok())
-        .unwrap_or("");
-
-    // Case 1: JSON Payloads (Handles both CommitLinkRequest AND Apple Shortcut {"url": "..."})
-    if content_type.starts_with("application/json") || body.starts_with(b"{") {
-        // 1a: Try CommitLinkRequest (web app selective import)
-        if let Ok(commit_req) = serde_json::from_slice::<CommitLinkRequest>(&body) {
-            let target_folder = commit_req
-                .folder
-                .unwrap_or_else(|| commit_req.platform.clone());
-
-            let receipt = execute_item_downloads(
-                &state,
-                &auth_user,
-                commit_req.selected_items,
-                &target_folder,
-                &commit_req.platform,
-            )
-            .await?;
-
-            return Ok(Json(IngestResponse::Batch(receipt)));
-        }
-
-        // 1b: Catch Apple Shortcut JSON: {"url": "https://..."} or {"link": "..."}
-        if let Ok(val) = serde_json::from_slice::<serde_json::Value>(&body) {
-            let extracted_url = val.get("url")
-                .or_else(|| val.get("link"))
-                .or_else(|| val.get("target"))
-                .and_then(|v| v.as_str())
-                .map(|s| s.trim());
-
-            if let Some(target_url) = extracted_url {
-                if target_url.starts_with("http://") || target_url.starts_with("https://") {
-                    let manifest = resolve_or_scrape_manifest(&state, &auth_user, target_url).await?;
-                    let target_folder = query.folder.unwrap_or(manifest.suggested_folder);
-
-                    let receipt = execute_item_downloads(
-                        &state,
-                        &auth_user,
-                        manifest.items,
-                        &target_folder,
-                        &manifest.platform,
-                    )
-                    .await?;
-
-                    return Ok(Json(IngestResponse::Batch(receipt)));
-                }
-            }
-        }
-    }
-
-    // Case 2: URL Auto-Commit (Raw text link)
-    let is_text_or_url = content_type.starts_with("text/")
-        || (body.len() < 2048
-            && std::str::from_utf8(&body)
-                .map(|s| s.trim().starts_with("http"))
-                .unwrap_or(false));
-
-    if is_text_or_url {
-        if let Ok(raw_str) = std::str::from_utf8(&body) {
-            let trimmed = raw_str.trim();
-            if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
-                let manifest = resolve_or_scrape_manifest(&state, &auth_user, trimmed).await?;
-                let target_folder = query.folder.unwrap_or(manifest.suggested_folder);
-
-                let receipt = execute_item_downloads(
-                    &state,
-                    &auth_user,
-                    manifest.items,
-                    &target_folder,
-                    &manifest.platform,
-                )
-                .await?;
-
-                return Ok(Json(IngestResponse::Batch(receipt)));
-            }
-        }
-    }
-
-    // Case 3: Binary Media Upload (Real images / videos only)
-    let file_name = resolve_incoming_filename(&query, &headers, &body);
-    let final_folder = query.folder.unwrap_or_else(default_camera_folder);
-
-    let result = persist_and_enqueue_bytes(
-        &state,
-        &auth_user.id,
-        &file_name,
-        &body,
-        &final_folder,
-    )
-    .await;
-
-    Ok(Json(IngestResponse::File(result)))
-}
-
-/// POST /api/upload/chunk
-pub async fn upload_chunk(
-    State(state): State<AppState>,
-    auth_user: AuthUser,
-    Query(query): Query<ChunkUploadQuery>,
-    body: Body,
-) -> Result<Json<ChunkUploadResponse>, AppError> {
-    if query.total_chunks == 0 {
-        return Err(AppError::BadRequest("total_chunks must be greater than 0".into()));
-    }
-    if query.chunk_index >= query.total_chunks {
-        return Err(AppError::BadRequest(format!(
-            "chunk_index {} out of bounds for total_chunks {}",
-            query.chunk_index, query.total_chunks
-        )));
-    }
-
-    let temp_root = resolve_user_temp_dir(&state, &auth_user.id, "chunks").await?;
-    let session_dir = temp_root.join(&query.upload_id);
-    fs::create_dir_all(&session_dir).await.map_err(|e| {
-        AppError::Internal(format!("Failed to create chunk session dir: {e}"))
-    })?;
-
-    // Record total_chunks once
-    let meta_path = session_dir.join("total_chunks");
-    if !meta_path.exists() {
-        let _ = fs::write(&meta_path, query.total_chunks.to_string()).await;
-    }
-
-    let chunk_path = session_dir.join(format!("{:06}.part", query.chunk_index));
-    let mut file = OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .open(&chunk_path)
-        .await
-        .map_err(|e| AppError::Internal(format!("Failed creating chunk file: {e}")))?;
-
-    // Stream incoming bytes directly to disk
-    let mut stream = body.into_data_stream();
-    let mut total_written = 0usize;
-
-    while let Some(chunk_result) = stream.next().await {
-        let data = chunk_result.map_err(|e| {
-            AppError::BadRequest(format!("Network stream read error: {e}"))
-        })?;
-
-        file.write_all(&data).await.map_err(|e| {
-            AppError::Internal(format!("Disk write error: {e}"))
-        })?;
-
-        total_written += data.len();
-    }
-
-    if total_written == 0 {
-        let _ = fs::remove_file(&chunk_path).await;
-        return Err(AppError::BadRequest("Chunk payload is empty".into()));
-    }
-
-    file.flush()
-        .await
-        .map_err(|e| AppError::Internal(format!("Failed flushing chunk file: {e}")))?;
-
-    Ok(Json(ChunkUploadResponse {
-        upload_id: query.upload_id,
-        chunk_index: query.chunk_index,
-        received: true,
-    }))
-}
-
-/// POST /api/upload/chunk/finalize
-pub async fn finalize_chunk(
-    State(state): State<AppState>,
-    auth_user: AuthUser,
-    Query(query): Query<FinalizeChunkQuery>,
-) -> Result<Json<UploadItemResult>, AppError> {
-    let temp_root = resolve_user_temp_dir(&state, &auth_user.id, "chunks").await?;
-    let session_dir = temp_root.join(&query.upload_id);
-
-    if !session_dir.exists() {
-        return Err(AppError::NotFound(
-            "Upload session directory not found or expired".into(),
-        ));
-    }
-
-    // Read total_chunks metadata
-    let meta_path = session_dir.join("total_chunks");
-    let total_chunks_str = fs::read_to_string(&meta_path).await.map_err(|_| {
-        AppError::BadRequest("Upload session missing metadata; no chunks received".into())
-    })?;
-
-    let total_chunks: u32 = total_chunks_str.trim().parse().map_err(|_| {
-        AppError::Internal("Corrupted total_chunks metadata".into())
-    })?;
-
-    let final_assembled_path = temp_root.join(format!("{}.complete", query.upload_id));
-    let mut assembled_file = OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .open(&final_assembled_path)
-        .await
-        .map_err(|e| AppError::Internal(format!("Failed creating final assembled file: {e}")))?;
-
-    // Stream-stitch all parts using fixed-size buffer copy (ZERO memory bloat)
-    for idx in 0..total_chunks {
-        let chunk_path = session_dir.join(format!("{:06}.part", idx));
-
-        let mut part_file = fs::File::open(&chunk_path).await.map_err(|_| {
-            AppError::BadRequest(format!(
-                "Incomplete upload: chunk {} of {} is missing",
-                idx, total_chunks
-            ))
-        })?;
-
-        // Copies directly at kernel/filesystem level via standard 64KB buffer
-        tokio::io::copy(&mut part_file, &mut assembled_file)
-            .await
-            .map_err(|e| AppError::Internal(format!("Failed stitching chunk {idx}: {e}")))?;
-    }
-
-    assembled_file
-        .flush()
-        .await
-        .map_err(|e| AppError::Internal(format!("Failed flushing final file: {e}")))?;
-    drop(assembled_file);
-
-    // Ingest the file into storage & DB
-    let final_folder = query.folder.unwrap_or_else(default_camera_folder);
-    let result = persist_and_enqueue_staged_file(
-        &state,
-        &auth_user.id,
-        &final_assembled_path,
-        &query.file_name,
-        &final_folder,
-        None,
-    )
-    .await;
-
-    // Guaranteed Cleanup: Runs whether ingest succeeded or failed
-    let _ = fs::remove_dir_all(&session_dir).await;
-    let _ = fs::remove_file(&final_assembled_path).await;
-
-    // Bubble ingest error after cleanup
-    let final_result = result?;
-
-    Ok(Json(final_result))
 }

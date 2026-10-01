@@ -2,16 +2,61 @@ use sqlx::{QueryBuilder, Row, Sqlite, SqlitePool};
 use std::path::Path;
 use chrono::{DateTime, Utc};
 
-use crate::domain::media::{
+use crate::domain::{
     AssetStorageInfo, MediaPageResponse, MediaQuery, SubAlbum, MediaSection,
     NewAssetRecord, DynamicFiltersResponse, FilterOption, AssetCacheMetadata,
     RawMediaRow, MediaItemSummary, MapLocationPoint, MapLocationsQuery,
-    AssetObjectDetail, AssetPoseDetail, 
+    AssetObjectDetail, AssetPoseDetail, CheckUploadResponse,
+    ExistingAssetRow,
 };
 
 pub struct AssetRepo;
 
 impl AssetRepo {
+
+    /// O(1) duplicate check powered by UNIQUE(user_id, sha256).
+    pub async fn check_duplicate_by_sha256(
+        pool: &SqlitePool,
+        user_id: &str,
+        sha256: &str,
+    ) -> Result<CheckUploadResponse, sqlx::Error> {
+        let row = sqlx::query_as::<_, ExistingAssetRow>(
+            r#"
+            SELECT id, deleted_at
+            FROM assets
+            WHERE user_id = ?1 AND sha256 = ?2
+            LIMIT 1
+            "#,
+        )
+        .bind(user_id)
+        .bind(sha256)
+        .fetch_optional(pool)
+        .await?;
+
+        match row {
+            Some(record) => {
+                let is_deleted = record.deleted_at.is_some();
+                let message = if is_deleted {
+                    Some("File exists in Trash".to_string())
+                } else {
+                    Some("Duplicate file exists in your library".to_string())
+                };
+
+                Ok(CheckUploadResponse {
+                    exists: true,
+                    asset_id: Some(record.id),
+                    is_deleted,
+                    message,
+                })
+            }
+            None => Ok(CheckUploadResponse {
+                exists: false,
+                asset_id: None,
+                is_deleted: false,
+                message: None,
+            }),
+        }
+    }
 
     /// Single-pass sequential grouper (O(N) with zero heap fragmentation)
     fn build_grouped_sections(rows: Vec<RawMediaRow>) -> Vec<MediaSection> {

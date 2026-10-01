@@ -133,3 +133,27 @@ pub struct FinalizeChunkQuery {
     pub file_name: String,
     pub folder: Option<String>,
 }
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct CheckUploadRequest {
+    pub sha256: String,
+    pub file_name: String,
+    pub folder: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CheckUploadResponse {
+    pub exists: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub asset_id: Option<String>,
+    pub is_deleted: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+/// Row projection for O(1) duplicate lookup via UNIQUE(user_id, sha256)
+#[derive(Debug, sqlx::FromRow)]
+pub struct ExistingAssetRow {
+    pub id: String,
+    pub deleted_at: Option<String>,
+}
