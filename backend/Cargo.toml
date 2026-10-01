@@ -34,3 +34,4 @@ uuid = { version = "1.26.0", features = ["v4", "fast-rng"] }
 db = { path = "../crates/db" }
 media_downloader = { path = "../crates/media_downloader" }
 media_processing = { path = "../crates/media_processing" }
+async-recursion = "1.1.1"

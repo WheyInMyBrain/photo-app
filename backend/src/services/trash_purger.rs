@@ -1,5 +1,6 @@
 // photo-app/backend/src/services/trash_purger.rs
 
+use async_recursion::async_recursion;
 use db::asset_repo::AssetRepo;
 use sqlx::SqlitePool;
 use std::path::{Path, PathBuf};
@@ -13,10 +14,11 @@ impl TrashPurgerService {
     pub fn start(pool: SqlitePool, storage_root: PathBuf) {
         tokio::spawn(async move {
             info!("Storage background maintenance service initialized (Trash purge + Temp cleaner)");
+            
             // Runs once every 24 hours
             let mut ticker = interval(Duration::from_secs(24 * 3600));
 
-            // Retention period for abandoned temp chunks/files (e.g., 24 hours or 7 days)
+            // Retention period for abandoned temp chunks/files (e.g., 24 hours)
             let temp_retention = Duration::from_secs(24 * 3600);
 
             loop {
@@ -33,7 +35,7 @@ impl TrashPurgerService {
                     }
                 }
 
-                // 2. Clean orphaned temporary uploads / chunk directories
+                // 2. Clean orphaned temporary uploads & chunk directories
                 let temp_dirs = [
                     storage_root.join("temp"),
                     storage_root.join("temp_chunks"),
@@ -48,30 +50,97 @@ impl TrashPurgerService {
                         );
                     }
                 }
+
+                // 3. Clean orphaned assembly temporary files (*.tmp) inside library originals
+                let users_dir = storage_root.join("users");
+                if let Err(e) = Self::cleanup_stale_library_tmp_files(&users_dir, temp_retention).await {
+                    warn!(
+                        path = %users_dir.display(),
+                        error = %e,
+                        "Failed to sweep stale assembly .tmp files in users directory"
+                    );
+                }
             }
         });
     }
 
-    /// Recursively removes files and subdirectories older than `max_age` within `dir`
+    /// Recursively sweeps files and empty directories older than `max_age`
+    #[async_recursion]
     async fn cleanup_stale_temp_entries(dir: &Path, max_age: Duration) -> std::io::Result<()> {
         if !dir.exists() {
             return Ok(());
         }
 
-        let mut reader = tokio::fs::read_dir(dir).await?;
+        let mut reader = match tokio::fs::read_dir(dir).await {
+            Ok(r) => r,
+            Err(e) => return Err(e),
+        };
+
         let now = SystemTime::now();
 
-        while let Some(entry) = reader.next_entry().await? {
+        while let Ok(Some(entry)) = reader.next_entry().await {
             let path = entry.path();
-            if let Ok(meta) = entry.metadata().await {
+            let meta = match entry.metadata().await {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+
+            if meta.is_dir() {
+                // Recursively clean children first
+                let _ = Self::cleanup_stale_temp_entries(&path, max_age).await;
+
+                // Prune directory if it is old enough and now empty
                 if let Ok(modified) = meta.modified() {
                     if let Ok(elapsed) = now.duration_since(modified) {
                         if elapsed > max_age {
-                            if meta.is_dir() {
-                                let _ = tokio::fs::remove_dir_all(&path).await;
-                            } else {
-                                let _ = tokio::fs::remove_file(&path).await;
-                            }
+                            // remove_dir only succeeds if the folder is empty
+                            let _ = tokio::fs::remove_dir(&path).await;
+                        }
+                    }
+                }
+            } else {
+                // Delete stale temporary file
+                if let Ok(modified) = meta.modified() {
+                    if let Ok(elapsed) = now.duration_since(modified) {
+                        if elapsed > max_age {
+                            let _ = tokio::fs::remove_file(&path).await;
+                        }
+                    }
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Recursively checks users/*/originals for abandoned `.tmp` assembly files
+    #[async_recursion]
+    async fn cleanup_stale_library_tmp_files(dir: &Path, max_age: Duration) -> std::io::Result<()> {
+        if !dir.exists() {
+            return Ok(());
+        }
+
+        let mut reader = match tokio::fs::read_dir(dir).await {
+            Ok(r) => r,
+            Err(e) => return Err(e),
+        };
+
+        let now = SystemTime::now();
+
+        while let Ok(Some(entry)) = reader.next_entry().await {
+            let path = entry.path();
+            let meta = match entry.metadata().await {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+
+            if meta.is_dir() {
+                let _ = Self::cleanup_stale_library_tmp_files(&path, max_age).await;
+            } else if path.extension().and_then(|s| s.to_str()) == Some("tmp") {
+                if let Ok(modified) = meta.modified() {
+                    if let Ok(elapsed) = now.duration_since(modified) {
+                        if elapsed > max_age {
+                            let _ = tokio::fs::remove_file(&path).await;
                         }
                     }
                 }
