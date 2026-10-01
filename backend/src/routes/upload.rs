@@ -1,9 +1,10 @@
 use axum::{
-    body::Bytes,
+    body::{Bytes, Body},
     extract::{Multipart, Query, State},
     response::Json,
     http::HeaderMap,
 };
+use futures_util::StreamExt;
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use tokio::fs::{self, create_dir_all, File, OpenOptions};
@@ -957,11 +958,8 @@ pub async fn upload_chunk(
     State(state): State<AppState>,
     auth_user: AuthUser,
     Query(query): Query<ChunkUploadQuery>,
-    body: Bytes,
+    body: Body, // Stream data directly rather than buffering into RAM
 ) -> Result<Json<ChunkUploadResponse>, AppError> {
-    if body.is_empty() {
-        return Err(AppError::BadRequest("Chunk payload is empty".into()));
-    }
     if query.total_chunks == 0 {
         return Err(AppError::BadRequest("total_chunks must be greater than 0".into()));
     }
@@ -973,23 +971,50 @@ pub async fn upload_chunk(
     }
 
     let temp_root = resolve_user_temp_dir(&state, &auth_user.id, "chunks").await?;
-    // Isolated session directory: /temp/chunks/{upload_id}/
     let session_dir = temp_root.join(&query.upload_id);
     fs::create_dir_all(&session_dir).await.map_err(|e| {
         AppError::Internal(format!("Failed to create chunk session dir: {e}"))
     })?;
 
-    // Record expected total_chunks in the session dir if not already recorded
+    // Record expected total_chunks once
     let meta_path = session_dir.join("total_chunks");
     if !meta_path.exists() {
         let _ = fs::write(&meta_path, query.total_chunks.to_string()).await;
     }
 
-    // Write chunk to its own isolated file in the session dir: e.g. "00003.part"
     let chunk_path = session_dir.join(format!("{:06}.part", query.chunk_index));
-    fs::write(&chunk_path, &body).await.map_err(|e| {
-        AppError::Internal(format!("Failed writing chunk {}: {e}", query.chunk_index))
-    })?;
+    let mut file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&chunk_path)
+        .await
+        .map_err(|e| AppError::Internal(format!("Failed creating chunk file: {e}")))?;
+
+    // Stream the body chunks directly to disk
+    let mut stream = body.into_data_stream();
+    let mut total_written = 0usize;
+
+    while let Some(chunk_result) = stream.next().await {
+        let data = chunk_result.map_err(|e| {
+            AppError::BadRequest(format!("Network stream read error: {e}"))
+        })?;
+
+        file.write_all(&data).await.map_err(|e| {
+            AppError::Internal(format!("Disk write error: {e}"))
+        })?;
+
+        total_written += data.len();
+    }
+
+    if total_written == 0 {
+        let _ = fs::remove_file(&chunk_path).await;
+        return Err(AppError::BadRequest("Chunk payload is empty".into()));
+    }
+
+    file.flush()
+        .await
+        .map_err(|e| AppError::Internal(format!("Failed flushing chunk file: {e}")))?;
 
     Ok(Json(ChunkUploadResponse {
         upload_id: query.upload_id,
