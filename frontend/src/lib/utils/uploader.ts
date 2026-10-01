@@ -1,7 +1,7 @@
 // photo-app/frontend/src/lib/utils/uploader.ts
 
-export const CHUNK_THRESHOLD_BYTES = 75 * 1024 * 1024; // 75MB
-export const CHUNK_SIZE_BYTES = 20 * 1024 * 1024;      // 20MB
+export const CHUNK_THRESHOLD_BYTES = 5000 * 1024 * 1024; // 1GB
+export const CHUNK_SIZE_BYTES = 1000 * 1024 * 1024;      // 1GB
 const MAX_RETRIES = 3;
 const CHUNK_TIMEOUT_MS = 30_000; // 60s hard timeout per chunk
 
