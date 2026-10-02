@@ -10,6 +10,7 @@ pub mod scrapes_repo;
 pub mod tag_repo;
 pub mod ingestion_repo;
 pub mod backup_repo;
+pub mod upload_repo;
 
 pub use album_repo::{AlbumRecord, AlbumRepo, SubAlbumRecord};
 pub use asset_repo::AssetRepo;
@@ -24,5 +25,6 @@ pub use ingestion_repo::{
     IngestionDetectedFace, IngestionNewPerson, IngestionPayload, IngestionRepo,
     IngestionUpdatedCluster, AiEnrichmentPayload,
 };
+pub use upload_repo::UploadRepo;
 
 pub use domain::*;

@@ -10,6 +10,7 @@
   import { filterStore, filterQueryString } from '$lib/stores/filterStore';
   import { filterOptionsStore } from '$lib/stores/filterOptionsStore';
   import { createWindowFileDrop } from '$lib/utils/dragDrop';
+  import { initMediaEvents } from '$lib/utils/mediaEvents';
 
   import AuthScreen from '$lib/components/AuthScreen.svelte';
   import FilterSidebar from '$lib/components/FilterSidebar.svelte';
@@ -26,6 +27,8 @@
   let lastScrollY = 0;
   let isNavHidden = false;
   const scrollThreshold = 8;
+
+  let sseSubscription: { close: () => void } | null = null;
 
   function handleMainScroll() {
     if (!mainScrollContainer) return;
@@ -48,16 +51,58 @@
     modalStore.openUpload();
   });
 
+  function setupEventStream() {
+    if (!browser || sseSubscription) return;
+
+    sseSubscription = initMediaEvents({
+      onAssetReady: (data) => {
+        // Broadcast to timeline views to load or inject the new asset
+        window.dispatchEvent(new CustomEvent('vault:refresh-timeline', { detail: data }));
+        filterOptionsStore.scheduleRefresh($filterQueryString, 0);
+      },
+      onAlbumUpdated: () => {
+        // Re-fetch custom albums & counts
+        albumStore.load();
+      },
+      onPeopleUpdated: (data) => {
+        // Signal People views/modals to refresh their faces grid
+        window.dispatchEvent(new CustomEvent('vault:refresh-people', { detail: data }));
+      },
+      onAiCompleted: (data) => {
+        filterOptionsStore.scheduleRefresh($filterQueryString, 100);
+      },
+      onAssetFailed: (data) => {
+        console.warn(`[Vault] Processing failed for asset ${data.asset_id}: ${data.error}`);
+      }
+    });
+  }
+
+  function teardownEventStream() {
+    if (sseSubscription) {
+      sseSubscription.close();
+      sseSubscription = null;
+    }
+  }
+
   onMount(() => {
     authStore.checkStatus();
     albumStore.load();
   });
 
-  $: if (browser && $authStore.isAuthenticated && $filterQueryString !== undefined) {
+  $: if (browser) {
+    if ($authStore.isAuthenticated) {
+      setupEventStream();
+    } else {
+      teardownEventStream();
+    }
+  }
+
+  $: if (browser && $authStore.isAuthenticated &&$filterQueryString !== undefined) {
     filterOptionsStore.scheduleRefresh($filterQueryString);
   }
 
   onDestroy(() => {
+    teardownEventStream();
     filterOptionsStore.destroy();
   });
 </script>
@@ -109,7 +154,7 @@
     >
       <slot />
 
-      <!-- Apple Liquid-Glass Navigation Dock -->
+      <!-- Navigation Dock -->
       <div
         style="bottom: max(1.5rem, calc(var(--sab) + 0.75rem));"
         class="fixed left-1/2 -translate-x-1/2 z-30 pointer-events-auto select-none transition-all duration-500 cubic-bezier(0.16, 1, 0.3, 1) {isNavHidden ? 'translate-y-24 opacity-0 scale-95 pointer-events-none' : 'translate-y-0 opacity-100 scale-100'}"
@@ -141,7 +186,7 @@
         </nav>
       </div>
 
-      <!-- Liquid Glass Plus Button -->
+      <!-- Plus Button -->
       <button
         type="button"
         on:click={() => modalStore.openUpload()}
@@ -165,15 +210,16 @@
       </div>
     {/if}
 
-    <!-- Persistent Floating Bottom-Right Upload Toast/Widget -->
+    <!-- Persistent Floating Upload Widget -->
     <UploadProgressWidget />
 
-    <!-- Modal Overlays via Declarative Store -->
+    <!-- Modals -->
     <UploadModal
       isOpen={$modalStore === 'upload'}
       initialFiles={droppedFiles}
       on:close={() => modalStore.close()}
       on:uploaded={() => {
+        albumStore.load();
         window.dispatchEvent(new CustomEvent('vault:refresh-timeline'));
         filterOptionsStore.scheduleRefresh($filterQueryString, 0);
       }}

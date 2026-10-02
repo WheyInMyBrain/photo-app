@@ -89,6 +89,7 @@ pub struct RawUploadQuery {
     pub folder: Option<String>,
     pub file_name: Option<String>,
     pub ext: Option<String>,
+    pub batch_id: Option<String>,
 }
 
 /// JSON body for POST /api/upload/ingest (selective commit mode)
@@ -132,6 +133,7 @@ pub struct FinalizeChunkQuery {
     pub upload_id: String,
     pub file_name: String,
     pub folder: Option<String>,
+    pub batch_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -156,4 +158,20 @@ pub struct CheckUploadResponse {
 pub struct ExistingAssetRow {
     pub id: String,
     pub deleted_at: Option<String>,
+}
+
+#[derive(Serialize)]
+pub struct StartBatchResponse {
+    pub batch_id: String,
+}
+
+#[derive(Deserialize)]
+pub struct FinishBatchRequest {
+    pub batch_id: String,
+}
+
+#[derive(Serialize)]
+pub struct FinishBatchResponse {
+    pub released_jobs: u64,
+    pub status: String,
 }

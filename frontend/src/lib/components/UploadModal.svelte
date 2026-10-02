@@ -4,8 +4,7 @@
   import { fade, scale } from 'svelte/transition';
   import { browser } from '$app/environment';
   import { fetchCustomAlbums } from '$lib/api/albums';
-  import { uploadQueue } from '$lib/stores/uploadQueueStore';
-  import { uploadProgressStore } from '$lib/stores/uploadProgressStore';
+  import { uploadStore } from '$lib/stores/uploadStore';
   import { formatBytes } from '$lib/utils/uploader';
   import { normalizePath, getDirectChildren, type FolderNode } from '$lib/utils/folderHierarchy';
   import type { CandidateItem } from '$lib/types/upload';
@@ -34,8 +33,8 @@
   let lastProcessedFiles: File[] = [];
   $: if (initialFiles && initialFiles.length > 0 && initialFiles !== lastProcessedFiles) {
     lastProcessedFiles = initialFiles;
-    uploadQueue.setMode('files');
-    uploadQueue.addFiles(initialFiles);
+    uploadStore.setMode('files');
+    uploadStore.addFiles(initialFiles);
   }
 
   // Reactive scroll lock: only lock body when modal is actually open
@@ -51,13 +50,13 @@
 
   // Can upload if files are staged OR if there's a link preview with selections OR a raw URL typed in
   $: canUpload =
-    $uploadQueue.uploadMode === 'files'
-      ? $uploadQueue.stagedFiles.length > 0
-      : ($uploadQueue.linkPreview !== null && $uploadQueue.selectedLinkItems.size > 0) ||
-        Boolean($uploadQueue.linkUrl.trim());
+    $uploadStore.uploadMode === 'files'
+      ? $uploadStore.stagedFiles.length > 0
+      : ($uploadStore.linkPreview !== null && $uploadStore.selectedLinkItems.size > 0) ||
+        Boolean($uploadStore.linkUrl.trim());
 
   // Normalized folder path (empty string means default)
-  $: cleanInputPath = normalizePath($uploadQueue.folderPath);
+  $: cleanInputPath = normalizePath($uploadStore.folderPath);
 
   $: currentChildren = getDirectChildren(rawAlbumPaths, browsingDir);
 
@@ -115,7 +114,7 @@
     const input = e.target as HTMLInputElement;
     if (input.files && input.files.length > 0) {
       const selected = Array.from(input.files);
-      uploadQueue.addFiles(selected);
+      uploadStore.addFiles(selected);
       input.value = '';
     }
   }
@@ -140,7 +139,7 @@
   }
 
   function selectDirectory(path: string) {
-    uploadQueue.setFolderPath(path);
+    uploadStore.setFolderPath(path);
     isFolderDropdownOpen = false;
     searchQuery = '';
   }
@@ -154,18 +153,14 @@
 
   // Unified start upload handler
   async function handleStartUpload() {
-    const state = $uploadQueue;
+    const state = $uploadStore;
 
     if (state.uploadMode === 'files' && state.stagedFiles.length > 0) {
-      const filesToUpload = [...state.stagedFiles];
-      const targetFolder = cleanInputPath;
-
       forceClose();
 
-      uploadProgressStore.startBatch(filesToUpload, targetFolder, (summary) => {
-        const count = summary ? summary.completed : filesToUpload.length;
-        if (count > 0) {
-          dispatch('uploaded', { count });
+      uploadStore.startUpload((completedCount) => {
+        if (completedCount > 0) {
+          dispatch('uploaded', { count: completedCount });
         }
       });
     } else if (state.uploadMode === 'link') {
@@ -221,7 +216,7 @@
   }
 
   function forceClose() {
-    uploadQueue.reset();
+    uploadStore.resetModal();
     isFolderDropdownOpen = false;
     browsingDir = '';
     searchQuery = '';
@@ -289,18 +284,18 @@
       <div class="px-6 pt-4">
         <div class="liquid-segmented p-0.5 rounded-xl flex text-xs">
           <button
-            class="flex-1 py-1.5 rounded-lg transition-all font-medium spring-tap cursor-pointer {$uploadQueue.uploadMode === 'files' ? 'liquid-seg-active text-[var(--text-main)] font-semibold' : 'text-[var(--text-muted)] hover:text-[var(--text-main)]'}"
+            class="flex-1 py-1.5 rounded-lg transition-all font-medium spring-tap cursor-pointer {$uploadStore.uploadMode === 'files' ? 'liquid-seg-active text-[var(--text-main)] font-semibold' : 'text-[var(--text-muted)] hover:text-[var(--text-main)]'}"
             on:click={() => {
-              uploadQueue.setMode('files');
+              uploadStore.setMode('files');
               isFolderDropdownOpen = false;
             }}
           >
             Files
           </button>
           <button
-            class="flex-1 py-1.5 rounded-lg transition-all font-medium spring-tap cursor-pointer {$uploadQueue.uploadMode === 'link' ? 'liquid-seg-active text-[var(--text-main)] font-semibold' : 'text-[var(--text-muted)] hover:text-[var(--text-main)]'}"
+            class="flex-1 py-1.5 rounded-lg transition-all font-medium spring-tap cursor-pointer {$uploadStore.uploadMode === 'link' ? 'liquid-seg-active text-[var(--text-main)] font-semibold' : 'text-[var(--text-muted)] hover:text-[var(--text-main)]'}"
             on:click={() => {
-              uploadQueue.setMode('link');
+              uploadStore.setMode('link');
               isFolderDropdownOpen = false;
             }}
           >
@@ -317,16 +312,16 @@
             <span class="text-[9px] uppercase tracking-wider font-semibold text-[var(--text-muted)] block">
               Destination Album
             </span>
-            {#if $uploadQueue.folderPath}
+            {#if $uploadStore.folderPath}
               <button
                 type="button"
                 on:click={() => {
-                  uploadQueue.setFolderPath('');
+                  uploadStore.setFolderPath('');
                   browsingDir = '';
                 }}
                 class="text-[10px] text-purple-600 dark:text-purple-400 hover:underline cursor-pointer"
               >
-                {$uploadQueue.uploadMode === 'files' ? 'Reset to root' : 'Reset to Auto'}
+                {$uploadStore.uploadMode === 'files' ? 'Reset to root' : 'Reset to Auto'}
               </button>
             {/if}
           </div>
@@ -335,7 +330,7 @@
             <button
               bind:this={folderTriggerBtn}
               type="button"
-              disabled={$uploadQueue.linkPreview !== null}
+              disabled={$uploadStore.linkPreview !== null}
               on:click={toggleFolderDropdown}
               class="liquid-input w-full rounded-xl px-3.5 py-2 text-xs text-left text-[var(--text-main)] outline-none transition-all flex items-center justify-between gap-2 cursor-pointer disabled:opacity-40"
             >
@@ -344,9 +339,9 @@
                   <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path>
                 </svg>
                 <span class="truncate font-medium">
-                  {#if $uploadQueue.folderPath}
-                    {$uploadQueue.folderPath}
-                  {:else if $uploadQueue.uploadMode === 'files'}
+                  {#if $uploadStore.folderPath}
+                    {$uploadStore.folderPath}
+                  {:else if $uploadStore.uploadMode === 'files'}
                     root (no album)
                   {:else}
                     Auto (Suggested by link)
@@ -360,11 +355,11 @@
           </div>
         </div>
 
-        {#if $uploadQueue.uploadMode === 'files'}
+        {#if $uploadStore.uploadMode === 'files'}
           <div class="space-y-2.5">
             <div class="flex items-center justify-between px-1">
               <span class="text-[9px] uppercase tracking-wider font-semibold text-[var(--text-muted)]">
-                Staged ({$uploadQueue.stagedFiles.length})
+                Staged ({$uploadStore.stagedFiles.length})
               </span>
               <button
                 type="button"
@@ -384,7 +379,7 @@
               class="hidden"
             />
 
-            {#if $uploadQueue.stagedFiles.length === 0}
+            {#if $uploadStore.stagedFiles.length === 0}
               <button
                 type="button"
                 on:click={() => fileInputEl?.click()}
@@ -400,7 +395,7 @@
               </button>
             {:else}
               <div class="space-y-1.5 max-h-52 overflow-y-auto pr-0.5 no-scrollbar">
-                {#each $uploadQueue.stagedFiles as file, idx}
+                {#each $uploadStore.stagedFiles as file, idx}
                   <div class="liquid-card flex items-center justify-between p-2.5 rounded-xl text-xs">
                     <div class="truncate mr-3">
                       <div class="text-[var(--text-main)] font-medium truncate max-w-[280px]">
@@ -412,7 +407,7 @@
                     </div>
                     <button
                       type="button"
-                      on:click={() => uploadQueue.removeFile(idx)}
+                      on:click={() => uploadStore.removeStagedFile(idx)}
                       class="text-[var(--text-muted)] hover:text-[var(--text-main)] p-1 cursor-pointer transition-colors spring-tap"
                       title="Remove file"
                       aria-label="Remove {file.name}"
@@ -429,7 +424,7 @@
           </div>
         {:else}
           <!-- Web Link Section -->
-          {#if !$uploadQueue.linkPreview}
+          {#if !$uploadStore.linkPreview}
             <div class="space-y-3">
               <div class="space-y-1.5">
                 <span class="text-[9px] uppercase tracking-wider font-semibold text-[var(--text-muted)] block pl-1">
@@ -439,20 +434,20 @@
                   <input
                     id="link-url-input"
                     type="url"
-                    value={$uploadQueue.linkUrl}
-                    on:input={(e) => uploadQueue.setLinkUrl(e.currentTarget.value)}
+                    value={$uploadStore.linkUrl}
+                    on:input={(e) => uploadStore.setLinkUrl(e.currentTarget.value)}
                     placeholder="https://..."
-                    on:keydown={(e) => e.key === 'Enter' && uploadQueue.inspectLink()}
+                    on:keydown={(e) => e.key === 'Enter' && uploadStore.inspectLink()}
                     class="liquid-input flex-1 rounded-xl px-3.5 py-2 text-xs text-[var(--text-main)] placeholder-[var(--text-muted)] outline-none transition-all"
                   />
                   <button
                     type="button"
-                    on:click={() => uploadQueue.inspectLink()}
-                    disabled={!$uploadQueue.linkUrl.trim()}
+                    on:click={() => uploadStore.inspectLink()}
+                    disabled={!$uploadStore.linkUrl.trim() || $uploadStore.isInspecting}
                     class="liquid-btn-secondary px-3.5 py-2 rounded-xl text-xs font-medium text-[var(--text-main)] transition-all disabled:opacity-40 cursor-pointer flex items-center justify-center spring-tap"
                     title="Inspect items before importing"
                   >
-                    Inspect
+                    {$uploadStore.isInspecting ? 'Inspecting...' : 'Inspect'}
                   </button>
                 </div>
               </div>
@@ -462,30 +457,30 @@
             <div class="space-y-3">
               <div class="flex items-center justify-between text-xs px-1">
                 <div>
-                  <span class="text-[var(--text-main)] font-semibold">{$uploadQueue.linkPreview.author}</span>
-                  <span class="text-[var(--text-muted)]"> on {$uploadQueue.linkPreview.platform} ({$uploadQueue.linkPreview.items.length})</span>
+                  <span class="text-[var(--text-main)] font-semibold">{$uploadStore.linkPreview.author}</span>
+                  <span class="text-[var(--text-muted)]"> on {$uploadStore.linkPreview.platform} ({$uploadStore.linkPreview.items.length})</span>
                 </div>
                 <button
                   type="button"
-                  on:click={() => uploadQueue.clearLinkPreview()}
+                  on:click={() => uploadStore.clearLinkPreview()}
                   class="text-purple-600 dark:text-purple-400 hover:underline font-medium cursor-pointer text-xs"
                 >
                   Change Link
                 </button>
               </div>
 
-              {#if $uploadQueue.linkPreview.caption}
+              {#if $uploadStore.linkPreview.caption}
                 <p class="text-[11px] text-[var(--text-muted)] line-clamp-2 italic border-l-2 border-purple-500/40 pl-2.5">
-                  "{$uploadQueue.linkPreview.caption}"
+                  "{$uploadStore.linkPreview.caption}"
                 </p>
               {/if}
 
               <div class="grid grid-cols-3 gap-2 max-h-52 overflow-y-auto pr-0.5 no-scrollbar">
-                {#each $uploadQueue.linkPreview.items as item}
-                  {@const isSelected = $uploadQueue.selectedLinkItems.has(item.id)}
+                {#each $uploadStore.linkPreview.items as item}
+                  {@const isSelected = $uploadStore.selectedLinkItems.has(item.id)}
                   <button
                     type="button"
-                    on:click={() => uploadQueue.toggleLinkItem(item.id)}
+                    on:click={() => uploadStore.toggleLinkItem(item.id)}
                     class="relative aspect-square liquid-card rounded-xl overflow-hidden cursor-pointer group focus:outline-none transition-all spring-tap {isSelected ? 'ring-2 ring-purple-500 shadow-md' : 'opacity-50'}"
                   >
                     {#if item.thumbnail_base64 || item.thumbnail_url}
@@ -528,10 +523,10 @@
           disabled={!canUpload}
           class="liquid-btn-primary px-5 py-2 rounded-xl text-xs font-semibold text-white transition-all disabled:opacity-40 cursor-pointer flex items-center gap-2 spring-tap shadow-sm"
         >
-          {#if $uploadQueue.uploadMode === 'files'}
-            Upload {$uploadQueue.stagedFiles.length} item{$uploadQueue.stagedFiles.length === 1 ? '' : 's'}
-          {:else if $uploadQueue.linkPreview}
-            Import Selected ({$uploadQueue.selectedLinkItems.size})
+          {#if $uploadStore.uploadMode === 'files'}
+            Upload {$uploadStore.stagedFiles.length} item{$uploadStore.stagedFiles.length === 1 ? '' : 's'}
+          {:else if $uploadStore.linkPreview}
+            Import Selected ({$uploadStore.selectedLinkItems.size})
           {:else}
             Import Link (Auto)
           {/if}
@@ -601,7 +596,7 @@
         on:click={() => selectDirectory(browsingDir)}
         class="w-full text-left px-2.5 py-1.5 rounded-lg text-xs bg-purple-500/10 hover:bg-purple-500/20 text-purple-600 dark:text-purple-300 font-medium transition-colors flex items-center justify-between cursor-pointer"
       >
-        <span class="truncate">Select "{browsingDir || ($uploadQueue.uploadMode === 'files' ? 'root' : 'Auto')}"</span>
+        <span class="truncate">Select "{browsingDir || ($uploadStore.uploadMode === 'files' ? 'root' : 'Auto')}"</span>
         <span class="text-[10px] uppercase font-mono">Use Current</span>
       </button>
 

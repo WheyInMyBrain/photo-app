@@ -4,14 +4,15 @@
   import { albumStore } from '$lib/stores/albumStore';
   import { filterStore } from '$lib/stores/filterStore';
   import { fade, scale } from 'svelte/transition';
+  import type { AlbumRecord } from '$lib/api/albums';
 
   export let isOpen = false;
-  export let album: {
+  export let album: (AlbumRecord | {
     id: string;
     title: string;
     description?: string | null;
     media_count: number;
-  } | null = null;
+  }) | null = null;
 
   const dispatch = createEventDispatcher<{
     close: void;
@@ -36,6 +37,7 @@
     const ok = await albumStore.renameAlbum(album.id, title.trim(), description.trim() || undefined);
     isSaving = false;
     if (ok) {
+      window.dispatchEvent(new CustomEvent('vault:refresh-timeline'));
       dispatch('updated');
       dispatch('close');
     }
@@ -48,6 +50,8 @@
     isSaving = false;
     if (ok) {
       filterStore.clearAlbum();
+      // If photos were trashed, immediately refresh the photo feed
+      window.dispatchEvent(new CustomEvent('vault:refresh-timeline'));
       dispatch('deleted');
       dispatch('close');
     }
@@ -192,7 +196,7 @@
     -webkit-backdrop-filter: blur(40px) saturate(190%);
     box-shadow:
       0 30px 70px var(--dock-shadow),
-      inset 0 1px 0 var(--border-specular);
+      inset 0 1px 0 0 var(--border-specular);
   }
 
   .liquid-input {

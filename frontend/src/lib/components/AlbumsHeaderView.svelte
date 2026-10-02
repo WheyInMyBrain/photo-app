@@ -3,12 +3,19 @@
   import { albumStore } from '$lib/stores/albumStore';
   import { filterStore } from '$lib/stores/filterStore';
   import { createEventDispatcher } from 'svelte';
+  import type { AlbumRecord } from '$lib/api/albums';
 
   const dispatch = createEventDispatcher<{
     openCreate: void;
+    openManage: { album: AlbumRecord };
   }>();
 
-  $: activeAlbum = $albumStore.find((a) => a.id ===$filterStore.album_id);
+  $: activeAlbum = $albumStore.find((a: AlbumRecord) => a.id ===$filterStore.album_id);
+
+  function getCoverSrc(thumb?: string | null): string | null {
+    if (!thumb) return null;
+    return thumb.startsWith('/') ? thumb : `/${thumb}`;
+  }
 </script>
 
 <div class="space-y-4 pt-1 pb-2">
@@ -30,10 +37,27 @@
             <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path>
           </svg>
           <span class="truncate max-w-[200px]">{activeAlbum.title}</span>
+
+          <!-- Manage / Settings Button for current album -->
+          <button
+            type="button"
+            on:click={() => dispatch('openManage', { album: activeAlbum })}
+            class="text-[var(--text-muted)] hover:text-purple-600 dark:hover:text-purple-400 transition-colors cursor-pointer ml-1 p-0.5"
+            title="Album options"
+            aria-label="Album options"
+          >
+            <svg xmlns="http://www.w3.org/2000/svg" class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <circle cx="12" cy="12" r="1"></circle>
+              <circle cx="19" cy="12" r="1"></circle>
+              <circle cx="5" cy="12" r="1"></circle>
+            </svg>
+          </button>
+
+          <!-- Exit Album Button -->
           <button
             type="button"
             on:click={() => filterStore.clearAlbum()}
-            class="text-[var(--text-muted)] hover:text-[var(--text-main)] transition-colors cursor-pointer ml-1 p-0.5"
+            class="text-[var(--text-muted)] hover:text-[var(--text-main)] transition-colors cursor-pointer p-0.5"
             title="Exit album"
             aria-label="Exit album"
           >
@@ -60,7 +84,7 @@
     </button>
   </div>
 
-  <!-- Album Cards Shelf (Visible when not drilling inside an album) -->
+  <!-- Album Cards Shelf -->
   {#if !$filterStore.album_id}
     {#if $albumStore.length === 0}
       <div class="py-10 text-center border border-dashed border-[var(--border-glass)] rounded-2xl bg-[var(--card-bg)]">
@@ -74,15 +98,16 @@
     {:else}
       <div class="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-6 gap-3">
         {#each $albumStore as album (album.id)}
+          {@const coverSrc = getCoverSrc(album.cover_thumb)}
           <button
             type="button"
             on:click={() => filterStore.setAlbumId(album.id)}
             class="group text-left p-2.5 rounded-2xl bg-[var(--card-bg)] hover:bg-[var(--dock-bg-hover)] border border-[var(--border-glass)] hover:border-purple-500/40 transition-all cursor-pointer flex flex-col gap-2.5 spring-tap"
           >
             <div class="w-full aspect-square rounded-xl overflow-hidden bg-black/10 dark:bg-black/40 flex items-center justify-center border border-[var(--border-glass)] relative">
-              {#if album.cover_thumb}
+              {#if coverSrc}
                 <img
-                  src={album.cover_thumb.startsWith('/') ? album.cover_thumb : `/${album.cover_thumb}`}
+                  src={coverSrc}
                   alt={album.title}
                   class="w-full h-full object-cover group-hover:scale-105 transition-transform duration-300"
                 />

@@ -1,6 +1,6 @@
 <!-- photo-app/frontend/src/lib/components/PeopleModal.svelte -->
 <script lang="ts">
-  import { createEventDispatcher } from 'svelte';
+  import { createEventDispatcher, onMount, onDestroy } from 'svelte';
   import { browser } from '$app/environment';
   import { fade, scale } from 'svelte/transition';
   import { filterStore } from '$lib/stores/filterStore';
@@ -72,7 +72,6 @@
     const query = currentPath.trim().toLowerCase().replace(/^\/+/, '');
     
     if (!query) {
-      // At root level: show all top-level directory names
       const rootSegments = new Set<string>();
       const directMatches: { id: string; title: string; nextSegment: string; fullPath: string }[] = [];
 
@@ -92,7 +91,6 @@
       return directMatches;
     }
 
-    // Matching sub-paths (e.g., query is "college" or "college/")
     const cleanPrefix = query.endsWith('/') ? query : query + '/';
     const suggestions: { id: string; title: string; nextSegment: string; fullPath: string }[] = [];
     const seenSegments = new Set<string>();
@@ -115,7 +113,6 @@
             fullPath: nextFullPath
           });
         } else if (!nextSegment && !seenSegments.has(a.normalizedPath)) {
-          // Exact match on album
           seenSegments.add(a.normalizedPath);
           suggestions.push({
             id: a.id,
@@ -130,27 +127,50 @@
     return suggestions;
   })();
 
-  async function loadData(albumId: string = selectedAlbumId) {
+  async function loadData(albumId: string = selectedAlbumId, silent = false) {
     if (!browser || !$authStore.isAuthenticated) return;
-    isLoading = true;
+    if (!silent) isLoading = true;
+
     try {
       const [peopleData, namesData, albumsData] = await Promise.all([
         fetchPeopleOverview(albumId === 'all' ? undefined : albumId),
         fetchNamesDirectory(),
         fetchCustomAlbums()
       ]);
+
       people = peopleData;
       nameDirectory = namesData;
       albums = albumsData;
+
+      // Prune IDs that no longer exist
+      const availableIds = new Set(peopleData.map((p) => p.id));
+      selectedIds = new Set([...selectedIds].filter((id) => availableIds.has(id)));
     } catch (e) {
       console.error('Failed loading modal data:', e);
     } finally {
-      isLoading = false;
+      if (!silent) isLoading = false;
     }
   }
 
+  function handleLivePeopleUpdate() {
+    if (!isOpen || editingId) return;
+    loadData(selectedAlbumId, true);
+  }
+
+  onMount(() => {
+    if (browser) {
+      window.addEventListener('vault:refresh-people', handleLivePeopleUpdate);
+    }
+  });
+
+  onDestroy(() => {
+    if (browser) {
+      window.removeEventListener('vault:refresh-people', handleLivePeopleUpdate);
+    }
+  });
+
   // Load when opened or when selected album changes
-  $: if (isOpen && browser &&$authStore.isAuthenticated) {
+  $: if (isOpen && browser && $authStore.isAuthenticated) {
     loadData(selectedAlbumId);
   }
 
@@ -160,7 +180,6 @@
       selectedAlbumId = suggestion.id;
       isPathDropdownOpen = false;
     } else {
-      // Find matching album ID if this path matches an existing album directly
       const clean = currentPath.toLowerCase().replace(/\/+$/, '');
       const matched = allAlbums.find((a) => a.normalizedPath === clean);
       if (matched) {
@@ -208,6 +227,7 @@
       try {
         await mergePersons(person.id, matched.id);
         await loadData(selectedAlbumId);
+        window.dispatchEvent(new CustomEvent('vault:refresh-timeline'));
       } catch (err) {
         console.error('Auto-merge failed:', err);
       }
@@ -219,6 +239,7 @@
         if (!nameDirectory.some((n) => n.id === person.id)) {
           nameDirectory = [...nameDirectory, { id: person.id, name: clean }];
         }
+        window.dispatchEvent(new CustomEvent('vault:refresh-timeline'));
       } catch (err) {
         console.error('Rename failed:', err);
       }
@@ -234,6 +255,7 @@
       target = null;
       clearSelection();
       await loadData(selectedAlbumId);
+      window.dispatchEvent(new CustomEvent('vault:refresh-timeline'));
     } catch (err) {
       console.error('Merge failed:', err);
     } finally {
@@ -259,6 +281,7 @@
       showMultiMergeModal = false;
       clearSelection();
       await loadData(selectedAlbumId);
+      window.dispatchEvent(new CustomEvent('vault:refresh-timeline'));
     } catch (err) {
       console.error('Multi-merge failed:', err);
     } finally {
@@ -278,6 +301,7 @@
       nameDirectory = nameDirectory.filter((n) => !selectedIds.has(n.id));
       showBatchDeleteConfirm = false;
       clearSelection();
+      window.dispatchEvent(new CustomEvent('vault:refresh-timeline'));
     } catch (err) {
       console.error('Batch delete failed:', err);
     } finally {
@@ -347,7 +371,7 @@
       transition:scale={{ start: 0.96, duration: 150 }}
       class="liquid-modal rounded-3xl w-full max-w-4xl max-h-[85vh] flex flex-col overflow-hidden text-[var(--text-main)]"
     >
-      <!-- Specular Header -->
+      <!-- Header -->
       <div class="px-6 py-4 border-b border-[var(--border-glass)] flex items-center justify-between gap-3">
         <div>
           <h2 class="text-sm sm:text-base font-semibold tracking-tight text-[var(--text-main)] flex items-center gap-2">
@@ -379,7 +403,6 @@
 
       <!-- Path & Sub-Album Navigation Bar -->
       <div class="px-6 py-3 border-b border-[var(--border-glass)] bg-black/10 dark:bg-white/[0.02] flex items-center gap-2 relative">
-        <!-- Quick Reset Button -->
         <button
           type="button"
           on:click={handleClearToRoot}
@@ -415,7 +438,7 @@
                 class="text-[var(--text-muted)] hover:text-[var(--text-main)] p-0.5"
                 title="Clear folder path"
               >
-                <svg xmlns="http://www.w3.org/2000/svg" class="w-3 3" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+                <svg xmlns="http://www.w3.org/2000/svg" class="w-3 h-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
                   <line x1="18" y1="6" x2="6" y2="18"></line>
                   <line x1="6" y1="6" x2="18" y2="18"></line>
                 </svg>
@@ -486,7 +509,6 @@
           </div>
 
           <div class="flex items-center gap-2">
-            <!-- Merge Button -->
             <button
               type="button"
               disabled={!canMergeSelected}
@@ -504,7 +526,6 @@
               <span>Merge ({selectedIds.size})</span>
             </button>
 
-            <!-- Delete Button -->
             <button
               type="button"
               disabled={!canDeleteSelected}
@@ -549,7 +570,7 @@
                 on:keydown={(e) => e.key === 'Enter' && handleCardClick(p)}
                 class="liquid-card group relative rounded-2xl p-3.5 flex flex-col items-center text-center cursor-pointer transition-all spring-tap {isSelected ? 'ring-2 ring-purple-500 shadow-md' : isFiltered ? 'liquid-card-filtered' : ''}"
               >
-                <!-- Selection Checkbox Button (Top Right) -->
+                <!-- Selection Checkbox Button -->
                 <button
                   type="button"
                   on:click|stopPropagation={() => toggleSelection(p.id)}

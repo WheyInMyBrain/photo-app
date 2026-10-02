@@ -1,3 +1,5 @@
+// photo-app/backend/src/main.rs
+
 mod config;
 mod error;
 mod middleware;
@@ -12,10 +14,7 @@ use axum::{
 };
 use config::Config;
 use std::net::SocketAddr;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicI64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
-use tokio::sync::{broadcast, Notify};
+use tokio::sync::{broadcast, mpsc};
 use tower_http::{
     services::ServeDir,
     set_header::SetResponseHeaderLayer,
@@ -29,45 +28,50 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use services::engine_coordinator::EngineCoordinator;
-use services::queue::QueueService;
+use services::queue::{QueueChannels, QueueService};
 use services::trash_purger::TrashPurgerService;
 
 #[derive(Clone, Debug, serde::Serialize)]
-pub struct WsMediaEvent {
-    pub event_type: String, // "asset_ready", "asset_failed"
-    pub asset_id: String,
-    pub thumb_path: String,
+#[serde(tag = "type", content = "data")]
+pub enum WsMediaEvent {
+    #[serde(rename = "asset_ready")]
+    AssetReady {
+        asset_id: String,
+        thumb_path: String,
+        folder_path: String,
+    },
+    #[serde(rename = "asset_failed")]
+    AssetFailed {
+        asset_id: String,
+        error: String,
+    },
+    #[serde(rename = "album_updated")]
+    AlbumUpdated {
+        album_id: Option<String>,
+        folder_path: String,
+        asset_id: String,
+    },
+    #[serde(rename = "people_updated")]
+    PeopleUpdated {
+        user_id: String,
+        new_people_count: usize,
+        affected_person_ids: Vec<String>,
+    },
+    #[serde(rename = "ai_completed")]
+    AiCompleted {
+        asset_id: String,
+        faces_detected: usize,
+        tags_count: usize,
+    },
 }
 
 #[derive(Clone)]
 pub struct AppState {
     pub db: sqlx::SqlitePool,
     pub config: Config,
-    pub queue_notify: Arc<Notify>,
     pub tx_events: broadcast::Sender<WsMediaEvent>,
     pub coordinator: EngineCoordinator,
-    pub last_upload_activity: std::sync::Arc<AtomicI64>,
-}
-
-impl AppState {
-    /// Call whenever any upload packet or file is received
-    pub fn touch_upload_activity(&self) {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs() as i64;
-        self.last_upload_activity.store(now, Ordering::Relaxed);
-    }
-
-    /// Check seconds elapsed since the last upload activity
-    pub fn seconds_since_last_upload(&self) -> i64 {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs() as i64;
-        let last = self.last_upload_activity.load(Ordering::Relaxed);
-        now.saturating_sub(last)
-    }
+    pub channels: QueueChannels,
 }
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
@@ -92,31 +96,73 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 1. Initialize coordinator (Zero ONNX models and zero vector caches loaded at boot)
     let models_dir = config.storage_root.join("models");
     let coordinator = EngineCoordinator::new(pool.clone(), models_dir);
-
-    let queue_notify = Arc::new(Notify::new());
     let (tx_events, _) = broadcast::channel::<WsMediaEvent>(100);
 
-    let last_upload_activity = Arc::new(AtomicI64::new(0));
+    // =========================================================================
+    // 2. Initialize Bounded In-Memory Pipeline Channels
+    // =========================================================================
+    let (assemble_tx, assemble_rx) = mpsc::channel::<db::domain::DbJob>(500);
+    let (thumb_tx, thumb_rx) = mpsc::channel::<db::domain::DbJob>(500);
+    let (ai_tx, ai_rx) = mpsc::channel::<db::domain::DbJob>(500);
 
-    // 2. Start worker with the coordinator (Idle worker consumes ~0 MB until a job arrives)
+    let channels = QueueChannels {
+        assemble_tx: assemble_tx.clone(),
+        thumb_tx: thumb_tx.clone(),
+        ai_tx: ai_tx.clone(),
+    };
+
     let state = AppState {
         db: pool.clone(),
         config: config.clone(),
-        queue_notify: queue_notify.clone(),
         tx_events: tx_events.clone(),
         coordinator: coordinator.clone(),
-        last_upload_activity,
+        channels: channels.clone(),
     };
 
-    // Start worker with `state`
-    QueueService::start_worker(
+    // =========================================================================
+    // 3. Start Event-Driven Workers
+    // =========================================================================
+    QueueService::start_pipeline(
         state.clone(),
         config.storage_root.clone(),
         coordinator.clone(),
         config.worker_concurrency,
-        queue_notify.clone(),
         tx_events.clone(),
+        assemble_rx,
+        thumb_rx,
+        ai_rx,
     );
+
+    // =========================================================================
+    // 4. WAL Startup Recovery: Refill channels from SQLite
+    // =========================================================================
+    {
+        let pool = pool.clone();
+        let a_tx = assemble_tx.clone();
+        let t_tx = thumb_tx.clone();
+        let ai_tx_init = ai_tx.clone();
+
+        tokio::spawn(async move {
+            if let Ok(jobs) = db::JobRepo::recover_uncompleted_jobs(&pool, "assemble").await {
+                info!("WAL Startup Recovery: Refilling {} assemble jobs", jobs.len());
+                for job in jobs {
+                    let _ = a_tx.send(job).await;
+                }
+            }
+            if let Ok(jobs) = db::JobRepo::recover_uncompleted_jobs(&pool, "thumbnail").await {
+                info!("WAL Startup Recovery: Refilling {} thumbnail jobs", jobs.len());
+                for job in jobs {
+                    let _ = t_tx.send(job).await;
+                }
+            }
+            if let Ok(jobs) = db::JobRepo::recover_uncompleted_jobs(&pool, "ai_enrichment").await {
+                info!("WAL Startup Recovery: Refilling {} AI jobs", jobs.len());
+                for job in jobs {
+                    let _ = ai_tx_init.send(job).await;
+                }
+            }
+        });
+    }
 
     // Serves /users/<user_id>/thumbs/<shard>/<file> from <storage_root>/users/
     let users_static_router = Router::new()
@@ -150,13 +196,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/assets/batch/purge", post(routes::media::batch_purge_assets))
         .route("/api/assets/{id}/poses", get(routes::media::get_asset_poses))
 
-        // Upload
+        // Upload Endpoints
         .route("/api/upload", post(routes::upload::upload_photo))
-        .route("/upload/check", post(routes::upload::check_upload))
+        .route("/api/upload/check", post(routes::upload::check_upload))
         .route("/api/upload/chunk", post(routes::upload::upload_chunk))
         .route("/api/upload/chunk/finalize", post(routes::upload::finalize_chunk))
         .route("/api/upload/inspect", post(routes::upload::inspect_link))
         .route("/api/upload/ingest", post(routes::upload::upload_ingest))
+        .route("/api/upload/batch/start", post(routes::upload::start_batch))
+        .route("/api/upload/batch/finish", post(routes::upload::finish_batch))
 
         // Event Stream
         .route("/api/events", get(routes::events::stream_events))

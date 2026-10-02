@@ -13,7 +13,6 @@ use uuid::Uuid;
 
 use crate::error::AppError;
 use crate::middleware::auth::AuthUser;
-use crate::services::queue::QueueService;
 use crate::AppState;
 
 use media_processing::StorageService;
@@ -21,11 +20,12 @@ use media_processing::StorageService;
 use db::domain::{
     BatchUploadReceipt, CandidateItem, CandidateManifest, CheckUploadRequest, CheckUploadResponse,
     ChunkUploadQuery, ChunkUploadResponse, CommitLinkRequest, DbJob, FinalizeChunkQuery,
-    IngestResponse, InspectLinkRequest, InspectLinkResponse, InspectResult, JobPayload,
-    RawUploadQuery, UploadItemResult,
+    FinishBatchRequest, FinishBatchResponse, IngestResponse, InspectLinkRequest,
+    InspectLinkResponse, InspectResult, JobPayload, RawUploadQuery, StartBatchResponse,
+    UploadItemResult,
 };
 use db::scrapes_repo::{ScrapedMediaItemRecord, ScrapedVariantRecord, ScrapesRepo};
-use db::{AlbumRepo, AssetRepo};
+use db::{AlbumRepo, AssetRepo, JobRepo, UploadRepo};
 use media_downloader::{
     download_media, extract_media, inject_metadata, stream_thumbnail_base64,
     ExtractedMediaMetadata, MediaMetadataPayload, MediaType,
@@ -34,6 +34,40 @@ use media_downloader::{
 // ==========================================
 // 1. FRONTEND HANDLER (Multipart Form-Data)
 // ==========================================
+
+/// POST /api/upload/batch/start
+pub async fn start_batch(
+    _auth_user: AuthUser,
+) -> Result<Json<StartBatchResponse>, AppError> {
+    let batch_id = UploadRepo::new_batch_id();
+    Ok(Json(StartBatchResponse { batch_id }))
+}
+
+/// POST /api/upload/batch/finish
+pub async fn finish_batch(
+    State(state): State<AppState>,
+    auth_user: AuthUser,
+    Json(payload): Json<FinishBatchRequest>,
+) -> Result<Json<FinishBatchResponse>, AppError> {
+    // 1. Atomically promote all 'staged' jobs of this batch to 'pending' in SQLite
+    let released_job_ids = JobRepo::commit_staged_batch(&state.db, &auth_user.id, &payload.batch_id)
+        .await
+        .map_err(|e| AppError::Internal(format!("Failed committing batch: {e}")))?;
+
+    let count = released_job_ids.len() as u64;
+
+    // 2. Push each promoted job directly into the in-memory assemble channel
+    for job_id in released_job_ids {
+        if let Ok(Some(job)) = JobRepo::acquire_job_by_id(&state.db, &job_id).await {
+            let _ = state.channels.assemble_tx.send(job).await;
+        }
+    }
+
+    Ok(Json(FinishBatchResponse {
+        released_jobs: count,
+        status: "processing_started".to_string(),
+    }))
+}
 
 /// POST /api/upload/check
 pub async fn check_upload(
@@ -84,12 +118,10 @@ pub async fn upload_photo(
     Query(query): Query<RawUploadQuery>,
     mut multipart: Multipart,
 ) -> Result<Json<BatchUploadReceipt>, AppError> {
-    state.touch_upload_activity();
-
     let mut raw_folder = query
         .folder
         .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| "root".to_string());
+        .unwrap_or_else(default_camera_folder);
 
     let mut results = Vec::new();
     let staging_root = resolve_user_temp_dir(&state, &auth_user.id, "staging").await?;
@@ -109,7 +141,6 @@ pub async fn upload_photo(
                 let asset_id = Uuid::new_v4().to_string();
                 let staged_path = staging_root.join(format!("{}.staged", asset_id));
 
-                // Stream incoming bytes directly to disk with zero memory buffering
                 let mut file = match OpenOptions::new()
                     .create(true)
                     .write(true)
@@ -134,7 +165,6 @@ pub async fn upload_photo(
                 let mut stream_error = false;
 
                 while let Ok(Some(chunk)) = field.chunk().await {
-                    state.touch_upload_activity();
                     if let Err(err) = file.write_all(&chunk).await {
                         results.push(UploadItemResult {
                             file_name: file_name.clone(),
@@ -171,7 +201,6 @@ pub async fn upload_photo(
 
                 let sanitized_folder = StorageService::sanitize_folder_path(&raw_folder);
 
-                // Queue "assemble" job: background worker hashes, deduplicates, and moves
                 let job = DbJob {
                     id: Uuid::new_v4().to_string(),
                     user_id: auth_user.id.clone(),
@@ -186,7 +215,11 @@ pub async fn upload_photo(
                     payload: None,
                 };
 
-                if let Err(e) = QueueService::enqueue(&state.db, &state.queue_notify, job).await {
+                let batch_id_opt = query.batch_id.as_deref();
+                let initial_status = if batch_id_opt.is_some() { "staged" } else { "pending" };
+
+                // 1. Write durable WAL record in SQLite
+                if let Err(e) = JobRepo::enqueue_with_status(&state.db, &job, initial_status, batch_id_opt).await {
                     let _ = fs::remove_file(&staged_path).await;
                     results.push(UploadItemResult {
                         file_name,
@@ -196,6 +229,11 @@ pub async fn upload_photo(
                         message: Some(format!("Failed enqueuing job: {e}")),
                     });
                     continue;
+                }
+
+                // 2. If unbatched, push directly into Worker 0's channel
+                if batch_id_opt.is_none() {
+                    let _ = state.channels.assemble_tx.send(job).await;
                 }
 
                 results.push(UploadItemResult {
@@ -275,8 +313,6 @@ pub async fn upload_ingest(
     Query(query): Query<RawUploadQuery>,
     body: Bytes,
 ) -> Result<Json<IngestResponse>, AppError> {
-    state.touch_upload_activity();
-
     if body.is_empty() {
         return Err(AppError::BadRequest("Upload body cannot be empty".into()));
     }
@@ -391,9 +427,16 @@ pub async fn upload_ingest(
         payload: None,
     };
 
-    QueueService::enqueue(&state.db, &state.queue_notify, job)
+    let batch_id_opt = query.batch_id.as_deref();
+    let initial_status = if batch_id_opt.is_some() { "staged" } else { "pending" };
+
+    JobRepo::enqueue_with_status(&state.db, &job, initial_status, batch_id_opt)
         .await
         .map_err(|e| AppError::Internal(format!("Failed to enqueue ingest job: {e}")))?;
+
+    if batch_id_opt.is_none() {
+        let _ = state.channels.assemble_tx.send(job).await;
+    }
 
     Ok(Json(IngestResponse::File(UploadItemResult {
         file_name,
@@ -406,13 +449,11 @@ pub async fn upload_ingest(
 
 /// POST /api/upload/chunk
 pub async fn upload_chunk(
-    State(state): State<AppState>,
+    State(_state): State<AppState>,
     auth_user: AuthUser,
     Query(query): Query<ChunkUploadQuery>,
     body: Body,
 ) -> Result<Json<ChunkUploadResponse>, AppError> {
-    state.touch_upload_activity();
-
     if query.total_chunks == 0 {
         return Err(AppError::BadRequest("total_chunks must be greater than 0".into()));
     }
@@ -423,7 +464,7 @@ pub async fn upload_chunk(
         )));
     }
 
-    let temp_root = resolve_user_temp_dir(&state, &auth_user.id, "chunks").await?;
+    let temp_root = resolve_user_temp_dir(&_state, &auth_user.id, "chunks").await?;
     let session_dir = temp_root.join(&query.upload_id);
     fs::create_dir_all(&session_dir).await.map_err(|e| {
         AppError::Internal(format!("Failed to create chunk session dir: {e}"))
@@ -449,7 +490,6 @@ pub async fn upload_chunk(
     let mut total_written = 0usize;
 
     while let Some(chunk_result) = stream.next().await {
-        state.touch_upload_activity();
         let data = chunk_result.map_err(|e| {
             AppError::BadRequest(format!("Network stream read error: {e}"))
         })?;
@@ -483,8 +523,6 @@ pub async fn finalize_chunk(
     auth_user: AuthUser,
     Query(query): Query<FinalizeChunkQuery>,
 ) -> Result<Json<UploadItemResult>, AppError> {
-    state.touch_upload_activity();
-
     let temp_root = resolve_user_temp_dir(&state, &auth_user.id, "chunks").await?;
     let session_dir = temp_root.join(&query.upload_id);
 
@@ -494,7 +532,6 @@ pub async fn finalize_chunk(
         ));
     }
 
-    // Read total_chunks metadata
     let meta_path = session_dir.join("total_chunks");
     let total_chunks_str = fs::read_to_string(&meta_path).await.map_err(|_| {
         AppError::BadRequest("Upload session missing metadata; no chunks received".into())
@@ -504,7 +541,6 @@ pub async fn finalize_chunk(
         AppError::Internal("Corrupted total_chunks metadata".into())
     })?;
 
-    // Quick verification: Do all .part files exist? (Microsecond point check)
     for idx in 0..total_chunks {
         let chunk_path = session_dir.join(format!("{:06}.part", idx));
         if !chunk_path.exists() {
@@ -519,7 +555,6 @@ pub async fn finalize_chunk(
     let final_folder = query.folder.unwrap_or_else(default_camera_folder);
     let sanitized_folder = StorageService::sanitize_folder_path(&final_folder);
 
-    // Enqueue Stage 0 "assemble" job pointing directly to session_dir
     let job = DbJob {
         id: Uuid::new_v4().to_string(),
         user_id: auth_user.id.clone(),
@@ -527,18 +562,26 @@ pub async fn finalize_chunk(
         file_name: query.file_name.clone(),
         rel_path: String::new(),
         folder_path: sanitized_folder,
-        disk_path: session_dir, // Worker stitches parts from here
+        disk_path: session_dir,
         sha256: String::new(),
         job_type: "assemble".to_string(),
         file_size_bytes: 0,
         payload: None,
     };
 
-    QueueService::enqueue(&state.db, &state.queue_notify, job)
+    let batch_id_opt = query.batch_id.as_deref();
+    let initial_status = if batch_id_opt.is_some() { "staged" } else { "pending" };
+
+    // 1. Write durable WAL entry
+    JobRepo::enqueue_with_status(&state.db, &job, initial_status, batch_id_opt)
         .await
         .map_err(|e| AppError::Internal(format!("Failed to enqueue assemble job: {e}")))?;
 
-    // Immediate acknowledgement: browser socket disconnects cleanly in <20ms
+    // 2. If unbatched, push directly into Worker 0 channel
+    if batch_id_opt.is_none() {
+        let _ = state.channels.assemble_tx.send(job).await;
+    }
+
     Ok(Json(UploadItemResult {
         file_name: query.file_name,
         status: "queued".to_string(),
@@ -969,7 +1012,8 @@ async fn execute_item_downloads(
             payload: Some(job_payload),
         };
 
-        if let Err(e) = QueueService::enqueue(&state.db, &state.queue_notify, job).await {
+        // Write durable WAL entry in SQLite
+        if let Err(e) = JobRepo::enqueue_with_status(&state.db, &job, "pending", None).await {
             let _ = tokio::fs::remove_file(&temp_file_path).await;
             results.push(UploadItemResult {
                 file_name: item.suggested_filename,
@@ -979,6 +1023,9 @@ async fn execute_item_downloads(
                 message: Some(format!("Failed to enqueue downloaded media: {e}")),
             });
         } else {
+            // Push directly to Worker 0 channel
+            let _ = state.channels.assemble_tx.send(job).await;
+
             results.push(UploadItemResult {
                 file_name: item.suggested_filename,
                 status: "queued".to_string(),

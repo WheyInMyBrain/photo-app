@@ -1,3 +1,5 @@
+// photo-app/backend/src/routes/events.rs
+
 use axum::{
     extract::State,
     http::{header, HeaderMap, HeaderValue},
@@ -17,13 +19,23 @@ pub async fn stream_events(
     let rx = state.tx_events.subscribe();
 
     let stream = BroadcastStream::new(rx).filter_map(|msg| match msg {
-        Ok(event) => match serde_json::to_string(&event) {
-            Ok(json) => {
-                let sse_event = Event::default().event("media_update").data(json);
-                Some(Ok::<Event, Infallible>(sse_event))
+        Ok(event) => {
+            let event_name = match &event {
+                crate::WsMediaEvent::AssetReady { .. } => "asset_ready",
+                crate::WsMediaEvent::AssetFailed { .. } => "asset_failed",
+                crate::WsMediaEvent::AlbumUpdated { .. } => "album_updated",
+                crate::WsMediaEvent::PeopleUpdated { .. } => "people_updated",
+                crate::WsMediaEvent::AiCompleted { .. } => "ai_completed",
+            };
+
+            match serde_json::to_string(&event) {
+                Ok(json) => {
+                    let sse_event = Event::default().event(event_name).data(json);
+                    Some(Ok::<Event, Infallible>(sse_event))
+                }
+                Err(_) => None,
             }
-            Err(_) => None,
-        },
+        }
         Err(_) => None,
     });
 

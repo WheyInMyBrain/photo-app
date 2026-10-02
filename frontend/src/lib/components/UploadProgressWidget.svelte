@@ -1,10 +1,10 @@
 <!-- photo-app/frontend/src/lib/components/UploadProgressWidget.svelte -->
 <script lang="ts">
-  import { fade, fly } from 'svelte/transition';
-  import { uploadProgressStore } from '$lib/stores/uploadProgressStore';
+  import { fly } from 'svelte/transition';
+  import { uploadStore } from '$lib/stores/uploadStore';
   import { formatBytes } from '$lib/utils/uploader';
 
-  $: state =$uploadProgressStore;
+  $: state =$uploadStore;
 
   $: overallPercent = state.totalBytes > 0 
     ? Math.min(100, Math.round((state.loadedBytes / state.totalBytes) * 100)) 
@@ -25,7 +25,7 @@
   })();
 </script>
 
-{#if state.isOpen}
+{#if state.isWidgetOpen}
   <div
     transition:fly={{ y: 20, duration: 200 }}
     class="fixed bottom-5 right-5 z-50 w-80 sm:w-96 liquid-toast rounded-3xl p-4 flex flex-col shadow-2xl text-[var(--text-main)] select-none border border-[var(--border-glass)]"
@@ -33,16 +33,18 @@
     <!-- Header -->
     <div class="flex items-center justify-between pb-3 border-b border-[var(--border-glass)]">
       <div class="flex items-center gap-2">
-        <div class="w-2.5 h-2.5 rounded-full bg-purple-500 animate-pulse"></div>
+        <div class="w-2.5 h-2.5 rounded-full {state.isUploading ? 'bg-purple-500 animate-pulse' : 'bg-emerald-500'}"></div>
         <span class="text-xs font-semibold tracking-tight text-[var(--text-main)]">
-          {state.completedFiles === state.totalFiles ? 'Upload Complete' : `Uploading (${state.completedFiles}/${state.totalFiles})`}
+          {state.completedFiles === state.totalFiles && !state.isUploading 
+            ? 'Upload Complete' 
+            : `Uploading (${state.completedFiles}/${state.totalFiles})`}
         </span>
       </div>
 
       <div class="flex items-center gap-1.5">
         <button
           type="button"
-          on:click={() => uploadProgressStore.toggleMinimize()}
+          on:click={() => uploadStore.toggleMinimize()}
           class="liquid-icon-btn w-6 h-6 rounded-full flex items-center justify-center text-[var(--text-muted)] hover:text-[var(--text-main)] cursor-pointer text-xs"
           title={state.isMinimized ? 'Expand' : 'Minimize'}
         >
@@ -50,7 +52,7 @@
         </button>
         <button
           type="button"
-          on:click={() => uploadProgressStore.close()}
+          on:click={() => uploadStore.closeWidget()}
           class="liquid-icon-btn w-6 h-6 rounded-full flex items-center justify-center text-[var(--text-muted)] hover:text-[var(--text-main)] cursor-pointer"
           title="Close"
         >
