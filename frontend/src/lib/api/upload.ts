@@ -1,9 +1,8 @@
 // photo-app/frontend/src/lib/api/upload.ts
 import { CHUNK_SIZE_BYTES, generateUUID } from '$lib/utils/uploader';
 
+const CHUNK_TIMEOUT_MS = 120_000; // 2 minutes per chunk
 const MAX_RETRIES = 3;
-const CHUNK_TIMEOUT_MS = 30_000;
-const FINALIZE_TIMEOUT_MS = 30_000;
 
 export interface DuplicateCheckResult {
   exists: boolean;
@@ -18,47 +17,6 @@ export interface StartBatchResult {
 export interface FinishBatchResult {
   released_jobs: number;
   status: string;
-}
-
-async function fetchWithRetryAndTimeout(
-  url: string,
-  options: RequestInit,
-  timeoutMs: number,
-  retries = MAX_RETRIES
-): Promise<Response> {
-  for (let attempt = 0; attempt < retries; attempt++) {
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
-
-    try {
-      const res = await fetch(url, {
-        ...options,
-        signal: controller.signal,
-        credentials: 'include',
-      });
-      clearTimeout(timeoutId);
-
-      if (res.status === 401) {
-        throw new Error('Session expired.');
-      }
-
-      if (res.ok) {
-        return res;
-      }
-
-      const isRetryable = res.status >= 500 || res.status === 408 || res.status === 429;
-      if (!isRetryable) {
-        const errText = await res.text().catch(() => '');
-        throw new Error(`Server rejected with status ${res.status}: ${errText}`);
-      }
-    } catch (err: any) {
-      clearTimeout(timeoutId);
-      if (err.message === 'Session expired.') throw err;
-      if (attempt === retries - 1) throw err;
-      await new Promise((resolve) => setTimeout(resolve, 1000 * (attempt + 1)));
-    }
-  }
-  throw new Error('Upload request failed after retries.');
 }
 
 /** 1. Start an explicit batch session */
@@ -157,6 +115,51 @@ export function apiUploadSingleXhr(
   });
 }
 
+/** Helper: Robust XHR chunk sender with retry and custom timeout */
+function sendChunkXhr(url: string, slice: Blob, retries = MAX_RETRIES): Promise<void> {
+  return new Promise((resolve, reject) => {
+    function attempt(remainingAttempts: number) {
+      const xhr = new XMLHttpRequest();
+      xhr.open('POST', url, true);
+      xhr.withCredentials = true;
+      xhr.setRequestHeader('Content-Type', 'application/octet-stream');
+      xhr.timeout = CHUNK_TIMEOUT_MS;
+
+      xhr.onload = () => {
+        if (xhr.status >= 200 && xhr.status < 300) {
+          resolve();
+        } else if (xhr.status === 401) {
+          reject(new Error('Session expired.'));
+        } else if (remainingAttempts > 0 && (xhr.status >= 500 || xhr.status === 408)) {
+          setTimeout(() => attempt(remainingAttempts - 1), 1000);
+        } else {
+          reject(new Error(xhr.responseText || `Chunk status ${xhr.status}`));
+        }
+      };
+
+      xhr.onerror = () => {
+        if (remainingAttempts > 0) {
+          setTimeout(() => attempt(remainingAttempts - 1), 1000);
+        } else {
+          reject(new Error('Network error uploading chunk'));
+        }
+      };
+
+      xhr.ontimeout = () => {
+        if (remainingAttempts > 0) {
+          setTimeout(() => attempt(remainingAttempts - 1), 1000);
+        } else {
+          reject(new Error('Chunk upload timed out after 120s'));
+        }
+      };
+
+      xhr.send(slice);
+    }
+
+    attempt(retries);
+  });
+}
+
 /** 4. Upload large files via slice chunks and finalize */
 export async function apiUploadChunked(
   file: File,
@@ -180,16 +183,8 @@ export async function apiUploadChunked(
       total_chunks: totalChunks.toString(),
     });
 
-    await fetchWithRetryAndTimeout(
-      `/api/upload/chunk?${params.toString()}`,
-      {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/octet-stream' },
-        body: slice,
-        credentials: 'include',
-      },
-      CHUNK_TIMEOUT_MS
-    );
+    // Use raw binary XHR stream instead of fetch/AbortController
+    await sendChunkXhr(`/api/upload/chunk?${params.toString()}`, slice);
 
     onProgress?.(chunkIdx + 1, totalChunks);
   }
@@ -201,14 +196,10 @@ export async function apiUploadChunked(
     ...(batchId ? { batch_id: batchId } : {}),
   });
 
-  const finalizeRes = await fetchWithRetryAndTimeout(
-    `/api/upload/chunk/finalize?${finalizeParams.toString()}`,
-    {
-      method: 'POST',
-      credentials: 'include',
-    },
-    FINALIZE_TIMEOUT_MS
-  );
+  const finalizeRes = await fetch(`/api/upload/chunk/finalize?${finalizeParams.toString()}`, {
+    method: 'POST',
+    credentials: 'include',
+  });
 
   if (!finalizeRes.ok) {
     const errText = await finalizeRes.text().catch(() => '');

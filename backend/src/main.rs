@@ -228,7 +228,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Upload Endpoints
         .route("/api/upload", post(routes::upload::upload_photo))
         .route("/api/upload/check", post(routes::upload::check_upload))
-        .route("/api/upload/chunk", post(routes::upload::upload_chunk))
+        .route(
+            "/api/upload/chunk",
+            post(routes::upload::upload_chunk).layer(DefaultBodyLimit::disable()),
+        )
         .route("/api/upload/chunk/finalize", post(routes::upload::finalize_chunk))
         .route("/api/upload/inspect", post(routes::upload::inspect_link))
         .route("/api/upload/ingest", post(routes::upload::upload_ingest))
