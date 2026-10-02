@@ -156,13 +156,19 @@
     const state = $uploadStore;
 
     if (state.uploadMode === 'files' && state.stagedFiles.length > 0) {
-      forceClose();
-
+      // 1. Kick off the upload pipeline FIRST while stagedFiles are intact
       uploadStore.startUpload((completedCount) => {
         if (completedCount > 0) {
           dispatch('uploaded', { count: completedCount });
         }
       });
+
+      // 2. Close modal view UI only (do NOT call resetModal which wipes staged files!)
+      isFolderDropdownOpen = false;
+      browsingDir = '';
+      searchQuery = '';
+      dispatch('close');
+
     } else if (state.uploadMode === 'link') {
       try {
         if (state.linkPreview && state.selectedLinkItems.size > 0) {
@@ -182,7 +188,7 @@
 
           if (res.ok) {
             dispatch('uploaded', { count: selectedIds.length });
-            forceClose();
+            cancelAndClose();
           } else {
             const errData = await res.json().catch(() => ({}));
             console.error('Ingest failed:', errData);
@@ -203,7 +209,7 @@
 
           if (res.ok) {
             dispatch('uploaded', { count: 1 });
-            forceClose();
+            cancelAndClose();
           } else {
             const errData = await res.json().catch(() => ({}));
             console.error('Ingest failed:', errData);
@@ -215,7 +221,7 @@
     }
   }
 
-  function forceClose() {
+  function cancelAndClose() {
     uploadStore.resetModal();
     isFolderDropdownOpen = false;
     browsingDir = '';
@@ -229,7 +235,7 @@
       if (isFolderDropdownOpen) {
         isFolderDropdownOpen = false;
       } else {
-        forceClose();
+        cancelAndClose();
       }
     }
   }
@@ -250,7 +256,7 @@
     role="dialog"
     aria-modal="true"
     tabindex="-1"
-    on:click|self={forceClose}
+    on:click|self={cancelAndClose}
   >
     <div
       transition:scale={{ start: 0.96, duration: 150 }}
@@ -268,7 +274,7 @@
         </div>
         <button
           type="button"
-          on:click={forceClose}
+          on:click={cancelAndClose}
           class="liquid-icon-btn w-7 h-7 flex items-center justify-center rounded-full text-[var(--text-muted)] hover:text-[var(--text-main)] transition-all spring-tap cursor-pointer"
           title="Close"
           aria-label="Close dialog"
@@ -512,7 +518,7 @@
       <div class="px-6 py-4 border-t border-[var(--border-glass)] flex justify-end gap-2.5">
         <button
           type="button"
-          on:click={forceClose}
+          on:click={cancelAndClose}
           class="liquid-btn-secondary px-4 py-2 rounded-xl text-xs text-[var(--text-muted)] hover:text-[var(--text-main)] transition-all spring-tap cursor-pointer"
         >
           Cancel
