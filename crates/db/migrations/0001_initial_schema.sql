@@ -387,9 +387,9 @@ CREATE TABLE IF NOT EXISTS scraped_posts (
     tags JSON NOT NULL DEFAULT '[]',            -- ["viral", "fashion", "ootd"]
     published_at TEXT,                          -- Original post timestamp (ISO-8601)
     next_page_url TEXT,                         -- Pagination cursor (e.g. ?max_id=...)
-    scraped_posts ADD COLUMN location_name TEXT,
-    scraped_posts ADD COLUMN latitude REAL,
-    scraped_posts ADD COLUMN longitude REAL,
+    location_name TEXT,
+    latitude REAL,
+    longitude REAL,
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     UNIQUE(user_id, platform, external_post_id)
 );
