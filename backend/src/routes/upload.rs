@@ -37,9 +37,14 @@ use media_downloader::{
 
 /// POST /api/upload/batch/start
 pub async fn start_batch(
+    State(state): State<AppState>,
     _auth_user: AuthUser,
 ) -> Result<Json<StartBatchResponse>, AppError> {
     let batch_id = UploadRepo::new_batch_id();
+
+    // Pause all background workers to free full I/O and CPU for network upload
+    state.pause_processing();
+
     Ok(Json(StartBatchResponse { batch_id }))
 }
 
@@ -52,7 +57,11 @@ pub async fn finish_batch(
     // 1. Atomically promote all 'staged' jobs of this batch to 'pending' in SQLite
     let released_job_ids = JobRepo::commit_staged_batch(&state.db, &auth_user.id, &payload.batch_id)
         .await
-        .map_err(|e| AppError::Internal(format!("Failed committing batch: {e}")))?;
+        .map_err(|e| {
+            // Guarantee we don't leave workers permanently paused on error
+            state.resume_processing_if_idle();
+            AppError::Internal(format!("Failed committing batch: {e}"))
+        })?;
 
     let count = released_job_ids.len() as u64;
 
@@ -62,6 +71,9 @@ pub async fn finish_batch(
             let _ = state.channels.assemble_tx.send(job).await;
         }
     }
+
+    // 3. Decrement active uploads; if no other batches are transferring, workers resume immediately
+    state.resume_processing_if_idle();
 
     Ok(Json(FinishBatchResponse {
         released_jobs: count,

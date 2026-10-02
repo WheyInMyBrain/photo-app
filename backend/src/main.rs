@@ -14,7 +14,9 @@ use axum::{
 };
 use config::Config;
 use std::net::SocketAddr;
-use tokio::sync::{broadcast, mpsc};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+use tokio::sync::{broadcast, mpsc, watch};
 use tower_http::{
     services::ServeDir,
     set_header::SetResponseHeaderLayer,
@@ -72,6 +74,27 @@ pub struct AppState {
     pub tx_events: broadcast::Sender<WsMediaEvent>,
     pub coordinator: EngineCoordinator,
     pub channels: QueueChannels,
+    pub upload_pause_tx: watch::Sender<bool>,
+    pub upload_pause_rx: watch::Receiver<bool>,
+    pub active_upload_batches: Arc<AtomicUsize>,
+}
+
+impl AppState {
+    pub fn pause_processing(&self) {
+        let prev = self.active_upload_batches.fetch_add(1, Ordering::SeqCst);
+        if prev == 0 {
+            let _ = self.upload_pause_tx.send(true);
+            info!("Upload batch active: background workers PAUSED");
+        }
+    }
+
+    pub fn resume_processing_if_idle(&self) {
+        let prev = self.active_upload_batches.fetch_sub(1, Ordering::SeqCst);
+        if prev <= 1 {
+            let _ = self.upload_pause_tx.send(false);
+            info!("All upload batches complete: background workers RESUMED");
+        }
+    }
 }
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
@@ -99,11 +122,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (tx_events, _) = broadcast::channel::<WsMediaEvent>(100);
 
     // =========================================================================
-    // 2. Initialize Bounded In-Memory Pipeline Channels
+    // 2. Initialize Bounded In-Memory Pipeline Channels & Pause Latch
     // =========================================================================
     let (assemble_tx, assemble_rx) = mpsc::channel::<db::domain::DbJob>(500);
     let (thumb_tx, thumb_rx) = mpsc::channel::<db::domain::DbJob>(500);
     let (ai_tx, ai_rx) = mpsc::channel::<db::domain::DbJob>(500);
+
+    let (upload_pause_tx, upload_pause_rx) = watch::channel(false);
+    let active_upload_batches = Arc::new(AtomicUsize::new(0));
 
     let channels = QueueChannels {
         assemble_tx: assemble_tx.clone(),
@@ -117,6 +143,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tx_events: tx_events.clone(),
         coordinator: coordinator.clone(),
         channels: channels.clone(),
+        upload_pause_tx,
+        upload_pause_rx,
+        active_upload_batches,
     };
 
     // =========================================================================

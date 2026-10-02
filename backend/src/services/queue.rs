@@ -28,6 +28,7 @@ pub struct QueueService;
 
 impl QueueService {
     /// Bootstraps all three pipeline workers driven strictly by in-memory mpsc channels.
+    /// Integrated with a Tokio watch pause gate to prioritize active upload batches.
     pub fn start_pipeline(
         state: AppState,
         storage_root: PathBuf,
@@ -39,12 +40,13 @@ impl QueueService {
         mut ai_rx: mpsc::Receiver<DbJob>,
     ) {
         let pool = state.db.clone();
+        let pause_rx = state.upload_pause_rx.clone();
 
         info!(
             assemble_concurrency = 1,
             thumb_concurrency = concurrency,
             ai_concurrency = 1,
-            "Three-stage push-driven mpsc media pipeline active"
+            "Three-stage push-driven mpsc media pipeline active with upload pause gate"
         );
 
         // =========================================================================
@@ -54,11 +56,17 @@ impl QueueService {
             let pool = pool.clone();
             let storage_root = storage_root.clone();
             let thumb_tx = state.channels.thumb_tx.clone();
+            let mut pause_rx = pause_rx.clone();
 
             tokio::spawn(async move {
-                // Event-driven: wakes immediately when a job arrives.
-                // Zero SQL polling queries. Zero sleep timers.
                 while let Some(job) = assemble_rx.recv().await {
+                    // PAUSE GATE: If an upload batch is transferring, yield disk I/O
+                    if *pause_rx.borrow() {
+                        info!("Worker 0 paused: waiting for active upload transfers to complete...");
+                        let _ = pause_rx.wait_for(|paused| !*paused).await;
+                        info!("Worker 0 resumed");
+                    }
+
                     let job_id = job.id.clone();
                     let input_path = job.disk_path.clone();
                     let asset_id = job.asset_id.clone();
@@ -189,7 +197,7 @@ impl QueueService {
                         continue;
                     }
 
-                    // Atomic in-place rename on the filesystem
+                    // Atomic in-place rename on filesystem
                     if let Err(e) = tokio::fs::rename(&destination_tmp, &final_destination).await {
                         error!("Failed final rename for {}: {}", asset_id, e);
                         let _ = tokio::fs::remove_file(&destination_tmp).await;
@@ -236,9 +244,15 @@ impl QueueService {
             let tx_events = tx_events.clone();
             let ai_tx = state.channels.ai_tx.clone();
             let thumb_sem = Arc::new(Semaphore::new(concurrency.max(1)));
+            let mut pause_rx = pause_rx.clone();
 
             tokio::spawn(async move {
                 while let Some(job) = thumb_rx.recv().await {
+                    // PAUSE GATE: Yield before acquiring work permits if an upload is active
+                    if *pause_rx.borrow() {
+                        let _ = pause_rx.wait_for(|paused| !*paused).await;
+                    }
+
                     let permit = match thumb_sem.clone().acquire_owned().await {
                         Ok(p) => p,
                         Err(_) => break,
@@ -303,7 +317,7 @@ impl QueueService {
                             Ok(thumb_path) => {
                                 let _ = JobRepo::mark_completed(&pool, &job_id).await;
 
-                                // 1. Notify that the thumbnail/preview image is live
+                                // 1. Notify that thumbnail/preview image is live
                                 let _ = tx_events.send(WsMediaEvent::AssetReady {
                                     asset_id: job.asset_id.clone(),
                                     thumb_path,
@@ -359,10 +373,16 @@ impl QueueService {
             let pool = pool.clone();
             let storage_root = storage_root.clone();
             let coordinator = coordinator.clone();
-            let tx_events = tx_events.clone(); // <--- Captured for Worker 2
+            let tx_events = tx_events.clone();
+            let mut pause_rx = pause_rx.clone();
 
             tokio::spawn(async move {
                 while let Some(job) = ai_rx.recv().await {
+                    // PAUSE GATE: Heavy AI tensor inference yields immediately to uploads
+                    if *pause_rx.borrow() {
+                        let _ = pause_rx.wait_for(|paused| !*paused).await;
+                    }
+
                     let job_id = job.id.clone();
                     let asset_id = job.asset_id.clone();
                     let user_id = job.user_id.clone();
@@ -714,7 +734,7 @@ impl QueueService {
                     person_id: face.person_id,
                     bbox_x: face.bbox_x,
                     bbox_y: face.bbox_y,
-                    bbox_w: face.bbox_w,
+                    bbox_w: face.bbox_h,
                     bbox_h: face.bbox_h,
                     score: face.score,
                     face_thumb_db_path: format!("users/{}/thumbs/{}", job.user_id, face.face_thumb_rel_path),
