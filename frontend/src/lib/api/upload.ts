@@ -88,7 +88,9 @@ export function apiUploadSingleXhr(
 
     xhr.upload.onprogress = (e) => {
       if (e.lengthComputable && onProgress) {
-        onProgress(e.loaded, e.total);
+        try {
+          onProgress(e.loaded, e.total);
+        } catch {}
       }
     };
 
@@ -115,14 +117,13 @@ export function apiUploadSingleXhr(
   });
 }
 
-/** Helper: Robust XHR chunk sender with retry and custom timeout */
-function sendChunkXhr(url: string, slice: Blob, retries = MAX_RETRIES): Promise<void> {
+/** Robust XHR chunk sender with explicit ArrayBuffer decoupling */
+function sendChunkXhr(url: string, data: ArrayBuffer, retries = MAX_RETRIES): Promise<void> {
   return new Promise((resolve, reject) => {
-    function attempt(remainingAttempts: number) {
+    function attempt(remaining: number) {
       const xhr = new XMLHttpRequest();
       xhr.open('POST', url, true);
       xhr.withCredentials = true;
-      xhr.setRequestHeader('Content-Type', 'application/octet-stream');
       xhr.timeout = CHUNK_TIMEOUT_MS;
 
       xhr.onload = () => {
@@ -130,30 +131,31 @@ function sendChunkXhr(url: string, slice: Blob, retries = MAX_RETRIES): Promise<
           resolve();
         } else if (xhr.status === 401) {
           reject(new Error('Session expired.'));
-        } else if (remainingAttempts > 0 && (xhr.status >= 500 || xhr.status === 408)) {
-          setTimeout(() => attempt(remainingAttempts - 1), 1000);
+        } else if (remaining > 0 && (xhr.status >= 500 || xhr.status === 408)) {
+          setTimeout(() => attempt(remaining - 1), 1000);
         } else {
-          reject(new Error(xhr.responseText || `Chunk status ${xhr.status}`));
+          reject(new Error(`Chunk upload failed with status ${xhr.status}: ${xhr.responseText}`));
         }
       };
 
       xhr.onerror = () => {
-        if (remainingAttempts > 0) {
-          setTimeout(() => attempt(remainingAttempts - 1), 1000);
+        if (remaining > 0) {
+          setTimeout(() => attempt(remaining - 1), 1000);
         } else {
           reject(new Error('Network error uploading chunk'));
         }
       };
 
       xhr.ontimeout = () => {
-        if (remainingAttempts > 0) {
-          setTimeout(() => attempt(remainingAttempts - 1), 1000);
+        if (remaining > 0) {
+          setTimeout(() => attempt(remaining - 1), 1000);
         } else {
-          reject(new Error('Chunk upload timed out after 120s'));
+          reject(new Error('Chunk upload timed out'));
         }
       };
 
-      xhr.send(slice);
+      // Sending ArrayBuffer prevents Safari/WebKit file lock stalls
+      xhr.send(data);
     }
 
     attempt(retries);
@@ -174,7 +176,9 @@ export async function apiUploadChunked(
   for (let chunkIdx = 0; chunkIdx < totalChunks; chunkIdx++) {
     const start = chunkIdx * CHUNK_SIZE_BYTES;
     const end = Math.min(file.size, start + CHUNK_SIZE_BYTES);
-    const slice = file.slice(start, end);
+    
+    // Convert slice to ArrayBuffer: resolves WebKit lock contention between chunks
+    const sliceBuffer = await file.slice(start, end).arrayBuffer();
 
     const params = new URLSearchParams({
       upload_id: uploadId,
@@ -183,10 +187,16 @@ export async function apiUploadChunked(
       total_chunks: totalChunks.toString(),
     });
 
-    // Use raw binary XHR stream instead of fetch/AbortController
-    await sendChunkXhr(`/api/upload/chunk?${params.toString()}`, slice);
+    await sendChunkXhr(`/api/upload/chunk?${params.toString()}`, sliceBuffer);
 
-    onProgress?.(chunkIdx + 1, totalChunks);
+    // Guard onProgress so store update panics don't abort loop
+    if (onProgress) {
+      try {
+        onProgress(chunkIdx + 1, totalChunks);
+      } catch (cbErr) {
+        console.warn('[Upload] onProgress handler error:', cbErr);
+      }
+    }
   }
 
   const finalizeParams = new URLSearchParams({
