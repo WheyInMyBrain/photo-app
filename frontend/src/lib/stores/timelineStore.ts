@@ -1,10 +1,108 @@
+// photo-app/frontend/src/lib/stores/timelineStore.ts
 import { writable } from 'svelte/store';
 import { browser } from '$app/environment';
 import { authStore } from '$lib/stores/authStore';
-import type { SubAlbum, MediaSection, MediaPageResponse } from '$lib/types/media';
+import type { SubAlbum, MediaSection, MediaPageResponse, AssetRecord } from '$lib/types/media';
+
+export interface DailyMediaSection extends MediaSection {
+  id?: string;
+  month?: string;
+  year?: string;
+}
+
+/** Formats a timestamp into: "Saturday, 12th September 2026" */
+function formatDayTitle(date: Date): string {
+  const day = date.getDate();
+  const suffix = (d: number) => {
+    if (d > 3 && d < 21) return 'th';
+    switch (d % 10) {
+      case 1:  return 'st';
+      case 2:  return 'nd';
+      case 3:  return 'rd';
+      default: return 'th';
+    }
+  };
+
+  const weekday = date.toLocaleDateString('en-US', { weekday: 'long' });
+  const month = date.toLocaleDateString('en-US', { month: 'long' });
+  const year = date.getFullYear();
+
+  return `${weekday}, ${day}${suffix(day)} ${month} ${year}`;
+}
+
+/** Resolves an asset's day key: "YYYY-MM-DD" */
+function getDayKey(asset: AssetRecord): string {
+  const rawDate = asset.captured_at || asset.created_at;
+  if (!rawDate) return 'undated';
+  const d = new Date(rawDate);
+  if (isNaN(d.getTime())) return 'undated';
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+}
+
+/** Regroups arbitrary sections or flat assets into strict day-by-day sections */
+function repartitionIntoDailySections(incomingSections: MediaSection[]): DailyMediaSection[] {
+  const result: DailyMediaSection[] = [];
+  const map = new Map<string, DailyMediaSection>();
+
+  for (const sec of incomingSections) {
+    for (const item of sec.items) {
+      const dayKey = getDayKey(item);
+
+      if (!map.has(dayKey)) {
+        let title = 'Undated';
+        let month = '';
+        let year = '';
+
+        if (dayKey !== 'undated') {
+          const rawDate = item.captured_at || item.created_at;
+          const d = rawDate ? new Date(rawDate) : null;
+          if (d && !isNaN(d.getTime())) {
+            title = formatDayTitle(d);
+            month = d.toLocaleDateString('en-US', { month: 'short' });
+            year = String(d.getFullYear());
+          }
+        }
+
+        const newSection: DailyMediaSection = {
+          id: dayKey,
+          title,
+          month,
+          year,
+          items: []
+        };
+        map.set(dayKey, newSection);
+        result.push(newSection);
+      }
+
+      map.get(dayKey)!.items.push(item);
+    }
+  }
+
+  return result;
+}
+
+/** Merges incoming daily sections into existing sections across pagination boundaries */
+function appendDailySections(current: DailyMediaSection[], incoming: DailyMediaSection[]): DailyMediaSection[] {
+  if (incoming.length === 0) return current;
+  const cloned = [...current];
+
+  for (const inc of incoming) {
+    if (cloned.length > 0) {
+      const last = cloned[cloned.length - 1];
+      // If the incoming chunk starts with the exact same date as our last item, merge items
+      if ((last.id && inc.id && last.id === inc.id) || last.title === inc.title) {
+        last.items = [...last.items, ...inc.items];
+        continue;
+      }
+    }
+    cloned.push(inc);
+  }
+
+  return cloned;
+}
 
 export function createTimelineStore() {
-  const sections = writable<MediaSection[]>([]);
+  const sections = writable<DailyMediaSection[]>([]);
   const albums = writable<SubAlbum[]>([]);
   const isLoading = writable(false);
   const hasMore = writable(true);
@@ -15,22 +113,6 @@ export function createTimelineStore() {
 
   // Monotonic sequence token preventing race conditions between resets & pagination
   let currentRequestId = 0;
-
-  function appendSections(current: MediaSection[], incoming: MediaSection[]): MediaSection[] {
-    if (incoming.length === 0) return current;
-    const cloned = [...current];
-
-    if (cloned.length > 0) {
-      const lastExisting = cloned[cloned.length - 1];
-      const firstIncoming = incoming[0];
-
-      if (lastExisting.title === firstIncoming.title) {
-        lastExisting.items = [...lastExisting.items, ...firstIncoming.items];
-        incoming.shift();
-      }
-    }
-    return [...cloned, ...incoming];
-  }
 
   async function fetchMedia(queryString = '', reset = false) {
     if (!browser) return;
@@ -43,8 +125,7 @@ export function createTimelineStore() {
       nextCapturedAt = null;
       nextId = null;
       hasMore.set(true);
-      // STALE-WHILE-REVALIDATE: Do NOT wipe sections.set([]) here.
-      // Keeps old content visible until new data resolves to prevent layout collapse.
+      // STALE-WHILE-REVALIDATE: Retain old sections until new ones resolve
     }
 
     pageAbortCtrl = new AbortController();
@@ -72,11 +153,13 @@ export function createTimelineStore() {
       const data: MediaPageResponse = await res.json();
       if (requestId !== currentRequestId) return;
 
+      const dailySections = repartitionIntoDailySections(data.sections ?? []);
+
       if (reset) {
         albums.set(data.albums ?? []);
-        sections.set(data.sections ?? []);
+        sections.set(dailySections);
       } else {
-        sections.update((curr) => appendSections(curr, data.sections ?? []));
+        sections.update((curr) => appendDailySections(curr, dailySections));
       }
 
       nextCapturedAt = data.next_cursor_captured_at;

@@ -41,10 +41,11 @@
   let showManageAlbumModal = false;
 
   $: selectedAsset = resolveAsset($sections, activeCoords);
-  $: prevAsset = resolveAsset($sections, getPrevCoords($sections, activeCoords));$: nextAsset = resolveAsset($sections, getNextCoords($sections, activeCoords));
+  $: prevAsset = resolveAsset($sections, getPrevCoords($sections, activeCoords));
+  $: nextAsset = resolveAsset($sections, getNextCoords($sections, activeCoords));
 
-  $: currentAlbum =$filterStore.album_id
-    ? $albumStore.find((a) => a.id ===$filterStore.album_id)
+  $: currentAlbum = $filterStore.album_id
+    ? $albumStore.find((a) => a.id === $filterStore.album_id)
     : null;
 
   $: currentAlbumPath = currentAlbum
@@ -68,7 +69,7 @@
     });
   })();
 
-  $: rootAlbums =$albumStore
+  $: rootAlbums = $albumStore
     .map((alb) => {
       const clean = (alb.title || '').replace(/^\/+|\/+$/g, '');
       const parts = clean.split('/');
@@ -99,11 +100,34 @@
       );
   })();
 
-  $: scrubMarkers =$sections.map((s, idx) => ({
-    label: s.title.split(' ')[0],
-    year: s.title.split(' ')[1] || '',
-    index: idx
-  }));
+  // Deduplicate day sections into distinct Month & Year scrubber milestones
+  $: scrubMarkers = (() => {
+    const seen = new Set<string>();
+    const markers: { label: string; year: string; index: number }[] = [];
+
+    $sections.forEach((s, idx) => {
+      let month = (s as any).month;
+      let year = (s as any).year;
+
+      if (!month || !year) {
+        const parts = s.title.split(' ');
+        month = parts[parts.length - 2] || '';
+        year = parts[parts.length - 1] || '';
+      }
+
+      const key = `${month} ${year}`.trim();
+      if (key && !seen.has(key)) {
+        seen.add(key);
+        markers.push({
+          label: month,
+          year: year,
+          index: idx // Points directly to the first day section in this month
+        });
+      }
+    });
+
+    return markers;
+  })();
 
   $: currentDensity = DENSITY_PRESETS[$gridDensity];
 
@@ -459,15 +483,18 @@
       on:pointerup={dragSelect.handlePointerUp}
       on:pointercancel={dragSelect.handlePointerCancel}
     >
-      {#each $sections as section, secIdx (section.title)}
+      {#each $sections as section, secIdx (section.id || section.title)}
         <section id="section-marker-{secIdx}" class="section-container">
-          <!-- Minimal Sticky Timeline Header -->
-          <div class="sticky top-0 z-20 py-1.5 px-1 flex items-baseline justify-between backdrop-blur-xl bg-[var(--bg-primary)]/80 mb-1.5">
-            <h2 class="text-xs font-semibold tracking-tight text-[var(--text-main)]">
-              {section.title}
-            </h2>
+          <!-- Daily Timeline Header with Sticky Blur -->
+          <div class="sticky top-0 z-20 py-2 px-1 flex items-baseline justify-between backdrop-blur-xl bg-[var(--bg-primary)]/80 mb-2 border-b border-[var(--border-glass)]/40">
+            <div class="flex items-center gap-2">
+              <span class="w-1.5 h-1.5 rounded-full bg-purple-500"></span>
+              <h2 class="text-xs sm:text-sm font-semibold tracking-tight text-[var(--text-main)]">
+                {section.title}
+              </h2>
+            </div>
             <span class="text-[10px] text-[var(--text-muted)] font-mono">
-              {section.items.length}
+              {section.items.length} {section.items.length === 1 ? 'item' : 'items'}
             </span>
           </div>
 
