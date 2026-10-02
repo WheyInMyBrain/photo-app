@@ -117,8 +117,8 @@ export function apiUploadSingleXhr(
   });
 }
 
-/** Robust XHR chunk sender with explicit ArrayBuffer decoupling */
-function sendChunkXhr(url: string, data: ArrayBuffer, retries = MAX_RETRIES): Promise<void> {
+/** Robust XHR chunk sender using Uint8Array backed specifically by ArrayBuffer */
+function sendChunkXhr(url: string, data: Uint8Array<ArrayBuffer>, retries = MAX_RETRIES): Promise<void> {
   return new Promise((resolve, reject) => {
     function attempt(remaining: number) {
       const xhr = new XMLHttpRequest();
@@ -154,7 +154,6 @@ function sendChunkXhr(url: string, data: ArrayBuffer, retries = MAX_RETRIES): Pr
         }
       };
 
-      // Sending ArrayBuffer prevents Safari/WebKit file lock stalls
       xhr.send(data);
     }
 
@@ -176,9 +175,10 @@ export async function apiUploadChunked(
   for (let chunkIdx = 0; chunkIdx < totalChunks; chunkIdx++) {
     const start = chunkIdx * CHUNK_SIZE_BYTES;
     const end = Math.min(file.size, start + CHUNK_SIZE_BYTES);
-    
-    // Convert slice to ArrayBuffer: resolves WebKit lock contention between chunks
+
+    // Convert slice to ArrayBuffer, then explicitly create a Uint8Array<ArrayBuffer>
     const sliceBuffer = await file.slice(start, end).arrayBuffer();
+    const chunkView = new Uint8Array(sliceBuffer);
 
     const params = new URLSearchParams({
       upload_id: uploadId,
@@ -187,9 +187,8 @@ export async function apiUploadChunked(
       total_chunks: totalChunks.toString(),
     });
 
-    await sendChunkXhr(`/api/upload/chunk?${params.toString()}`, sliceBuffer);
+    await sendChunkXhr(`/api/upload/chunk?${params.toString()}`, chunkView);
 
-    // Guard onProgress so store update panics don't abort loop
     if (onProgress) {
       try {
         onProgress(chunkIdx + 1, totalChunks);
