@@ -345,11 +345,18 @@ CREATE TABLE IF NOT EXISTS processing_jobs (
     disk_path TEXT NOT NULL,
     sha256 TEXT NOT NULL,
     file_size_bytes INTEGER NOT NULL,
-    job_type TEXT NOT NULL DEFAULT 'thumbnail',
-    status TEXT NOT NULL DEFAULT 'pending', -- 'pending', 'processing', 'completed', 'failed'
+    job_type TEXT NOT NULL DEFAULT 'thumbnail', -- 'assemble', 'thumbnail', 'ai_enrichment'
+    status TEXT NOT NULL DEFAULT 'pending',     -- 'staged', 'pending', 'processing', 'completed', 'failed'
     attempts INTEGER NOT NULL DEFAULT 0,
     last_error TEXT,
-    payload JSON,                          -- Holds context: { "tags": [...], "caption": "...", "author": "..." }
+    payload JSON,                               -- Ingestion context (batch_id, author, caption, tags)
+
+    -- Granular AI completion checkpoints (0 = pending/skipped, 1 = completed)
+    ai_faces_done INTEGER NOT NULL DEFAULT 0,
+    ai_clip_done  INTEGER NOT NULL DEFAULT 0,
+    ai_tags_done  INTEGER NOT NULL DEFAULT 0,
+    ai_poses_done INTEGER NOT NULL DEFAULT 0,
+
     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
@@ -370,6 +377,13 @@ CREATE INDEX IF NOT EXISTS idx_processing_jobs_queue
 CREATE INDEX IF NOT EXISTS idx_jobs_batch_release
     ON processing_jobs(user_id, status, json_extract(payload, '$.batch_id'))
     WHERE status = 'staged';
+
+CREATE INDEX IF NOT EXISTS idx_jobs_type_status_attempts 
+    ON processing_jobs(job_type, status, attempts, created_at);
+
+CREATE INDEX IF NOT EXISTS idx_jobs_ai_backfill
+    ON processing_jobs(status, ai_faces_done, ai_clip_done, ai_tags_done)
+    WHERE job_type = 'ai_enrichment';
 
 -- ============================================================================
 -- 7. SCRAPED POSTS, MEDIA STAGING, VARIANTS & DISCOVERY QUEUE

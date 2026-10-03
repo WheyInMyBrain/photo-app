@@ -38,6 +38,9 @@ pub struct DbJob {
     pub sha256: String,
     pub file_size_bytes: i64,
     pub job_type: String,
-    /// Contextual metadata carried along the pipeline
     pub payload: Option<JobPayload>,
+    pub ai_faces_done: i64,
+    pub ai_clip_done: i64,
+    pub ai_tags_done: i64,
+    pub ai_poses_done: i64,
 }

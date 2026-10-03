@@ -143,6 +143,15 @@ pub struct FilterOption {
     pub count: i64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TimelineBucket {
+    pub year: String,
+    pub month: String,      // e.g. "09"
+    pub month_name: String, // e.g. "Sep"
+    pub count: i64,
+    pub latest_captured_at: String,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
 pub struct DynamicFiltersResponse {
     pub total_media: i64,
@@ -150,6 +159,7 @@ pub struct DynamicFiltersResponse {
     pub videos_count: i64,
     pub min_date: Option<String>,
     pub max_date: Option<String>,
+    pub timeline: Vec<TimelineBucket>,
     pub times_of_day: Vec<FilterOption>,
     pub people: Vec<FilterOption>,
     pub tags: Vec<FilterOption>,

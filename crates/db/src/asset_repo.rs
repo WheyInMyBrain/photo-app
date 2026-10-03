@@ -7,7 +7,7 @@ use crate::domain::{
     NewAssetRecord, DynamicFiltersResponse, FilterOption, AssetCacheMetadata,
     RawMediaRow, MediaItemSummary, MapLocationPoint, MapLocationsQuery,
     AssetObjectDetail, AssetPoseDetail, CheckUploadResponse,
-    ExistingAssetRow,
+    ExistingAssetRow, TimelineBucket,
 };
 
 pub struct AssetRepo;
@@ -470,7 +470,7 @@ impl AssetRepo {
             builder
         };
 
-        // 1. Primary counts and date bounds
+        // 1. Primary counts and date bounds (Min & Max for Range Slider)
         let mut stats_builder = build_cte();
         stats_builder.push(
             r#"
@@ -496,7 +496,41 @@ impl AssetRepo {
         let min_date: Option<String> = stats_row.try_get("min_d").ok();
         let max_date: Option<String> = stats_row.try_get("max_d").ok();
 
-        // 2. Times of day breakdown
+        // 2. Full Timeline Milestones (for the Scrubber)
+        let mut timeline_builder = build_cte();
+        timeline_builder.push(
+            r#"
+            SELECT 
+                CAST(year AS TEXT) as yr,
+                PRINTF('%02d', month) as mo,
+                CASE month
+                    WHEN 1 THEN 'Jan' WHEN 2 THEN 'Feb' WHEN 3 THEN 'Mar'
+                    WHEN 4 THEN 'Apr' WHEN 5 THEN 'May' WHEN 6 THEN 'Jun'
+                    WHEN 7 THEN 'Jul' WHEN 8 THEN 'Aug' WHEN 9 THEN 'Sep'
+                    WHEN 10 THEN 'Oct' WHEN 11 THEN 'Nov' WHEN 12 THEN 'Dec'
+                    ELSE 'Unknown'
+                END as mo_name,
+                COUNT(*) as count,
+                MAX(captured_at) as latest_captured_at
+            FROM filtered
+            WHERE year IS NOT NULL AND month IS NOT NULL
+            GROUP BY year, month
+            ORDER BY year DESC, month DESC
+            "#
+        );
+
+        let timeline: Vec<TimelineBucket> = timeline_builder.build().fetch_all(pool).await?
+            .into_iter()
+            .map(|r| TimelineBucket {
+                year: r.get("yr"),
+                month: r.get("mo"),
+                month_name: r.get("mo_name"),
+                count: r.get("count"),
+                latest_captured_at: r.get("latest_captured_at"),
+            })
+            .collect();
+
+        // 3. Times of day breakdown
         let mut tod_builder = build_cte();
         tod_builder.push(
             r#"
@@ -524,7 +558,7 @@ impl AssetRepo {
             })
             .collect();
 
-        // 3. People breakdown
+        // 4. People breakdown
         let mut people_builder = build_cte();
         people_builder.push(
             r#"
@@ -554,7 +588,7 @@ impl AssetRepo {
             })
             .collect();
 
-        // 4. Tags breakdown
+        // 5. Tags breakdown
         let mut tags_builder = build_cte();
         tags_builder.push(
             r#"
@@ -583,7 +617,7 @@ impl AssetRepo {
             })
             .collect();
 
-        // 5. Locations breakdown
+        // 6. Locations breakdown
         let mut loc_builder = build_cte();
         loc_builder.push(
             r#"
@@ -605,7 +639,7 @@ impl AssetRepo {
             })
             .collect();
 
-        // 6. Cameras breakdown
+        // 7. Cameras breakdown
         let mut cam_builder = build_cte();
         cam_builder.push(
             r#"
@@ -627,7 +661,7 @@ impl AssetRepo {
             })
             .collect();
 
-        // 7. Folders / Albums breakdown
+        // 8. Folders / Albums breakdown
         let mut album_builder = build_cte();
         album_builder.push(
             r#"
@@ -655,6 +689,7 @@ impl AssetRepo {
             videos_count,
             min_date,
             max_date,
+            timeline,
             times_of_day,
             people,
             tags,

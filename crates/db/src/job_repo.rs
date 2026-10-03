@@ -38,8 +38,9 @@ impl JobRepo {
             r#"
             INSERT INTO processing_jobs (
                 id, user_id, asset_id, file_name, rel_path, folder_path,
-                disk_path, sha256, file_size_bytes, job_type, payload, status
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                disk_path, sha256, file_size_bytes, job_type, payload, status,
+                ai_faces_done, ai_clip_done, ai_tags_done, ai_poses_done
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             "#,
         )
         .bind(&job.id)
@@ -54,6 +55,10 @@ impl JobRepo {
         .bind(job_type)
         .bind(payload_json)
         .bind(status)
+        .bind(job.ai_faces_done)
+        .bind(job.ai_clip_done)
+        .bind(job.ai_tags_done)
+        .bind(job.ai_poses_done)
         .execute(pool)
         .await?;
 
@@ -129,7 +134,8 @@ impl JobRepo {
         let rows = sqlx::query(
             r#"
             SELECT id, user_id, asset_id, file_name, rel_path, folder_path,
-                   disk_path, sha256, file_size_bytes, job_type, payload
+                   disk_path, sha256, file_size_bytes, job_type, payload,
+                   ai_faces_done, ai_clip_done, ai_tags_done, ai_poses_done
             FROM processing_jobs
             WHERE status = 'pending' AND job_type = ? AND attempts < 3
             ORDER BY created_at ASC
@@ -158,6 +164,74 @@ impl JobRepo {
                 job_type: r.get("job_type"),
                 file_size_bytes: r.get("file_size_bytes"),
                 payload,
+                ai_faces_done: r.get("ai_faces_done"),
+                ai_clip_done: r.get("ai_clip_done"),
+                ai_tags_done: r.get("ai_tags_done"),
+                ai_poses_done: r.get("ai_poses_done"),
+            });
+        }
+
+        Ok(jobs)
+    }
+
+    /// Backfill Discovery: Scans for existing ai_enrichment jobs where configured sub-features
+    /// are still marked 0 (e.g. user enabled faces or clip later in config).
+    pub async fn find_unprocessed_ai_jobs(
+        pool: &SqlitePool,
+        check_faces: bool,
+        check_clip: bool,
+        check_tags: bool,
+        check_poses: bool,
+        limit: i64,
+    ) -> Result<Vec<DbJob>, sqlx::Error> {
+        let rows = sqlx::query(
+            r#"
+            SELECT id, user_id, asset_id, file_name, rel_path, folder_path,
+                   disk_path, sha256, file_size_bytes, job_type, payload,
+                   ai_faces_done, ai_clip_done, ai_tags_done, ai_poses_done
+            FROM processing_jobs
+            WHERE job_type = 'ai_enrichment'
+              AND (
+                  (?1 = 1 AND ai_faces_done = 0) OR
+                  (?2 = 1 AND ai_clip_done = 0)  OR
+                  (?3 = 1 AND ai_tags_done = 0)  OR
+                  (?4 = 1 AND ai_poses_done = 0)
+              )
+            ORDER BY created_at ASC
+            LIMIT ?5
+            "#,
+        )
+        .bind(if check_faces { 1 } else { 0 })
+        .bind(if check_clip { 1 } else { 0 })
+        .bind(if check_tags { 1 } else { 0 })
+        .bind(if check_poses { 1 } else { 0 })
+        .bind(limit)
+        .fetch_all(pool)
+        .await?;
+
+        let mut jobs = Vec::with_capacity(rows.len());
+        for r in rows {
+            let payload_raw: Option<String> = r.get("payload");
+            let payload: Option<JobPayload> = payload_raw
+                .as_deref()
+                .and_then(|raw| serde_json::from_str(raw).ok());
+
+            jobs.push(DbJob {
+                id: r.get("id"),
+                user_id: r.get("user_id"),
+                asset_id: r.get("asset_id"),
+                file_name: r.get("file_name"),
+                rel_path: r.get("rel_path"),
+                folder_path: r.get("folder_path"),
+                disk_path: PathBuf::from(r.get::<String, _>("disk_path")),
+                sha256: r.get("sha256"),
+                job_type: r.get("job_type"),
+                file_size_bytes: r.get("file_size_bytes"),
+                payload,
+                ai_faces_done: r.get("ai_faces_done"),
+                ai_clip_done: r.get("ai_clip_done"),
+                ai_tags_done: r.get("ai_tags_done"),
+                ai_poses_done: r.get("ai_poses_done"),
             });
         }
 
@@ -174,7 +248,8 @@ impl JobRepo {
         let row = sqlx::query(
             r#"
             SELECT id, user_id, asset_id, file_name, rel_path, folder_path,
-                   disk_path, sha256, file_size_bytes, job_type, payload
+                   disk_path, sha256, file_size_bytes, job_type, payload,
+                   ai_faces_done, ai_clip_done, ai_tags_done, ai_poses_done
             FROM processing_jobs
             WHERE id = ? AND attempts < 3
             LIMIT 1
@@ -202,6 +277,10 @@ impl JobRepo {
                 job_type: r.get("job_type"),
                 file_size_bytes: r.get("file_size_bytes"),
                 payload,
+                ai_faces_done: r.get("ai_faces_done"),
+                ai_clip_done: r.get("ai_clip_done"),
+                ai_tags_done: r.get("ai_tags_done"),
+                ai_poses_done: r.get("ai_poses_done"),
             };
 
             sqlx::query(
@@ -216,6 +295,55 @@ impl JobRepo {
         } else {
             Ok(None)
         }
+    }
+
+    /// Atomically updates granular AI sub-task flags and sets the overall status.
+    /// If all configured features are now done, it marks the job 'completed'. Otherwise, it marks it 'pending'
+    /// so any remaining components can run when their toggles are enabled.
+    pub async fn update_ai_checkpoints(
+        pool: &SqlitePool,
+        job_id: &str,
+        faces_done: bool,
+        clip_done: bool,
+        tags_done: bool,
+        poses_done: bool,
+        require_faces: bool,
+        require_clip: bool,
+        require_tags: bool,
+        require_poses: bool,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            r#"
+            UPDATE processing_jobs
+            SET ai_faces_done = CASE WHEN ?1 = 1 THEN 1 ELSE ai_faces_done END,
+                ai_clip_done  = CASE WHEN ?2 = 1 THEN 1 ELSE ai_clip_done END,
+                ai_tags_done  = CASE WHEN ?3 = 1 THEN 1 ELSE ai_tags_done END,
+                ai_poses_done = CASE WHEN ?4 = 1 THEN 1 ELSE ai_poses_done END,
+                status = CASE
+                    WHEN (?5 = 0 OR ?1 = 1 OR ai_faces_done = 1)
+                     AND (?6 = 0 OR ?2 = 1 OR ai_clip_done = 1)
+                     AND (?7 = 0 OR ?3 = 1 OR ai_tags_done = 1)
+                     AND (?8 = 0 OR ?4 = 1 OR ai_poses_done = 1)
+                    THEN 'completed'
+                    ELSE 'pending'
+                END,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?9
+            "#,
+        )
+        .bind(if faces_done { 1 } else { 0 })
+        .bind(if clip_done { 1 } else { 0 })
+        .bind(if tags_done { 1 } else { 0 })
+        .bind(if poses_done { 1 } else { 0 })
+        .bind(if require_faces { 1 } else { 0 })
+        .bind(if require_clip { 1 } else { 0 })
+        .bind(if require_tags { 1 } else { 0 })
+        .bind(if require_poses { 1 } else { 0 })
+        .bind(job_id)
+        .execute(pool)
+        .await?;
+
+        Ok(())
     }
 
     pub async fn mark_completed(pool: &SqlitePool, job_id: &str) -> Result<(), sqlx::Error> {

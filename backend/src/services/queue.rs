@@ -46,6 +46,11 @@ impl QueueService {
             assemble_concurrency = 1,
             thumb_concurrency = concurrency,
             ai_concurrency = 1,
+            ai_globally_enabled = state.config.ai.enabled,
+            ai_faces = state.config.ai.enable_faces,
+            ai_clip = state.config.ai.enable_clip,
+            ai_tags = state.config.ai.enable_tags,
+            ai_poses = state.config.ai.enable_poses,
             "Three-stage push-driven mpsc media pipeline active with upload pause gate"
         );
 
@@ -225,6 +230,10 @@ impl QueueService {
                         job_type: "thumbnail".to_string(),
                         file_size_bytes,
                         payload: job.payload,
+                        ai_faces_done: 0,
+                        ai_clip_done: 0,
+                        ai_tags_done: 0,
+                        ai_poses_done: 0,
                     };
 
                     // Persist to WAL
@@ -357,6 +366,10 @@ impl QueueService {
                             job_type: "ai_enrichment".to_string(),
                             file_size_bytes: job.file_size_bytes,
                             payload: job.payload,
+                            ai_faces_done: 0,
+                            ai_clip_done: 0,
+                            ai_tags_done: 0,
+                            ai_poses_done: 0,
                         };
 
                         let _ = JobRepo::enqueue(&pool, &ai_job).await;
@@ -367,25 +380,51 @@ impl QueueService {
         }
 
         // =========================================================================
-        // WORKER 2: Low-Priority Background AI Enrichment (Strict Concurrency = 1)
+        // WORKER 2: Config-Gated Background AI Enrichment (Strict Concurrency = 1)
         // =========================================================================
         {
             let pool = pool.clone();
             let storage_root = storage_root.clone();
             let coordinator = coordinator.clone();
             let tx_events = tx_events.clone();
+            let config_ai = state.config.ai.clone();
             let mut pause_rx = pause_rx.clone();
 
             tokio::spawn(async move {
                 while let Some(job) = ai_rx.recv().await {
-                    // PAUSE GATE: Heavy AI tensor inference yields immediately to uploads
-                    if *pause_rx.borrow() {
-                        let _ = pause_rx.wait_for(|paused| !*paused).await;
-                    }
-
                     let job_id = job.id.clone();
                     let asset_id = job.asset_id.clone();
                     let user_id = job.user_id.clone();
+
+                    // 1. If AI is globally disabled, skip entirely and leave checkpoints as 0
+                    if !config_ai.enabled {
+                        info!(asset_id = %asset_id, "AI globally disabled: leaving enrichment pending");
+                        // We mark failed or keep pending so backfill scanner picks it up when turned back on
+                        let _ = sqlx::query(
+                            "UPDATE processing_jobs SET status = 'pending', updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                        )
+                        .bind(&job_id)
+                        .execute(&pool)
+                        .await;
+                        continue;
+                    }
+
+                    // 2. Identify remaining work based on config toggles AND prior job checkpoints
+                    let need_faces = config_ai.enable_faces && job.ai_faces_done == 0;
+                    let need_clip = config_ai.enable_clip && job.ai_clip_done == 0;
+                    let need_tags = config_ai.enable_tags && job.ai_tags_done == 0;
+                    let need_poses = config_ai.enable_poses && job.ai_poses_done == 0;
+
+                    // If everything configured is already done for this asset, finalize and proceed
+                    if !need_faces && !need_clip && !need_tags && !need_poses {
+                        let _ = JobRepo::mark_completed(&pool, &job_id).await;
+                        continue;
+                    }
+
+                    // PAUSE GATE: Yield tensor inference immediately during active network uploads
+                    if *pause_rx.borrow() {
+                        let _ = pause_rx.wait_for(|paused| !*paused).await;
+                    }
 
                     let media_engine = match coordinator.ensure_pipeline_engine().await {
                         Ok(e) => e,
@@ -413,9 +452,11 @@ impl QueueService {
 
                     coordinator.keep_warm().await;
 
-                    let known_clusters = {
+                    let known_clusters = if need_faces {
                         let read_guard = cluster_cache.read().await;
                         read_guard.get(&user_id).cloned().unwrap_or_default()
+                    } else {
+                        Vec::new()
                     };
 
                     let user_thumbs_dir = storage_root.join("users").join(&user_id).join("thumbs");
@@ -433,25 +474,44 @@ impl QueueService {
                     })
                     .await;
 
-                    let ai_result = match phase2_res {
+                    let mut ai_result = match phase2_res {
                         Ok(Ok(data)) => data,
                         Ok(Err(e)) => {
                             warn!("AI inference skipped/failed on {}: {}", asset_id, e);
-                            let _ = JobRepo::mark_completed(&pool, &job_id).await;
+                            let _ = JobRepo::mark_failed(&pool, &job_id, &e.to_string()).await;
                             continue;
                         }
                         Err(join_err) => {
                             warn!("AI inference panic on {}: {}", asset_id, join_err);
-                            let _ = JobRepo::mark_completed(&pool, &job_id).await;
+                            let _ = JobRepo::mark_failed(&pool, &job_id, &join_err.to_string()).await;
                             continue;
                         }
                     };
 
-                    // Face clustering updates
+                    // 3. Filter outputs according to what was requested and not yet done
+                    if !need_faces {
+                        ai_result.detected_faces.clear();
+                        ai_result.new_persons.clear();
+                        ai_result.updated_clusters.clear();
+                    }
+
+                    if !need_tags {
+                        ai_result.tags.clear();
+                    }
+
+                    if !need_clip {
+                        ai_result.clip_embedding = None;
+                    }
+
+                    if !need_poses {
+                        ai_result.poses.clear();
+                    }
+
+                    // Face clustering updates (if faces were processed)
                     let mut affected_ids: Vec<String> = Vec::new();
                     let new_people_count = ai_result.new_persons.len();
 
-                    if !ai_result.new_persons.is_empty() || !ai_result.updated_clusters.is_empty() {
+                    if need_faces && (!ai_result.new_persons.is_empty() || !ai_result.updated_clusters.is_empty()) {
                         let mut write_guard = cluster_cache.write().await;
                         let user_bucket = write_guard.entry(user_id.clone()).or_default();
 
@@ -482,22 +542,24 @@ impl QueueService {
                         }
                     }
 
-                    // SIMD CLIP vector cache update
-                    if let Some(ref embedding_vec) = ai_result.clip_embedding {
-                        if embedding_vec.len() == media_processing::EMBEDDING_DIM {
-                            let mut emb_array = [0.0f32; media_processing::EMBEDDING_DIM];
-                            emb_array.copy_from_slice(embedding_vec);
+                    // SIMD CLIP vector cache update (if CLIP was processed)
+                    if need_clip {
+                        if let Some(ref embedding_vec) = ai_result.clip_embedding {
+                            if embedding_vec.len() == media_processing::EMBEDDING_DIM {
+                                let mut emb_array = [0.0f32; media_processing::EMBEDDING_DIM];
+                                emb_array.copy_from_slice(embedding_vec);
 
-                            if let Ok(Some(meta)) = AssetRepo::get_cache_metadata(&pool, &asset_id, &user_id).await {
-                                clip_cache
-                                    .insert(media_processing::CachedEmbedding {
-                                        id: job.asset_id.clone(),
-                                        user_id: job.user_id.clone(),
-                                        thumb_path: meta.thumb_path,
-                                        mime_type: meta.mime_type,
-                                        embedding: emb_array,
-                                    })
-                                    .await;
+                                if let Ok(Some(meta)) = AssetRepo::get_cache_metadata(&pool, &asset_id, &user_id).await {
+                                    clip_cache
+                                        .insert(media_processing::CachedEmbedding {
+                                            id: job.asset_id.clone(),
+                                            user_id: job.user_id.clone(),
+                                            thumb_path: meta.thumb_path,
+                                            mime_type: meta.mime_type,
+                                            embedding: emb_array,
+                                        })
+                                        .await;
+                                }
                             }
                         }
                     }
@@ -505,14 +567,28 @@ impl QueueService {
                     let detected_faces_count = ai_result.detected_faces.len();
                     let tags_count = ai_result.tags.len();
 
+                    // Persist enriched metadata
                     if let Err(e) = Self::commit_ai_enrichment(&pool, &job, ai_result).await {
                         warn!("Failed persisting AI metadata for {}: {}", job.asset_id, e);
                     }
 
-                    let _ = JobRepo::mark_completed(&pool, &job_id).await;
+                    // 4. Update checkpoints in DB atomically
+                    let _ = JobRepo::update_ai_checkpoints(
+                        &pool,
+                        &job_id,
+                        need_faces,
+                        need_clip,
+                        need_tags,
+                        need_poses,
+                        config_ai.enable_faces,
+                        config_ai.enable_clip,
+                        config_ai.enable_tags,
+                        config_ai.enable_poses,
+                    )
+                    .await;
+
                     coordinator.keep_warm().await;
 
-                    // 1. Broadcast people/face changes if new faces/persons were identified or updated
                     if !affected_ids.is_empty() {
                         let _ = tx_events.send(WsMediaEvent::PeopleUpdated {
                             user_id: user_id.clone(),
@@ -521,14 +597,13 @@ impl QueueService {
                         });
                     }
 
-                    // 2. Broadcast complete AI enrichment outcome
                     let _ = tx_events.send(WsMediaEvent::AiCompleted {
                         asset_id: job.asset_id.clone(),
                         faces_detected: detected_faces_count,
                         tags_count,
                     });
 
-                    info!(id = %job.asset_id, user_id = %job.user_id, "Asset fully indexed with AI");
+                    info!(id = %job.asset_id, user_id = %job.user_id, "Granular AI sub-tasks executed and committed");
                 }
             });
         }

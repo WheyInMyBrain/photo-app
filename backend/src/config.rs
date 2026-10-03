@@ -21,6 +21,15 @@ impl B2Config {
 }
 
 #[derive(Clone, Debug)]
+pub struct AiConfig {
+    pub enabled: bool,
+    pub enable_faces: bool,
+    pub enable_tags: bool,
+    pub enable_clip: bool,
+    pub enable_poses: bool,
+}
+
+#[derive(Clone, Debug)]
 pub struct Config {
     pub server_host: String,
     pub server_port: u16,
@@ -31,6 +40,7 @@ pub struct Config {
     pub allow_registration: bool,
     pub b2: B2Config,
     pub downloader: DownloaderConfig,
+    pub ai: AiConfig,
 }
 
 impl Config {
@@ -110,6 +120,40 @@ impl Config {
             ig_csrf_token: std::env::var("IG_CSRF_TOKEN").ok().filter(|s| !s.trim().is_empty()),
         };
 
+        // 9. AI config
+        let ai_enabled = std::env::var("ENABLE_AI")
+            .unwrap_or_else(|_| "true".to_string())
+            .parse::<bool>()
+            .unwrap_or(true);
+
+        let enable_faces = std::env::var("ENABLE_AI_FACES")
+            .unwrap_or_else(|_| "true".to_string())
+            .parse::<bool>()
+            .unwrap_or(true);
+
+        let enable_tags = std::env::var("ENABLE_AI_TAGS")
+            .unwrap_or_else(|_| "true".to_string())
+            .parse::<bool>()
+            .unwrap_or(true);
+
+        let enable_clip = std::env::var("ENABLE_AI_CLIP")
+            .unwrap_or_else(|_| "true".to_string())
+            .parse::<bool>()
+            .unwrap_or(true);
+
+        let enable_poses = std::env::var("ENABLE_AI_POSES")
+            .unwrap_or_else(|_| "false".to_string())
+            .parse::<bool>()
+            .unwrap_or(false);
+
+        let ai = AiConfig {
+            enabled: ai_enabled,
+            enable_faces,
+            enable_tags,
+            enable_clip,
+            enable_poses,
+        };
+
         Self {
             server_host,
             server_port,
@@ -120,6 +164,7 @@ impl Config {
             allow_registration,
             b2,
             downloader,
+            ai,
         }
     }
 }

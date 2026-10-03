@@ -89,7 +89,7 @@ function appendDailySections(current: DailyMediaSection[], incoming: DailyMediaS
   for (const inc of incoming) {
     if (cloned.length > 0) {
       const last = cloned[cloned.length - 1];
-      // If the incoming chunk starts with the exact same date as our last item, merge items
+      // If the incoming slice shares the same date, merge items
       if ((last.id && inc.id && last.id === inc.id) || last.title === inc.title) {
         last.items = [...last.items, ...inc.items];
         continue;
@@ -117,7 +117,6 @@ export function createTimelineStore() {
   async function fetchMedia(queryString = '', reset = false) {
     if (!browser) return;
 
-    // Invalidate any in-flight requests and assign an incrementing sequence ID
     const requestId = ++currentRequestId;
 
     if (reset) {
@@ -125,7 +124,7 @@ export function createTimelineStore() {
       nextCapturedAt = null;
       nextId = null;
       hasMore.set(true);
-      // STALE-WHILE-REVALIDATE: Retain old sections until new ones resolve
+      // STALE-WHILE-REVALIDATE: Don't wipe sections.set([]) here to prevent UI flash
     }
 
     pageAbortCtrl = new AbortController();
@@ -141,7 +140,6 @@ export function createTimelineStore() {
 
       const res = await fetch(`/api/media?${params.toString()}`, { signal: pageAbortCtrl.signal });
 
-      // Discard stale or superseded responses
       if (requestId !== currentRequestId) return;
 
       if (res.status === 401) {
@@ -176,6 +174,48 @@ export function createTimelineStore() {
     }
   }
 
+  /**
+   * Jumps the timeline cursor directly to a historical date milestone (e.g. from scrubber or filter)
+   */
+  async function jumpToDate(capturedAtIso: string, queryString = '') {
+    if (!browser) return;
+    const requestId = ++currentRequestId;
+    if (pageAbortCtrl) pageAbortCtrl.abort();
+
+    pageAbortCtrl = new AbortController();
+    isLoading.set(true);
+    hasMore.set(true);
+
+    try {
+      const params = new URLSearchParams(queryString.replace(/^\?/, ''));
+      params.set('limit', '60');
+      params.set('cursor_captured_at', capturedAtIso);
+
+      const res = await fetch(`/api/media?${params.toString()}`, { signal: pageAbortCtrl.signal });
+      if (requestId !== currentRequestId) return;
+
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data: MediaPageResponse = await res.json();
+      if (requestId !== currentRequestId) return;
+
+      const dailySections = repartitionIntoDailySections(data.sections ?? []);
+      sections.set(dailySections);
+      albums.set(data.albums ?? []);
+
+      nextCapturedAt = data.next_cursor_captured_at;
+      nextId = data.next_cursor_id;
+      hasMore.set(data.has_more);
+    } catch (err: any) {
+      if (err?.name !== 'AbortError' && requestId === currentRequestId) {
+        console.error('Timeline jump error:', err);
+      }
+    } finally {
+      if (requestId === currentRequestId) {
+        isLoading.set(false);
+      }
+    }
+  }
+
   function patchFavorite(coords: [number, number], isFav: boolean) {
     sections.update((curr) => {
       const [s, i] = coords;
@@ -197,6 +237,7 @@ export function createTimelineStore() {
     isLoading,
     hasMore,
     fetchMedia,
+    jumpToDate,
     patchFavorite,
     destroy
   };

@@ -225,6 +225,10 @@ pub async fn upload_photo(
                     job_type: "assemble".to_string(),
                     file_size_bytes: total_bytes,
                     payload: None,
+                    ai_faces_done: 0,
+                    ai_clip_done: 0,
+                    ai_tags_done: 0,
+                    ai_poses_done: 0,
                 };
 
                 let batch_id_opt = query.batch_id.as_deref();
@@ -437,6 +441,10 @@ pub async fn upload_ingest(
         job_type: "assemble".to_string(),
         file_size_bytes: body.len() as i64,
         payload: None,
+        ai_faces_done: 0,
+        ai_clip_done: 0,
+        ai_tags_done: 0,
+        ai_poses_done: 0,
     };
 
     let batch_id_opt = query.batch_id.as_deref();
@@ -579,6 +587,10 @@ pub async fn finalize_chunk(
         job_type: "assemble".to_string(),
         file_size_bytes: 0,
         payload: None,
+        ai_faces_done: 0,
+        ai_clip_done: 0,
+        ai_tags_done: 0,
+        ai_poses_done: 0,
     };
 
     let batch_id_opt = query.batch_id.as_deref();
@@ -1022,6 +1034,10 @@ async fn execute_item_downloads(
             job_type: "assemble".to_string(),
             file_size_bytes,
             payload: Some(job_payload),
+            ai_faces_done: 0,
+            ai_clip_done: 0,
+            ai_tags_done: 0,
+            ai_poses_done: 0,
         };
 
         // Write durable WAL entry in SQLite

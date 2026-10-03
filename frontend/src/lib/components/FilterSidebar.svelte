@@ -14,6 +14,64 @@
   }>();
 
   $: filters = $filterOptionsStore;
+
+  // --- Dual-Range Slider State & Helpers ---
+  function parseToTimestamp(dateStr?: string | null): number | null {
+    if (!dateStr) return null;
+    const t = new Date(dateStr).getTime();
+    return isNaN(t) ? null : t;
+  }
+
+  function formatTimestampToIso(ts: number): string {
+    const d = new Date(ts);
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+  }
+
+  function formatDisplayDate(dateStr?: string | null): string {
+    if (!dateStr) return '--';
+    const d = new Date(dateStr);
+    if (isNaN(d.getTime())) return dateStr;
+    return d.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+  }
+
+  $: libMinTs = parseToTimestamp(filters.min_date);
+  $: libMaxTs = parseToTimestamp(filters.max_date);
+
+  // If min and max are the same day, add 1 day so range isn't 0
+  $: totalSpan = libMinTs && libMaxTs ? Math.max(86_400_000, libMaxTs - libMinTs) : 0;
+
+  $: currentFromTs = parseToTimestamp($filterStore.from) ?? libMinTs ?? 0;
+  $: currentToTs = parseToTimestamp($filterStore.to) ?? libMaxTs ?? 0;
+
+  // Percentage positions (0% to 100%)
+  $: minPercent =
+    totalSpan > 0 && libMinTs !== null
+      ? Math.max(0, Math.min(100, ((currentFromTs - libMinTs) / totalSpan) * 100))
+      : 0;
+
+  $: maxPercent =
+    totalSpan > 0 && libMinTs !== null
+      ? Math.max(0, Math.min(100, ((currentToTs - libMinTs) / totalSpan) * 100))
+      : 100;
+
+  function handleMinSliderInput(e: Event) {
+    if (libMinTs === null || totalSpan === 0) return;
+    const val = parseFloat((e.currentTarget as HTMLInputElement).value);
+    const newFromTs = Math.min(libMinTs + (val / 100) * totalSpan, currentToTs - 86_400_000);
+    filterStore.setFrom(formatTimestampToIso(newFromTs));
+  }
+
+  function handleMaxSliderInput(e: Event) {
+    if (libMinTs === null || totalSpan === 0) return;
+    const val = parseFloat((e.currentTarget as HTMLInputElement).value);
+    const newToTs = Math.max(libMinTs + (val / 100) * totalSpan, currentFromTs + 86_400_000);
+    filterStore.setTo(formatTimestampToIso(newToTs));
+  }
+
+  function resetDateRange() {
+    filterStore.setFrom('');
+    filterStore.setTo('');
+  }
 </script>
 
 <!-- Backdrop with blur -->
@@ -127,6 +185,91 @@
       {/if}
     </button>
 
+    <!-- Squeezable Period Dual Range Slider -->
+    {#if filters.min_date && filters.max_date}
+      <div class="space-y-2 pt-1">
+        <div class="flex items-center justify-between pl-1 pr-0.5">
+          <span class="text-[9px] uppercase tracking-wider font-semibold text-[var(--text-muted)]">Time Period</span>
+          {#if $filterStore.from ||$filterStore.to}
+            <button
+              type="button"
+              on:click={resetDateRange}
+              class="text-[9px] text-purple-500 hover:text-purple-400 font-medium transition-colors cursor-pointer"
+            >
+              Reset Span
+            </button>
+          {/if}
+        </div>
+
+        <!-- Range Badges: Displays the active squeezed window -->
+        <div class="flex items-center justify-between text-[11px] font-mono text-[var(--text-main)] px-1">
+          <span class="bg-[var(--pill-bg)] px-2 py-0.5 rounded-md border border-[var(--border-glass)]">
+            {formatDisplayDate($filterStore.from || filters.min_date)}
+          </span>
+          <span class="text-[10px] text-[var(--text-muted)] font-sans">to</span>
+          <span class="bg-[var(--pill-bg)] px-2 py-0.5 rounded-md border border-[var(--border-glass)]">
+            {formatDisplayDate($filterStore.to || filters.max_date)}
+          </span>
+        </div>
+
+        <!-- Squeezable Dual-Thumb Track Container -->
+        <div class="relative h-6 flex items-center px-1">
+          <!-- Background Inactive Track -->
+          <div class="absolute left-1 right-1 h-1.5 rounded-full bg-[var(--pill-bg)] border border-[var(--border-glass)] pointer-events-none"></div>
+
+          <!-- Highlighted Active Squeezed Track -->
+          <div
+            style="left: calc({minPercent}%); width: calc({Math.max(0, maxPercent - minPercent)}%);"
+            class="absolute h-1.5 rounded-full bg-purple-500 shadow-[0_0_8px_rgba(168,85,247,0.5)] pointer-events-none"
+          ></div>
+
+          <!-- Left Thumb: Drag forward to contract start period -->
+          <input
+            type="range"
+            min="0"
+            max="100"
+            step="0.5"
+            value={minPercent}
+            on:input={handleMinSliderInput}
+            aria-label="Filter start date"
+            class="dual-range-input z-20"
+          />
+
+          <!-- Right Thumb: Drag backward to contract end period -->
+          <input
+            type="range"
+            min="0"
+            max="100"
+            step="0.5"
+            value={maxPercent}
+            on:input={handleMaxSliderInput}
+            aria-label="Filter end date"
+            class="dual-range-input z-30"
+          />
+        </div>
+
+        <!-- Native Date Inputs for Precision -->
+        <div class="grid grid-cols-2 gap-2 pt-0.5">
+          <input
+            type="date"
+            value={$filterStore.from || filters.min_date}
+            min={filters.min_date}
+            max={$filterStore.to || filters.max_date}
+            on:change={(e) => filterStore.setFrom(e.currentTarget.value)}
+            class="liquid-input text-[11px] text-[var(--text-main)] rounded-xl px-2.5 py-1.5 outline-none w-full"
+          />
+          <input
+            type="date"
+            value={$filterStore.to || filters.max_date}
+            min={$filterStore.from || filters.min_date}
+            max={filters.max_date}
+            on:change={(e) => filterStore.setTo(e.currentTarget.value)}
+            class="liquid-input text-[11px] text-[var(--text-main)] rounded-xl px-2.5 py-1.5 outline-none w-full"
+          />
+        </div>
+      </div>
+    {/if}
+
     <!-- Album / Folder Selector -->
     {#if filters.albums.length > 0}
       <div class="space-y-1.5 pt-1">
@@ -143,29 +286,6 @@
         </select>
       </div>
     {/if}
-
-    <!-- Date Range Bounds -->
-    <div class="space-y-1.5 pt-1">
-      <span class="text-[9px] uppercase tracking-wider font-semibold text-[var(--text-muted)] block pl-1">Date Range</span>
-      <div class="grid grid-cols-2 gap-2">
-        <input
-          type="date"
-          value={$filterStore.from}
-          min={filters.min_date ?? ''}
-          max={filters.max_date ?? ''}
-          on:change={(e) => filterStore.setFrom(e.currentTarget.value)}
-          class="liquid-input text-[11px] text-[var(--text-main)] rounded-xl px-2.5 py-1.5 outline-none w-full"
-        />
-        <input
-          type="date"
-          value={$filterStore.to}
-          min={filters.min_date ?? ''}
-          max={filters.max_date ?? ''}
-          on:change={(e) => filterStore.setTo(e.currentTarget.value)}
-          class="liquid-input text-[11px] text-[var(--text-main)] rounded-xl px-2.5 py-1.5 outline-none w-full"
-        />
-      </div>
-    </div>
 
     <!-- People Filter Chips -->
     {#if filters.people.length > 0}
@@ -371,7 +491,7 @@
   .liquid-icon-btn {
     background: var(--card-bg);
     border: 1px solid var(--card-border);
-    box-shadow: inset 0 1px 0 var(--border-specular);
+    box-shadow: inset 0 1px 0 0 var(--border-specular);
   }
 
   .liquid-icon-btn:hover {
@@ -418,5 +538,52 @@
     background: rgba(244, 63, 94, 0.12);
     border: 1px solid rgba(244, 63, 94, 0.28);
     box-shadow: 0 2px 10px rgba(244, 63, 94, 0.12);
+  }
+
+  /* Dual Range Overlapping Sliders */
+  .dual-range-input {
+    position: absolute;
+    left: 0;
+    right: 0;
+    width: 100%;
+    margin: 0;
+    pointer-events: none;
+    -webkit-appearance: none;
+    appearance: none;
+    background: transparent;
+  }
+
+  .dual-range-input::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    appearance: none;
+    pointer-events: auto;
+    width: 16px;
+    height: 16px;
+    border-radius: 50%;
+    background: #a855f7;
+    border: 2px solid #ffffff;
+    box-shadow: 0 2px 6px rgba(0, 0, 0, 0.35);
+    cursor: ew-resize;
+    transition: transform 0.15s ease;
+  }
+
+  .dual-range-input::-webkit-slider-thumb:hover {
+    transform: scale(1.18);
+  }
+
+  .dual-range-input::-moz-range-thumb {
+    pointer-events: auto;
+    width: 16px;
+    height: 16px;
+    border-radius: 50%;
+    background: #a855f7;
+    border: 2px solid #ffffff;
+    box-shadow: 0 2px 6px rgba(0, 0, 0, 0.35);
+    cursor: ew-resize;
+    transition: transform 0.15s ease;
+  }
+
+  .dual-range-input::-moz-range-thumb:hover {
+    transform: scale(1.18);
   }
 </style>
