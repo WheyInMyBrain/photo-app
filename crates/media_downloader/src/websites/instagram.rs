@@ -27,12 +27,6 @@ const GQL_POST_DOC_ID: &str = "10015901848480474";
 const PROFILE_INITIAL_DOC_ID: &str = "28991540097136703";
 const PROFILE_PAGINATION_DOC_ID: &str = "29240983615539641";
 
-// Meta Session Security Defaults
-const DEFAULT_LSD: &str = "yXrreD4HnOCuW_Brhb9Frt";
-const DEFAULT_FB_DTSG: &str =
-    "NAfwiJgsDYGImSPXcVbvUbTQWQia1OnODE6bLPa65xhWpD1oojf_TSw:17843683195144578:1791138983";
-const DEFAULT_JAZOEST: &str = "26404";
-
 pub struct InstagramExtractor;
 
 impl Extractor for InstagramExtractor {
@@ -495,7 +489,27 @@ async fn extract_user_profile_feed(
         .context("Could not extract username from Instagram profile URL")?;
 
     let cookie = cfg.ig_cookie.as_deref().unwrap_or("");
-    let ds_user_id = extract_cookie_val(cookie, "ds_user_id").unwrap_or_else(|| "0".to_string());
+    let csrf_token = cfg
+        .ig_csrf_token
+        .clone()
+        .or_else(|| extract_cookie_val(cookie, "csrftoken"))
+        .unwrap_or_default();
+
+    let lsd = cfg
+        .ig_lsd
+        .clone()
+        .unwrap_or_else(|| csrf_token.clone());
+
+    let dtsg = cfg
+        .ig_fb_dtsg
+        .clone()
+        .unwrap_or_default();
+
+    let jazoest = compute_jazoest(&dtsg);
+
+    let ds_user_id = extract_cookie_val(cookie, "ds_user_id")
+        .or_else(|| extract_cookie_val(cookie, "sessionid").and_then(|s| s.split(':').next().map(|v| v.to_string())))
+        .unwrap_or_else(|| "0".to_string());
 
     let mut items = Vec::new();
     let mut discovered_post_urls = Vec::new();
@@ -551,10 +565,10 @@ async fn extract_user_profile_feed(
 
         let raw_vars = variables.to_string();
         let encoded_vars = urlencoding::encode(&raw_vars);
-        let encoded_dtsg = urlencoding::encode(DEFAULT_FB_DTSG);
+        let encoded_dtsg = urlencoding::encode(&dtsg);
 
         let form_body = format!(
-            "av={ds_user_id}&__d=www&__user=0&__a=1&__req=6&dpr=2&__comet_req=7&fb_dtsg={encoded_dtsg}&jazoest={DEFAULT_JAZOEST}&lsd={DEFAULT_LSD}&fb_api_caller_class=RelayModern&fb_api_req_friendly_name={friendly_name}&server_timestamps=true&doc_id={doc_id}&variables={encoded_vars}"
+            "av={ds_user_id}&__d=www&__user=0&__a=1&__req=6&dpr=2&__comet_req=7&fb_dtsg={encoded_dtsg}&jazoest={jazoest}&lsd={lsd}&fb_api_caller_class=RelayModern&fb_api_req_friendly_name={friendly_name}&server_timestamps=true&doc_id={doc_id}&variables={encoded_vars}"
         );
 
         let resp = client
@@ -580,44 +594,68 @@ async fn extract_user_profile_feed(
             body = stripped.to_string();
         }
 
-        let payload: Value = serde_json::from_str(&body)?;
-        let connection = match payload.pointer("/data/xdt_api__v1__feed__user_timeline_graphql_connection") {
-            Some(c) => c,
-            None => {
+        let payload: Value = match serde_json::from_str(&body) {
+            Ok(val) => val,
+            Err(e) => {
                 if items.is_empty() {
-                    bail!("Failed to locate timeline connection in Instagram GraphQL response");
+                    bail!("Failed to parse Instagram GraphQL JSON: {e}. Raw: {}", &body[..body.len().min(200)]);
                 } else {
                     break;
                 }
             }
         };
 
-        let edges = match connection.get("edges").and_then(|e| e.as_array()) {
+        if let Some(err_code) = payload.get("error") {
+            let msg = payload.get("errorSummary").and_then(|s| s.as_str()).unwrap_or("unknown error");
+            if items.is_empty() {
+                bail!("Meta GraphQL error {err_code}: {msg}. Verify session cookies and credentials in .env.");
+            } else {
+                break;
+            }
+        }
+
+        let (edges, page_info) = if let Some(conn) = payload.pointer("/data/xdt_api__v1__feed__user_timeline_graphql_connection") {
+            (conn.get("edges").and_then(|e| e.as_array()), conn.get("page_info"))
+        } else if let Some(conn) = payload.pointer("/data/user/edge_owner_to_timeline_media") {
+            (conn.get("edges").and_then(|e| e.as_array()), conn.get("page_info"))
+        } else {
+            if items.is_empty() {
+                let debug_preview = &body[..body.len().min(300)];
+                bail!("Failed to locate timeline connection in GraphQL response. Preview: {debug_preview}");
+            } else {
+                break;
+            }
+        };
+
+        let raw_edges = match edges {
             Some(arr) if !arr.is_empty() => arr,
             _ => break,
         };
 
-        for edge in edges {
+        for edge in raw_edges {
             let node = edge.get("node").unwrap_or(edge);
-            if let Some(code) = node.get("code").and_then(|c| c.as_str()) {
+            if let Some(code) = node.get("code").or_else(|| node.get("shortcode")).and_then(|c| c.as_str()) {
                 discovered_post_urls.push(format!("https://www.instagram.com/p/{code}/"));
             }
 
-            let raw_nodes: Vec<&Value> =
-                if let Some(arr) = node.get("carousel_media").and_then(|c| c.as_array()) {
-                    arr.iter().collect()
-                } else {
-                    vec![node]
-                };
-
-            for item_node in raw_nodes {
-                if let Some(media_item) = parse_media_item(item_node) {
-                    items.push(media_item);
+            if let Some(media_item) = parse_media_item(node).or_else(|| parse_graphql_node(node)) {
+                items.push(media_item);
+            } else if let Some(carousels) = node.get("carousel_media").and_then(|c| c.as_array()) {
+                for c in carousels {
+                    if let Some(item) = parse_media_item(c) {
+                        items.push(item);
+                    }
+                }
+            } else if let Some(carousels) = node.pointer("/edge_sidecar_to_children/edges").and_then(|c| c.as_array()) {
+                for c in carousels {
+                    let child_node = c.get("node").unwrap_or(c);
+                    if let Some(item) = parse_graphql_node(child_node) {
+                        items.push(item);
+                    }
                 }
             }
         }
 
-        let page_info = connection.get("page_info");
         let has_next_page = page_info
             .and_then(|p| p.get("has_next_page"))
             .and_then(|b| b.as_bool())
@@ -764,7 +802,7 @@ async fn extract_direct_pk_links(
         published_at,
         tags: Vec::new(),
         items,
-        location,
+        location: None,
         next_page_url: None,
         discovered_post_urls: Vec::new(),
         embedded_player_urls: Vec::new(),
@@ -972,6 +1010,11 @@ fn build_auth_client(cfg: &DownloaderConfig) -> Result<Client> {
         .as_deref()
         .context("Missing ig_csrf_token in DownloaderConfig")?;
 
+    let lsd = cfg
+        .ig_lsd
+        .as_deref()
+        .unwrap_or(csrf);
+
     let mut headers = HeaderMap::new();
     headers.insert(USER_AGENT, HeaderValue::from_static(BROWSER_UA));
     headers.insert("X-IG-App-ID", HeaderValue::from_static(APP_ID));
@@ -984,9 +1027,17 @@ fn build_auth_client(cfg: &DownloaderConfig) -> Result<Client> {
     headers.insert("Sec-Fetch-Dest", HeaderValue::from_static("empty"));
     headers.insert("Sec-Fetch-Mode", HeaderValue::from_static("cors"));
     headers.insert("Sec-Fetch-Site", HeaderValue::from_static("same-origin"));
-    headers.insert("X-FB-LSD", HeaderValue::from_static(DEFAULT_LSD));
+    headers.insert("X-FB-LSD", HeaderValue::from_str(lsd)?);
 
     Ok(Client::builder().cookie_store(true).default_headers(headers).build()?)
+}
+
+fn compute_jazoest(dtsg: &str) -> String {
+    let mut total: u32 = 0;
+    for c in dtsg.chars() {
+        total = total.wrapping_add(c as u32);
+    }
+    format!("2{total}")
 }
 
 fn extract_cookie_val(cookie: &str, key: &str) -> Option<String> {
