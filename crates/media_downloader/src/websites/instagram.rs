@@ -802,7 +802,7 @@ async fn extract_direct_pk_links(
         published_at,
         tags: Vec::new(),
         items,
-        location: None,
+        location: location,
         next_page_url: None,
         discovered_post_urls: Vec::new(),
         embedded_player_urls: Vec::new(),
