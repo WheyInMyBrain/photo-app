@@ -1,22 +1,37 @@
 // src/websites/instagram.rs
 
+use crate::config::DownloaderConfig;
+use crate::models::{
+    ExtractedLocation, ExtractedMediaMetadata, MediaDimensions, MediaItem, MediaType, MediaVariant,
+};
 use crate::utils::page::extract_hashtags_from_text;
-use crate::models::{ExtractedLocation, ExtractedMediaMetadata, MediaDimensions, MediaItem, MediaType, MediaVariant};
 use crate::websites::Extractor;
 use anyhow::{bail, Context, Result};
-use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, COOKIE, REFERER, USER_AGENT};
+use reqwest::header::{
+    HeaderMap, HeaderValue, ACCEPT, CONTENT_TYPE, COOKIE, ORIGIN, REFERER, USER_AGENT,
+};
 use reqwest::Client;
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::collections::HashSet;
 use std::future::Future;
 use std::pin::Pin;
-
-use crate::config::DownloaderConfig;
+use std::time::Duration;
 
 const BROWSER_UA: &str =
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10.15; rv:155.0) Gecko/20100101 Firefox/155.0";
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/27.0.1 Safari/605.1.15";
 const APP_ID: &str = "936619743392459";
+const ASBD_ID: &str = "359341";
 const GQL_POST_DOC_ID: &str = "10015901848480474";
+
+// Document IDs for Profile Queries
+const PROFILE_INITIAL_DOC_ID: &str = "28991540097136703";
+const PROFILE_PAGINATION_DOC_ID: &str = "29240983615539641";
+
+// Meta Session Security Defaults
+const DEFAULT_LSD: &str = "yXrreD4HnOCuW_Brhb9Frt";
+const DEFAULT_FB_DTSG: &str =
+    "NAfwiJgsDYGImSPXcVbvUbTQWQia1OnODE6bLPa65xhWpD1oojf_TSw:17843683195144578:1791138983";
+const DEFAULT_JAZOEST: &str = "26404";
 
 pub struct InstagramExtractor;
 
@@ -39,10 +54,9 @@ pub async fn extract_instagram(
     input_url: &str,
     config: Option<&DownloaderConfig>,
 ) -> Result<ExtractedMediaMetadata> {
-    // 1. Check auth from the passed config struct, not std::env
     let has_auth = config.map_or(false, |c| c.has_instagram_auth());
 
-    // 2. Stories and Highlights strictly require session cookies
+    // 1. Stories and Highlights strictly require session cookies
     if input_url.contains("/stories/") {
         let cfg = config.context("DownloaderConfig required for Instagram stories")?;
         let auth_client = build_auth_client(cfg).context(
@@ -55,11 +69,11 @@ pub async fn extract_instagram(
         }
     }
 
-    // 3. Posts, Reels, and Carousels
+    // 2. Posts, Reels, and Carousels
     if input_url.contains("/p/") || input_url.contains("/reel/") || input_url.contains("/reels/") {
-        let shortcode = extract_shortcode(input_url).context("Could not extract Instagram shortcode")?;
+        let shortcode =
+            extract_shortcode(input_url).context("Could not extract Instagram shortcode")?;
 
-        // Priority 1: If credentials exist, run Mobile API for unthrottled master (e.g. 1276x720 + variants)
         if has_auth {
             if let Some(cfg) = config {
                 if let Ok(auth_client) = build_auth_client(cfg) {
@@ -70,33 +84,22 @@ pub async fn extract_instagram(
             }
         }
 
-        // Priority 2: Fallback to Public Web GraphQL (No cookies required)
         let guest_client = build_guest_client()?;
         if let Ok(meta) = fetch_graphql_post_info(shortcode, &guest_client).await {
             return Ok(meta);
         }
 
-        // Priority 3: Try mobile endpoint as guest
         return fetch_mobile_post_info(shortcode, &guest_client).await;
     }
 
-    // 4. Profile Grid Feed
-    if has_auth {
-        if let Some(cfg) = config {
-            if let Ok(auth_client) = build_auth_client(cfg) {
-                if let Ok(meta) = extract_user_profile_feed(input_url, &auth_client).await {
-                    return Ok(meta);
-                }
-            }
-        }
-    }
-
-    let guest_client = build_guest_client()?;
-    extract_user_profile_feed(input_url, &guest_client).await
+    // 3. Profile Grid Feed (Requires Authenticated GraphQL client)
+    let cfg = config.context("DownloaderConfig with active credentials required to scrape profile feed")?;
+    let auth_client = build_auth_client(cfg)?;
+    extract_user_profile_feed(input_url, cfg, &auth_client).await
 }
 
 // -----------------------------------------------------------------------------
-// Location Resolver: Parses embedded coords or hits /locations/{id}/info/
+// Location Resolver
 // -----------------------------------------------------------------------------
 async fn extract_and_resolve_location(
     loc_val: Option<&Value>,
@@ -116,7 +119,6 @@ async fn extract_and_resolve_location(
         .or_else(|| loc.get("id"))
         .map(|v| v.to_string().trim_matches('"').to_string());
 
-    // If coordinates are missing from the post node, fetch them via the location info API
     if (latitude.is_none() || longitude.is_none()) && location_id.is_some() {
         if let Some(ref lid) = location_id {
             let loc_api = format!("https://www.instagram.com/api/v1/locations/{lid}/info/");
@@ -149,7 +151,7 @@ async fn extract_and_resolve_location(
 }
 
 // -----------------------------------------------------------------------------
-// Mobile /info/ API (Highest Master Quality + Full Variant List)
+// Mobile /info/ API
 // -----------------------------------------------------------------------------
 async fn fetch_mobile_post_info(shortcode: &str, client: &Client) -> Result<ExtractedMediaMetadata> {
     let media_id = shortcode_to_id(shortcode)?;
@@ -191,11 +193,12 @@ async fn fetch_mobile_post_info(shortcode: &str, client: &Client) -> Result<Extr
 
     let tags = extract_hashtags_from_text(&caption);
 
-    let raw_nodes: Vec<&Value> = if let Some(arr) = item.get("carousel_media").and_then(|c| c.as_array()) {
-        arr.iter().collect()
-    } else {
-        vec![item]
-    };
+    let raw_nodes: Vec<&Value> =
+        if let Some(arr) = item.get("carousel_media").and_then(|c| c.as_array()) {
+            arr.iter().collect()
+        } else {
+            vec![item]
+        };
 
     let mut items = Vec::new();
     for node in raw_nodes {
@@ -229,7 +232,7 @@ async fn fetch_mobile_post_info(shortcode: &str, client: &Client) -> Result<Extr
 }
 
 // -----------------------------------------------------------------------------
-// Public Web GraphQL Query (Zero-Cookie Fallback)
+// Public Web GraphQL Query (Zero-Cookie Fallback for single post)
 // -----------------------------------------------------------------------------
 async fn fetch_graphql_post_info(shortcode: &str, client: &Client) -> Result<ExtractedMediaMetadata> {
     let gql_url = format!(
@@ -267,8 +270,10 @@ async fn fetch_graphql_post_info(shortcode: &str, client: &Client) -> Result<Ext
     let tags = extract_hashtags_from_text(&caption);
 
     let mut items = Vec::new();
-
-    if let Some(edges) = media.pointer("/edge_sidecar_to_children/edges").and_then(|e| e.as_array()) {
+    if let Some(edges) = media
+        .pointer("/edge_sidecar_to_children/edges")
+        .and_then(|e| e.as_array())
+    {
         for edge in edges {
             if let Some(node) = edge.get("node") {
                 if let Some(item) = parse_graphql_node(node) {
@@ -474,9 +479,13 @@ async fn extract_highlight_links(input_url: &str, client: &Client) -> Result<Ext
 }
 
 // -----------------------------------------------------------------------------
-// User Profile Feed (Full Pagination Loop)
+// User Profile Feed (Full GraphQL Pagination Loop)
 // -----------------------------------------------------------------------------
-async fn extract_user_profile_feed(input_url: &str, client: &Client) -> Result<ExtractedMediaMetadata> {
+async fn extract_user_profile_feed(
+    input_url: &str,
+    cfg: &DownloaderConfig,
+    client: &Client,
+) -> Result<ExtractedMediaMetadata> {
     let parsed_url = reqwest::Url::parse(input_url)?;
     let clean_path = parsed_url.path().trim_matches('/');
     let username = clean_path
@@ -485,68 +494,146 @@ async fn extract_user_profile_feed(input_url: &str, client: &Client) -> Result<E
         .filter(|s| !s.is_empty() && *s != "explore" && *s != "direct")
         .context("Could not extract username from Instagram profile URL")?;
 
+    let cookie = cfg.ig_cookie.as_deref().unwrap_or("");
+    let ds_user_id = extract_cookie_val(cookie, "ds_user_id").unwrap_or_else(|| "0".to_string());
+
     let mut items = Vec::new();
     let mut discovered_post_urls = Vec::new();
-    let mut current_max_id: Option<String> = None;
+    let mut cursor: Option<String> = None;
     let mut page_count = 0;
     const MAX_PAGES: usize = 100;
 
     loop {
         page_count += 1;
-        let mut api_url = format!("https://www.instagram.com/api/v1/feed/user/{username}/username/?count=12");
-        if let Some(ref mid) = current_max_id {
-            api_url = format!("{api_url}&max_id={mid}");
-        }
+
+        let (doc_id, friendly_name, variables) = if let Some(ref c) = cursor {
+            (
+                PROFILE_PAGINATION_DOC_ID,
+                "PolarisProfilePostsTabContentQuery_connection",
+                json!({
+                    "after": c,
+                    "before": null,
+                    "first": 12,
+                    "last": null,
+                    "username": username,
+                    "data": {
+                        "count": 12,
+                        "include_reel_media_seen_timestamp": true,
+                        "include_relationship_info": true,
+                        "latest_besties_reel_media": true,
+                        "latest_reel_media": true
+                    },
+                    "include_multi_captions": false,
+                    "__relay_internal__pv__PolarisMultiCaptionCarouselEnabledrelayprovider": false,
+                    "__relay_internal__pv__PolarisShortDramaEnabledrelayprovider": false,
+                    "__relay_internal__pv__PolarisReelsRecoDebugOverlayEnabledrelayprovider": false
+                }),
+            )
+        } else {
+            (
+                PROFILE_INITIAL_DOC_ID,
+                "PolarisProfilePostsQuery",
+                json!({
+                    "username": username,
+                    "data": {
+                        "count": 12,
+                        "include_reel_media_seen_timestamp": true,
+                        "include_relationship_info": true,
+                        "latest_besties_reel_media": true,
+                        "latest_reel_media": true
+                    },
+                    "__relay_internal__pv__PolarisMultiCaptionCarouselEnabledrelayprovider": false,
+                    "__relay_internal__pv__PolarisShortDramaEnabledrelayprovider": false,
+                    "__relay_internal__pv__PolarisReelsRecoDebugOverlayEnabledrelayprovider": false
+                }),
+            )
+        };
+
+        let raw_vars = variables.to_string();
+        let encoded_vars = urlencoding::encode(&raw_vars);
+        let encoded_dtsg = urlencoding::encode(DEFAULT_FB_DTSG);
+
+        let form_body = format!(
+            "av={ds_user_id}&__d=www&__user=0&__a=1&__req=6&dpr=2&__comet_req=7&fb_dtsg={encoded_dtsg}&jazoest={DEFAULT_JAZOEST}&lsd={DEFAULT_LSD}&fb_api_caller_class=RelayModern&fb_api_req_friendly_name={friendly_name}&server_timestamps=true&doc_id={doc_id}&variables={encoded_vars}"
+        );
 
         let resp = client
-            .get(&api_url)
+            .post("https://www.instagram.com/graphql/query")
             .header(REFERER, format!("https://www.instagram.com/{username}/"))
+            .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .header("X-FB-Friendly-Name", friendly_name)
+            .header("X-Root-Field-Name", "xdt_api__v1__feed__user_timeline_graphql_connection")
+            .body(form_body)
             .send()
             .await?;
 
         if !resp.status().is_success() {
             if items.is_empty() {
-                bail!("Instagram feed API returned HTTP {}", resp.status());
+                bail!("Instagram GraphQL query failed with HTTP {}", resp.status());
             } else {
                 break;
             }
         }
 
-        let body = resp.text().await?;
-        let payload: Value = serde_json::from_str(&body)?;
+        let mut body: String = resp.text().await?;
+        if let Some(stripped) = body.strip_prefix("for (;;);") {
+            body = stripped.to_string();
+        }
 
-        let raw_items = match payload.get("items").and_then(|i| i.as_array()) {
+        let payload: Value = serde_json::from_str(&body)?;
+        let connection = match payload.pointer("/data/xdt_api__v1__feed__user_timeline_graphql_connection") {
+            Some(c) => c,
+            None => {
+                if items.is_empty() {
+                    bail!("Failed to locate timeline connection in Instagram GraphQL response");
+                } else {
+                    break;
+                }
+            }
+        };
+
+        let edges = match connection.get("edges").and_then(|e| e.as_array()) {
             Some(arr) if !arr.is_empty() => arr,
             _ => break,
         };
 
-        for raw in raw_items {
-            if let Some(code) = raw.get("code").and_then(|c| c.as_str()) {
+        for edge in edges {
+            let node = edge.get("node").unwrap_or(edge);
+            if let Some(code) = node.get("code").and_then(|c| c.as_str()) {
                 discovered_post_urls.push(format!("https://www.instagram.com/p/{code}/"));
             }
 
-            let raw_nodes: Vec<&Value> = if let Some(arr) = raw.get("carousel_media").and_then(|c| c.as_array()) {
-                arr.iter().collect()
-            } else {
-                vec![raw]
-            };
+            let raw_nodes: Vec<&Value> =
+                if let Some(arr) = node.get("carousel_media").and_then(|c| c.as_array()) {
+                    arr.iter().collect()
+                } else {
+                    vec![node]
+                };
 
-            for node in raw_nodes {
-                if let Some(media_item) = parse_media_item(node) {
+            for item_node in raw_nodes {
+                if let Some(media_item) = parse_media_item(item_node) {
                     items.push(media_item);
                 }
             }
         }
 
-        let more_available = payload.get("more_available").and_then(|v| v.as_bool()).unwrap_or(false);
-        let next_max_id = payload.get("next_max_id").and_then(|v| v.as_str()).map(|s| s.to_string());
+        let page_info = connection.get("page_info");
+        let has_next_page = page_info
+            .and_then(|p| p.get("has_next_page"))
+            .and_then(|b| b.as_bool())
+            .unwrap_or(false);
 
-        if !more_available || next_max_id.is_none() || page_count >= MAX_PAGES {
+        let next_cursor = page_info
+            .and_then(|p| p.get("end_cursor"))
+            .and_then(|c| c.as_str())
+            .map(|s| s.to_string());
+
+        if !has_next_page || next_cursor.is_none() || page_count >= MAX_PAGES {
             break;
         }
 
-        current_max_id = next_max_id;
-        tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
+        cursor = next_cursor;
+        tokio::time::sleep(Duration::from_millis(500)).await;
     }
 
     if items.is_empty() {
@@ -823,37 +910,6 @@ fn parse_media_item(item: &Value) -> Option<MediaItem> {
 // Numeric ID Resolver
 // -----------------------------------------------------------------------------
 async fn resolve_numeric_user_id(username: &str, client: &Client) -> Result<String> {
-    let profile_url = format!("https://www.instagram.com/{username}/");
-    if let Ok(resp) = client
-        .get(&profile_url)
-        .header(REFERER, "https://www.instagram.com/")
-        .send()
-        .await
-    {
-        if resp.status().is_success() {
-            if let Ok(html) = resp.text().await {
-                if let Some(pos) = html.find("\"props\":{\"id\":\"") {
-                    let rem = &html[pos + 15..];
-                    if let Some(end) = rem.find('\"') {
-                        let id = &rem[..end];
-                        if id.chars().all(|c| c.is_ascii_digit()) && !id.is_empty() {
-                            return Ok(id.to_string());
-                        }
-                    }
-                }
-                if let Some(pos) = html.find("\"profilePage_") {
-                    let rem = &html[pos + 13..];
-                    if let Some(end) = rem.find('\"') {
-                        let id = &rem[..end];
-                        if id.chars().all(|c| c.is_ascii_digit()) && !id.is_empty() {
-                            return Ok(id.to_string());
-                        }
-                    }
-                }
-            }
-        }
-    }
-
     let search_url = format!("https://www.instagram.com/api/v1/web/search/topsearch/?query={username}");
     if let Ok(resp) = client
         .get(&search_url)
@@ -919,11 +975,29 @@ fn build_auth_client(cfg: &DownloaderConfig) -> Result<Client> {
     let mut headers = HeaderMap::new();
     headers.insert(USER_AGENT, HeaderValue::from_static(BROWSER_UA));
     headers.insert("X-IG-App-ID", HeaderValue::from_static(APP_ID));
+    headers.insert("X-ASBD-ID", HeaderValue::from_static(ASBD_ID));
     headers.insert("X-CSRFToken", HeaderValue::from_str(csrf)?);
     headers.insert(COOKIE, HeaderValue::from_str(cookie)?);
     headers.insert("X-Requested-With", HeaderValue::from_static("XMLHttpRequest"));
+    headers.insert(ORIGIN, HeaderValue::from_static("https://www.instagram.com"));
+    headers.insert(ACCEPT, HeaderValue::from_static("*/*"));
+    headers.insert("Sec-Fetch-Dest", HeaderValue::from_static("empty"));
+    headers.insert("Sec-Fetch-Mode", HeaderValue::from_static("cors"));
+    headers.insert("Sec-Fetch-Site", HeaderValue::from_static("same-origin"));
+    headers.insert("X-FB-LSD", HeaderValue::from_static(DEFAULT_LSD));
 
     Ok(Client::builder().cookie_store(true).default_headers(headers).build()?)
+}
+
+fn extract_cookie_val(cookie: &str, key: &str) -> Option<String> {
+    let prefix = format!("{key}=");
+    for part in cookie.split(';') {
+        let trimmed = part.trim();
+        if let Some(val) = trimmed.strip_prefix(&prefix) {
+            return Some(val.to_string());
+        }
+    }
+    None
 }
 
 fn clean_url(raw: &str) -> String {
@@ -952,6 +1026,5 @@ fn shortcode_to_id(shortcode: &str) -> Result<u128> {
 }
 
 fn format_epoch_timestamp(epoch_secs: i64) -> Option<String> {
-    chrono::DateTime::from_timestamp(epoch_secs, 0)
-        .map(|dt| dt.to_rfc3339())
+    chrono::DateTime::from_timestamp(epoch_secs, 0).map(|dt| dt.to_rfc3339())
 }
