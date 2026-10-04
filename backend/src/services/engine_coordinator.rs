@@ -1,3 +1,5 @@
+// photo-app/backend/src/services/engine_coordinator.rs
+
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -5,6 +7,7 @@ use sqlx::SqlitePool;
 use tokio::sync::{Mutex, RwLock};
 use tracing::info;
 
+use crate::config::Config;
 use crate::services::clip_cache::load_clip_cache;
 use crate::services::cluster_cache::{ClusterCacheManager, SharedClusterCache};
 
@@ -175,11 +178,12 @@ impl<T: Send + Sync + 'static> ManagedResource<T> {
 
 /// Central coordinator for all transient, heavy resources:
 /// - Tier 2: Vector caches (ClipCache ~20MB, ClusterCache ~1MB)
-/// - Tier 3: AI Inference Engines (ClipEngine ~150MB, Full MediaEngine ~2GB)
+/// - Tier 3: AI Inference Engines (ClipEngine ~150MB, Full MediaEngine ~950MB)
 #[derive(Clone)]
 pub struct EngineCoordinator {
     pool: SqlitePool,
     models_dir: PathBuf,
+    config: Config,
 
     // Tier 2: In-memory vector caches (5-minute idle eviction)
     clip_cache: Arc<ManagedResource<ClipCacheManager>>,
@@ -191,10 +195,13 @@ pub struct EngineCoordinator {
 }
 
 impl EngineCoordinator {
-    pub fn new(pool: SqlitePool, models_dir: PathBuf) -> Self {
+    pub fn new(pool: SqlitePool, models_dir: PathBuf, config: Config) -> Self {
+        let ai_enabled = config.ai.enabled;
+
         let coordinator = Self {
             pool,
             models_dir,
+            config,
             // Caches: 5 minutes idle timeout (300s)
             clip_cache: Arc::new(ManagedResource::new("ClipCache", 300)),
             cluster_cache: Arc::new(ManagedResource::new("ClusterCache", 300)),
@@ -203,42 +210,47 @@ impl EngineCoordinator {
             media_engine: Arc::new(ManagedResource::new("MediaEngine", 180)),
         };
 
-        // Start a single lightweight background task to monitor idle evictions every 30 seconds
-        let weak_clip_cache = Arc::downgrade(&coordinator.clip_cache);
-        let weak_cluster_cache = Arc::downgrade(&coordinator.cluster_cache);
-        let weak_clip_engine = Arc::downgrade(&coordinator.clip_engine);
-        let weak_media_engine = Arc::downgrade(&coordinator.media_engine);
+        // Only start background eviction monitor if AI is enabled
+        if ai_enabled {
+            let weak_clip_cache = Arc::downgrade(&coordinator.clip_cache);
+            let weak_cluster_cache = Arc::downgrade(&coordinator.cluster_cache);
+            let weak_clip_engine = Arc::downgrade(&coordinator.clip_engine);
+            let weak_media_engine = Arc::downgrade(&coordinator.media_engine);
 
-        tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(Duration::from_secs(30)).await;
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(Duration::from_secs(30)).await;
 
-                // If all containers have dropped, app is shutting down
-                let c_cache = weak_clip_cache.upgrade();
-                let cl_cache = weak_cluster_cache.upgrade();
-                let c_engine = weak_clip_engine.upgrade();
-                let m_engine = weak_media_engine.upgrade();
+                    let c_cache = weak_clip_cache.upgrade();
+                    let cl_cache = weak_cluster_cache.upgrade();
+                    let c_engine = weak_clip_engine.upgrade();
+                    let m_engine = weak_media_engine.upgrade();
 
-                if c_cache.is_none() && cl_cache.is_none() && c_engine.is_none() && m_engine.is_none() {
-                    break;
+                    if c_cache.is_none() && cl_cache.is_none() && c_engine.is_none() && m_engine.is_none() {
+                        break;
+                    }
+
+                    if let Some(r) = c_cache { r.try_evict().await; }
+                    if let Some(r) = cl_cache { r.try_evict().await; }
+                    if let Some(r) = c_engine { r.try_evict().await; }
+                    if let Some(r) = m_engine { r.try_evict().await; }
                 }
-
-                if let Some(r) = c_cache { r.try_evict().await; }
-                if let Some(r) = cl_cache { r.try_evict().await; }
-                if let Some(r) = c_engine { r.try_evict().await; }
-                if let Some(r) = m_engine { r.try_evict().await; }
-            }
-        });
+            });
+        }
 
         coordinator
     }
 
     // -------------------------------------------------------------------------
-    // Tier 2: Lightweight Cache Accessors (~20 MB total)
+    // Tier 2: Lightweight Cache Accessors
     // -------------------------------------------------------------------------
 
     /// Ensures the CLIP vector embedding cache is ready in RAM (for similarity lookups)
     pub async fn ensure_clip_cache(&self) -> Result<ClipCacheManager, String> {
+        if !self.config.ai.enabled || !self.config.ai.enable_clip {
+            return Err("CLIP cache disabled in config".to_string());
+        }
+
         let pool = self.pool.clone();
         let arc_cache = self
             .clip_cache
@@ -254,6 +266,10 @@ impl EngineCoordinator {
 
     /// Ensures the Face Cluster centroids are ready in RAM
     pub async fn ensure_cluster_cache(&self) -> Result<SharedClusterCache, String> {
+        if !self.config.ai.enabled || !self.config.ai.enable_faces {
+            return Err("Face cluster cache disabled in config".to_string());
+        }
+
         let pool = self.pool.clone();
         let arc_shared = self
             .cluster_cache
@@ -264,7 +280,6 @@ impl EngineCoordinator {
             })
             .await?;
 
-        // SharedClusterCache is already Arc<RwLock<HashMap<String, Vec<KnownPersonCluster>>>>
         Ok((*arc_shared).clone())
     }
 
@@ -274,6 +289,10 @@ impl EngineCoordinator {
 
     /// Ensures only the CLIP text encoder is loaded (~150 MB) for natural language search queries
     pub async fn ensure_search_engine(&self) -> Result<Arc<ClipEngine>, String> {
+        if !self.config.ai.enabled || !self.config.ai.enable_clip {
+            return Err("CLIP search engine disabled in config".to_string());
+        }
+
         let m_dir = self.models_dir.clone();
         self.clip_engine
             .get_or_load(|| async move {
@@ -286,8 +305,12 @@ impl EngineCoordinator {
             .await
     }
 
-    /// Ensures the full pipeline engine is loaded (~2 GB) for processing ingested uploads
+    /// Ensures the pipeline engine is loaded for processing ingested uploads
     pub async fn ensure_pipeline_engine(&self) -> Result<Arc<MediaEngine>, String> {
+        if !self.config.ai.enabled {
+            return Err("AI pipeline engine disabled in config".to_string());
+        }
+
         let m_dir = self.models_dir.clone();
         self.media_engine
             .get_or_load(|| async move {
@@ -306,6 +329,9 @@ impl EngineCoordinator {
 
     /// Touch running resources so they stay hot while a long batch is actively processing
     pub async fn keep_warm(&self) {
+        if !self.config.ai.enabled {
+            return;
+        }
         self.clip_cache.touch().await;
         self.cluster_cache.touch().await;
         self.clip_engine.touch().await;

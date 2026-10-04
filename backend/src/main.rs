@@ -118,7 +118,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 1. Initialize coordinator (Zero ONNX models and zero vector caches loaded at boot)
     let models_dir = config.storage_root.join("models");
-    let coordinator = EngineCoordinator::new(pool.clone(), models_dir);
+    let coordinator = EngineCoordinator::new(pool.clone(), models_dir, config.clone());
     let (tx_events, _) = broadcast::channel::<WsMediaEvent>(100);
 
     // =========================================================================
