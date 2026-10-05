@@ -47,22 +47,31 @@
   $: prevAsset = resolveAsset($sections, getPrevCoords($sections, activeCoords));
   $: nextAsset = resolveAsset($sections, getNextCoords($sections, activeCoords));
 
-  $: currentAlbum = $filterStore.album_id
-    ? $albumStore.find((a) => a.id === $filterStore.album_id)
+  // Define or import your Album type
+  interface Album {
+    id: string;
+    title?: string | null;
+    cover_thumb?: string | null;
+    media_count?: number;
+    [key: string]: any;
+  }
+
+  $: currentAlbum =$filterStore.album_id
+    ? ($albumStore as Album[]).find((a: Album) => a.id ===$filterStore.album_id) ?? null
     : null;
 
   $: currentAlbumPath = currentAlbum
     ? (currentAlbum.title || '').replace(/^\/+|\/+$/g, '')
-    : ($filterStore.folder_path || '').replace(/^\/+|\/+$/g, '');
+    : ($filterStore.folder_path || '').replace(/^\/+\vert{}\/+$/g, '');
 
   $: breadcrumbSegments = (() => {
     if (!currentAlbumPath) return [];
-    const parts = currentAlbumPath.split('/');
+    const parts: string[] = currentAlbumPath.split('/');
     let cumulative = '';
-    return parts.map((part) => {
+    return parts.map((part: string) => {
       cumulative = cumulative ? `${cumulative}/${part}` : part;
-      const matchedAlbum = $albumStore.find(
-        (a) => (a.title || '').replace(/^\/+|\/+$/g, '') === cumulative
+      const matchedAlbum = ($albumStore as Album[]).find(
+        (a: Album) => (a.title || '').replace(/^\/+|\/+$/g, '') === cumulative
       );
       return {
         name: part,
@@ -72,8 +81,8 @@
     });
   })();
 
-  $: rootAlbums = $albumStore
-    .map((alb) => {
+  $: rootAlbums = ($albumStore as Album[])
+    .map((alb: Album) => {
       const clean = (alb.title || '').replace(/^\/+|\/+$/g, '');
       const parts = clean.split('/');
       return { ...alb, cleanPath: clean, rootName: parts[0] };
@@ -83,12 +92,12 @@
   $: childAlbums = (() => {
     if (!currentAlbumPath) return [];
     const prefix = `${currentAlbumPath}/`;
-    return $albumStore
-      .filter((alb) => {
+    return ($albumStore as Album[])
+      .filter((alb: Album) => {
         const clean = (alb.title || '').replace(/^\/+|\/+$/g, '');
         return clean.startsWith(prefix) && clean !== currentAlbumPath;
       })
-      .map((alb) => {
+      .map((alb: Album) => {
         const clean = (alb.title || '').replace(/^\/+|\/+$/g, '');
         const remainder = clean.slice(prefix.length);
         const directSubName = remainder.split('/')[0];
@@ -98,7 +107,7 @@
           displayTitle: directSubName
         };
       })
-      .filter((item, index, self) =>
+      .filter((item, index: number, self) =>
         index === self.findIndex((t) => t.directSubName === item.directSubName)
       );
   })();
@@ -107,12 +116,12 @@
     const seen = new Set<string>();
     const markers: { label: string; year: string; index: number; count?: number }[] = [];
 
-    $sections.forEach((s, idx) => {
-      let month = (s as any).month;
-      let year = (s as any).year;
+    $sections.forEach((s: any, idx: number) => {
+      let month = s.month;
+      let year = s.year;
 
       if (!month || !year) {
-        const parts = s.title.split(' ');
+        const parts: string[] = s.title.split(' ');
         month = parts[parts.length - 2] || '';
         year = parts[parts.length - 1] || '';
       }
@@ -134,10 +143,15 @@
 
   $: currentDensity = DENSITY_PRESETS[$gridDensity];
 
-  $: selectedAssetIds = Array.from(
-    (selection as any).selectedIds ??
-    (typeof (selection as any).getSelectedIds === 'function' ? (selection as any).getSelectedIds() : [])
+  // Fast reactive Set for O(1) checks on every render
+  $: selectedSet = new Set<string>(
+    Array.from(
+      (selection as any).selectedIds ??
+      (typeof (selection as any).getSelectedIds === 'function' ? (selection as any).getSelectedIds() : [])
+    )
   );
+
+  $: selectedAssetIds = Array.from(selectedSet);
 
   const pinchZoom = createPinchZoomHandler(
     () => gridDensity.zoomIn(),
@@ -242,6 +256,24 @@
       clickedCardRect = null;
       timeline.fetchMedia($filterQueryString, true);
     }, 180);
+  }
+
+  function handleImageLoad(e: Event) {
+    (e.currentTarget as HTMLElement).classList.add('loaded');
+  }
+
+  function handleJump(e: CustomEvent<{ index: number }>) {
+    scrollToSection(e.detail.index);
+  }
+
+  function handleSelectAsset(e: CustomEvent<{ id: string }>) {
+    clickedCardRect = null;
+    const found = findCoordsById($sections, e.detail.id);
+    if (found) activeCoords = found;
+  }
+
+  function handleToggleFavorite(e: CustomEvent<{ is_favorite: boolean }>) {
+    if (activeCoords) timeline.patchFavorite(activeCoords, e.detail.is_favorite);
   }
 
   onMount(() => {
@@ -503,7 +535,7 @@
           <div class="gallery-grid">
             {#each section.items as asset, itemIdx (asset.id)}
               {@const isPriority = secIdx === 0 && itemIdx < 20}
-              {@const isSelected = selectedAssetIds.includes(asset.id)}
+              {@const isSelected = selectedSet.has(asset.id)}
 
               <div
                 role="button"
@@ -519,28 +551,35 @@
                     handleCardClick(e, asset.id, secIdx, itemIdx);
                   }
                 }}
-                class="tile-card group relative aspect-square rounded-md overflow-hidden cursor-pointer focus:outline-none transition-transform duration-150 {isSelected ? 'scale-[0.93] ring-3 ring-purple-500 shadow-md' : 'hover:scale-[1.015]'}"
+                class="tile-card group relative aspect-square rounded-lg overflow-hidden cursor-pointer focus:outline-none transition-all duration-200 {isSelected ? 'selected' : 'hover:scale-[1.01]'}"
               >
-                <!-- Thumbnail Image -->
+                <!-- Thumbnail Image (Smoothly scales down when selected) -->
                 <img
                   src={asset.thumb_path.startsWith('/') ? asset.thumb_path : `/${asset.thumb_path}`}
                   alt={asset.file_name}
                   loading={isPriority ? 'eager' : 'lazy'}
                   decoding="async"
                   fetchpriority={isPriority ? 'high' : 'auto'}
-                  on:load={(e) => (e.currentTarget as HTMLElement).classList.add('loaded')}
-                  class="tile-image w-full h-full object-cover pointer-events-none"
+                  on:load={handleImageLoad}
+                  class="tile-image w-full h-full object-cover pointer-events-none transition-transform duration-200 {isSelected ? 'scale-[0.88] rounded-md' : 'scale-100'}"
                 />
+
+                <!-- Selected State Backdrop Overlay & Inset Ring (Cannot be clipped) -->
+                {#if isSelected}
+                  <div class="selection-overlay pointer-events-none absolute inset-0 z-10 flex items-center justify-center">
+                    <div class="selection-ring absolute inset-0 rounded-lg pointer-events-none"></div>
+                  </div>
+                {/if}
 
                 <!-- Selection Circle Badge -->
                 <button
                   type="button"
                   data-select-btn
-                  class="select-btn absolute top-1.5 left-1.5 w-6 h-6 rounded-full flex items-center justify-center transition-all z-20 cursor-pointer shadow-md active:scale-90 {isSelected ? 'bg-purple-600 border border-white text-white opacity-100' : 'bg-black/35 backdrop-blur-md border border-white/40 text-white opacity-0 group-hover:opacity-100'}"
+                  class="select-btn absolute top-1.5 left-1.5 w-6 h-6 rounded-full flex items-center justify-center transition-all z-20 cursor-pointer active:scale-90 {isSelected ? 'opacity-100 scale-100 bg-purple-600 border-2 border-white text-white shadow-lg' : ($isSelectionActive ? 'opacity-100 scale-95 bg-black/40 border border-white/60 text-transparent' : 'opacity-0 scale-90 group-hover:opacity-100 bg-black/40 border border-white/60 text-transparent')}"
                   title="Select"
                   aria-label="Select photo"
                 >
-                  <svg xmlns="http://www.w3.org/2000/svg" class="w-3.5 h-3.5 pointer-events-none {isSelected ? 'opacity-100' : 'opacity-0'}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round" stroke-linejoin="round">
+                  <svg xmlns="http://www.w3.org/2000/svg" class="w-3.5 h-3.5 pointer-events-none transition-opacity duration-150 {isSelected ? 'opacity-100 text-white' : 'opacity-0'}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round">
                     <polyline points="20 6 9 17 4 12"></polyline>
                   </svg>
                 </button>
@@ -595,7 +634,7 @@
 
 <TimelineScrubber
   markers={scrubMarkers}
-  on:jump={(e) => scrollToSection(e.detail.index)}
+  on:jump={handleJump}
 />
 
 <BatchActionBar
@@ -650,15 +689,9 @@
       clickedCardRect = null;
       activeCoords = getNextCoords($sections, activeCoords);
     }}
-    on:selectAsset={(e) => {
-      clickedCardRect = null;
-      const found = findCoordsById($sections, e.detail.id);
-      if (found) activeCoords = found;
-    }}
-    on:toggleFavorite={(e) => {
-      if (activeCoords) timeline.patchFavorite(activeCoords, e.detail.is_favorite);
-    }}
-    on:setAsCover={(e) => {
+    on:selectAsset={handleSelectAsset}
+    on:toggleFavorite={handleToggleFavorite}
+    on:setAsCover={() => {
       if (selectedAsset) handleSetCover(selectedAsset.id, selectedAsset.thumb_path);
     }}
   />
@@ -723,14 +756,35 @@
   .tile-card {
     position: relative;
     width: 100%;
-    contain: strict;
+    contain: layout paint;
     -webkit-touch-callout: none;
     background-color: var(--card-bg, #1e1e24);
+    transition: background-color 0.2s ease, transform 0.15s ease;
+  }
+
+  /* Distinct Selected State styling */
+  .tile-card.selected {
+    background-color: rgba(168, 85, 247, 0.15);
+  }
+
+  .selection-overlay {
+    background: radial-gradient(circle, rgba(168, 85, 247, 0.18) 0%, rgba(147, 51, 234, 0.28) 100%);
+  }
+
+  .selection-ring {
+    border: 3px solid #a855f7;
+    box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.4), 0 0 16px rgba(168, 85, 247, 0.5);
+  }
+
+  .select-btn {
+    backdrop-filter: blur(8px);
+    -webkit-backdrop-filter: blur(8px);
+    transition: transform 0.18s cubic-bezier(0.34, 1.56, 0.64, 1), background-color 0.15s ease, opacity 0.15s ease;
   }
 
   .tile-image {
     opacity: 0;
-    transition: opacity 0.2s ease-out;
+    transition: opacity 0.2s ease-out, transform 0.2s cubic-bezier(0.16, 1, 0.3, 1);
   }
 
   :global(.tile-image.loaded) {
