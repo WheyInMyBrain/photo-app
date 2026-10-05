@@ -587,7 +587,7 @@ async fn extract_highlight_links(input_url: &str, client: &Client) -> Result<Ext
 }
 
 // -----------------------------------------------------------------------------
-// User Profile Feed: Crawls timeline & resolves each post via post extractor
+// User Profile Feed: Ingests timeline directly in a single pagination pass
 // -----------------------------------------------------------------------------
 async fn extract_user_profile_feed(
     input_url: &str,
@@ -597,113 +597,7 @@ async fn extract_user_profile_feed(
     let username = extract_username_from_url(input_url)
         .context("Could not extract username from Instagram profile URL")?;
 
-    // Step 1: Discover all profile post URLs
-    let post_urls = discover_profile_post_urls(input_url, cfg, client).await?;
-    let total_count = post_urls.len();
-    info!(
-        username = %username,
-        total_posts = total_count,
-        "Executing post extraction for each discovered link"
-    );
-
-    // Step 2: Loop every link through the single post extractor
-    let mut all_media_items = Vec::new();
-    let mut aggregated_tags = HashSet::new();
-    let mut latest_post_date = None;
-    let mut primary_location = None;
-
-    for (idx, post_url) in post_urls.iter().enumerate() {
-        debug!(progress = format!("{}/{}", idx + 1, total_count), url = %post_url, "Extracting post metadata & media");
-
-        match extract_single_post(post_url, Some(cfg)).await {
-            Ok(post_meta) => {
-                let count = post_meta.items.len();
-
-                // Capture profile-level fallbacks from the newest post if needed
-                if latest_post_date.is_none() && post_meta.published_at.is_some() {
-                    latest_post_date = post_meta.published_at.clone();
-                }
-                if primary_location.is_none() && post_meta.location.is_some() {
-                    primary_location = post_meta.location.clone();
-                }
-
-                // Explicitly bind ONLY this specific post's metadata to its items
-                for mut item in post_meta.items {
-                    item.source_post_url = Some(post_url.clone());
-                    item.caption = if !post_meta.caption.is_empty() {
-                        Some(post_meta.caption.clone())
-                    } else {
-                        None
-                    };
-                    item.published_at = post_meta.published_at.clone();
-                    item.location = post_meta.location.clone();
-                    item.tags = post_meta.tags.clone();
-
-                    for tag in &post_meta.tags {
-                        aggregated_tags.insert(tag.clone());
-                    }
-
-                    all_media_items.push(item);
-                }
-
-                info!(
-                    progress = format!("{}/{}", idx + 1, total_count),
-                    url = %post_url,
-                    media_count = count,
-                    date = ?post_meta.published_at,
-                    has_location = post_meta.location.is_some(),
-                    "Post resolved successfully with individual metadata"
-                );
-            }
-            Err(e) => {
-                warn!(
-                    progress = format!("{}/{}", idx + 1, total_count),
-                    url = %post_url,
-                    error = %e,
-                    "Failed to extract post, skipping"
-                );
-            }
-        }
-
-        tokio::time::sleep(Duration::from_millis(250)).await;
-    }
-
-    if all_media_items.is_empty() {
-        bail!("Failed to extract media items from discovered posts for @{username}");
-    }
-
-    info!(
-        username = %username,
-        total_media_items = all_media_items.len(),
-        total_posts = post_urls.len(),
-        "Profile extraction complete"
-    );
-
-    Ok(ExtractedMediaMetadata {
-        platform: "instagram".to_string(),
-        author: username.clone(),
-        caption: format!("Profile feed for @{username}"),
-        post_text: None,
-        published_at: latest_post_date,
-        tags: aggregated_tags.into_iter().collect(),
-        items: all_media_items,
-        location: primary_location,
-        next_page_url: None,
-        discovered_post_urls: post_urls,
-        embedded_player_urls: Vec::new(),
-    })
-}
-
-/// Discovers all post URLs for a given Instagram profile URL.
-pub async fn discover_profile_post_urls(
-    input_url: &str,
-    cfg: &DownloaderConfig,
-    client: &Client,
-) -> Result<Vec<String>> {
-    let username = extract_username_from_url(input_url)
-        .context("Could not extract username from Instagram profile URL")?;
-
-    info!(username = %username, "Starting profile timeline post discovery");
+    info!(username = %username, "Starting unified profile extraction");
 
     let cookie = cfg.ig_cookie.as_deref().unwrap_or("");
     let csrf_token = cfg
@@ -723,10 +617,13 @@ pub async fn discover_profile_post_urls(
         })
         .unwrap_or_else(|| "0".to_string());
 
-    debug!(username = %username, ds_user_id = %ds_user_id, "Built profile request credentials");
-
+    let mut all_media_items = Vec::new();
     let mut discovered_post_urls = Vec::new();
     let mut seen_codes = HashSet::new();
+    let mut aggregated_tags = HashSet::new();
+    let mut latest_post_date = None;
+    let mut primary_location = None;
+
     let mut cursor: Option<String> = None;
     let mut page_count = 0;
     const MAX_PAGES: usize = 500;
@@ -798,8 +695,8 @@ pub async fn discover_profile_post_urls(
 
         let status = resp.status();
         if !status.is_success() {
-            error!(username = %username, page = page_count, status = %status, "Instagram GraphQL query failed");
-            if discovered_post_urls.is_empty() {
+            error!(username = %username, page = page_count, status = %status, "Timeline query failed");
+            if all_media_items.is_empty() {
                 bail!("Instagram GraphQL query failed with HTTP {status}");
             } else {
                 break;
@@ -815,7 +712,7 @@ pub async fn discover_profile_post_urls(
             Ok(val) => val,
             Err(e) => {
                 error!(username = %username, error = %e, preview = %&body[..body.len().min(300)], "Failed to parse timeline JSON");
-                if discovered_post_urls.is_empty() {
+                if all_media_items.is_empty() {
                     bail!("Failed to parse Instagram GraphQL JSON: {e}");
                 } else {
                     break;
@@ -826,7 +723,7 @@ pub async fn discover_profile_post_urls(
         if let Some(err_code) = payload.get("error") {
             let msg = payload.get("errorSummary").and_then(|s| s.as_str()).unwrap_or("unknown error");
             error!(username = %username, error_code = %err_code, summary = %msg, "Meta returned an API-level error");
-            if discovered_post_urls.is_empty() {
+            if all_media_items.is_empty() {
                 bail!("Meta GraphQL error {err_code}: {msg}. Verify session cookies in .env.");
             } else {
                 break;
@@ -839,7 +736,7 @@ pub async fn discover_profile_post_urls(
             (conn.get("edges").and_then(|e| e.as_array()), conn.get("page_info"))
         } else {
             warn!(username = %username, preview = %&body[..body.len().min(300)], "Could not locate timeline connection in payload");
-            if discovered_post_urls.is_empty() {
+            if all_media_items.is_empty() {
                 bail!("Failed to locate timeline connection in GraphQL response.");
             } else {
                 break;
@@ -854,18 +751,89 @@ pub async fn discover_profile_post_urls(
             }
         };
 
-        let mut new_on_page = 0;
+        let mut new_items_on_page = 0;
+
         for edge in raw_edges {
             let node = edge.get("node").unwrap_or(edge);
-            if let Some(code) = node.get("code").or_else(|| node.get("shortcode")).and_then(|c| c.as_str()) {
-                if seen_codes.insert(code.to_string()) {
-                    discovered_post_urls.push(format!("https://www.instagram.com/p/{code}/"));
-                    new_on_page += 1;
+            let code = match node.get("code").or_else(|| node.get("shortcode")).and_then(|c| c.as_str()) {
+                Some(c) => c,
+                None => continue,
+            };
+
+            if !seen_codes.insert(code.to_string()) {
+                continue;
+            }
+
+            let post_url = format!("https://www.instagram.com/p/{code}/");
+            discovered_post_urls.push(post_url.clone());
+
+            // 1. Caption & Tags
+            let caption = node
+                .pointer("/caption/text")
+                .and_then(|t| t.as_str())
+                .unwrap_or("")
+                .to_string();
+
+            let post_tags = extract_hashtags_from_text(&caption);
+            for tag in &post_tags {
+                aggregated_tags.insert(tag.clone());
+            }
+
+            // 2. Timestamp
+            let published_at = node
+                .get("taken_at")
+                .and_then(|t| t.as_i64())
+                .and_then(format_epoch_timestamp);
+
+            if latest_post_date.is_none() && published_at.is_some() {
+                latest_post_date = published_at.clone();
+            }
+
+            // 3. Location
+            let post_location = extract_and_resolve_location(node.get("location"), client).await;
+            if primary_location.is_none() && post_location.is_some() {
+                primary_location = post_location.clone();
+            }
+
+            // 4. Media nodes (Carousels vs Single Post)
+            let raw_media_nodes: Vec<&Value> = if let Some(carousel) = node.get("carousel_media").and_then(|c| c.as_array()) {
+                carousel.iter().collect()
+            } else {
+                vec![node]
+            };
+
+            for media_node in raw_media_nodes {
+                if let Some(mut media_item) = parse_media_item(media_node) {
+                    let slide_location = if media_node.get("location").is_some() {
+                        extract_and_resolve_location(media_node.get("location"), client).await
+                    } else {
+                        post_location.clone()
+                    };
+
+                    media_item.source_post_url = Some(post_url.clone());
+                    media_item.caption = if !caption.is_empty() {
+                        Some(caption.clone())
+                    } else {
+                        None
+                    };
+                    media_item.published_at = published_at.clone();
+                    media_item.location = slide_location;
+                    media_item.tags = post_tags.clone();
+
+                    all_media_items.push(media_item);
+                    new_items_on_page += 1;
                 }
             }
         }
 
-        info!(username = %username, page = page_count, new_posts = new_on_page, total_discovered = discovered_post_urls.len(), "Timeline page processed");
+        info!(
+            username = %username,
+            page = page_count,
+            items_parsed_this_page = new_items_on_page,
+            total_items = all_media_items.len(),
+            total_posts = discovered_post_urls.len(),
+            "Timeline page parsed directly"
+        );
 
         let has_next_page = page_info
             .and_then(|p| p.get("has_next_page"))
@@ -878,21 +846,38 @@ pub async fn discover_profile_post_urls(
             .map(|s| s.to_string());
 
         if !has_next_page || next_cursor.is_none() || page_count >= MAX_PAGES {
-            debug!(username = %username, has_next_page, max_pages_reached = page_count >= MAX_PAGES, "Finished timeline pagination loop");
+            debug!(username = %username, has_next_page, max_pages_reached = page_count >= MAX_PAGES, "Finished timeline pagination");
             break;
         }
 
         cursor = next_cursor;
-        tokio::time::sleep(Duration::from_millis(400)).await;
+        tokio::time::sleep(Duration::from_millis(350)).await;
     }
 
-    if discovered_post_urls.is_empty() {
-        error!(username = %username, "0 posts discovered for profile");
-        bail!("No posts found for @{username}");
+    if all_media_items.is_empty() {
+        bail!("No media items could be extracted for @{username}");
     }
 
-    info!(username = %username, total_posts = discovered_post_urls.len(), "Discovered all profile post links");
-    Ok(discovered_post_urls)
+    info!(
+        username = %username,
+        total_media_items = all_media_items.len(),
+        total_posts = discovered_post_urls.len(),
+        "Unified extraction complete"
+    );
+
+    Ok(ExtractedMediaMetadata {
+        platform: "instagram".to_string(),
+        author: username.clone(),
+        caption: format!("Profile feed for @{username}"),
+        post_text: None,
+        published_at: latest_post_date,
+        tags: aggregated_tags.into_iter().collect(),
+        items: all_media_items,
+        location: primary_location,
+        next_page_url: None,
+        discovered_post_urls,
+        embedded_player_urls: Vec::new(),
+    })
 }
 
 // -----------------------------------------------------------------------------
@@ -1071,134 +1056,132 @@ async fn extract_direct_pk_links(
 // -----------------------------------------------------------------------------
 fn parse_media_item(item: &Value) -> Option<MediaItem> {
     let media_type = item.get("media_type").and_then(|t| t.as_i64()).unwrap_or(1);
-    let candidates = item.get("image_versions2")?.get("candidates")?.as_array()?;
-    let thumbnail_url = candidates.last()?.get("url")?.as_str().map(clean_url);
+
+    // Extract image candidates used for both image posts and video cover thumbnails
+    let img_candidates = item
+        .pointer("/image_versions2/candidates")
+        .and_then(|c| c.as_array())?;
+
+    let default_thumb_url = img_candidates
+        .last()
+        .and_then(|c| c.get("url"))
+        .and_then(|u| u.as_str())
+        .map(clean_url);
 
     if media_type == 2 {
+        // --- Video Processing ---
         let versions = item.get("video_versions")?.as_array()?;
         if versions.is_empty() {
             return None;
         }
 
-        let mut parsed_variants: Vec<(usize, usize, String, Option<u64>)> = Vec::new();
-        let mut seen_urls = HashSet::new();
-
-        for v in versions {
-            if let Some(v_url) = v.get("url").and_then(|u| u.as_str()) {
-                let cleaned = clean_url(v_url);
-                if seen_urls.insert(cleaned.clone()) {
-                    let w = v.get("width").and_then(|n| n.as_u64()).unwrap_or(0) as usize;
-                    let h = v.get("height").and_then(|n| n.as_u64()).unwrap_or(0) as usize;
-                    let size = v
-                        .get("file_size")
-                        .or_else(|| v.get("file_size_bytes"))
-                        .and_then(|s| s.as_u64());
-
-                    parsed_variants.push((w, h, cleaned, size));
-                }
-            }
+        let mut parsed_variants = extract_variants(versions);
+        if parsed_variants.is_empty() {
+            return None;
         }
 
-        parsed_variants.sort_by_key(|(w, h, _, _)| std::cmp::Reverse(w * h));
-        let (best_w, best_h, best_url, best_size) = parsed_variants.first()?.clone();
+        // Sort descending by resolution (w * h)
+        parsed_variants.sort_by_key(|v| {
+            std::cmp::Reverse(v.dimensions.as_ref().map(|d| d.width * d.height).unwrap_or(0))
+        });
 
-        let dims = if best_w > 0 && best_h > 0 {
-            Some(MediaDimensions { width: best_w, height: best_h })
-        } else {
-            None
-        };
+        let best = &parsed_variants[0];
+        let best_url = best.url.clone();
+        let best_dims = best.dimensions.clone();
+        let best_size = best.file_size_bytes;
 
         let mut media = MediaItem::new(
             MediaType::Video,
             "video/mp4",
-            dims,
+            best_dims,
             best_size,
             best_url.clone(),
-            thumbnail_url,
+            default_thumb_url,
             None,
             None,
             Some("https://www.instagram.com/".to_string()),
             best_url,
         );
-
-        media.variants = parsed_variants
-            .into_iter()
-            .map(|(w, h, url, size)| MediaVariant {
-                url,
-                dimensions: if w > 0 && h > 0 {
-                    Some(MediaDimensions { width: w, height: h })
-                } else {
-                    None
-                },
-                file_size_bytes: size,
-                label: Some(format!("{w}x{h}")),
-            })
-            .collect();
+        media.variants = parsed_variants;
 
         Some(media)
     } else {
-        let mut parsed_variants: Vec<(usize, usize, String, Option<u64>)> = Vec::new();
-        let mut seen_urls = HashSet::new();
-
-        for c in candidates {
-            if let Some(c_url) = c.get("url").and_then(|u| u.as_str()) {
-                let cleaned = clean_url(c_url);
-                if seen_urls.insert(cleaned.clone()) {
-                    let w = c.get("width").and_then(|n| n.as_u64()).unwrap_or(0) as usize;
-                    let h = c.get("height").and_then(|n| n.as_u64()).unwrap_or(0) as usize;
-                    let size = c
-                        .get("file_size")
-                        .or_else(|| c.get("file_size_bytes"))
-                        .and_then(|s| s.as_u64());
-
-                    parsed_variants.push((w, h, cleaned, size));
-                }
-            }
+        // --- Image Processing ---
+        let mut parsed_variants = extract_variants(img_candidates);
+        if parsed_variants.is_empty() {
+            return None;
         }
 
-        parsed_variants.sort_by_key(|(w, h, _, _)| std::cmp::Reverse(w * h));
-        let (best_w, best_h, best_url, best_size) = parsed_variants.first()?.clone();
+        // Sort descending by resolution (w * h)
+        parsed_variants.sort_by_key(|v| {
+            std::cmp::Reverse(v.dimensions.as_ref().map(|d| d.width * d.height).unwrap_or(0))
+        });
 
-        let dims = if best_w > 0 && best_h > 0 {
-            Some(MediaDimensions { width: best_w, height: best_h })
-        } else {
-            None
-        };
+        let best = &parsed_variants[0];
+        let best_url = best.url.clone();
+        let best_dims = best.dimensions.clone();
+        let best_size = best.file_size_bytes;
 
-        let thumb = parsed_variants
-            .last()
-            .map(|(_, _, u, _)| u.clone())
-            .or(thumbnail_url);
+        // Smallest variant for grid display, fallback to default_thumb_url
+        let thumb_url = parsed_variants.last().map(|v| v.url.clone()).or(default_thumb_url);
 
         let mut media = MediaItem::new(
             MediaType::Image,
             "image/jpeg",
-            dims,
+            best_dims,
             best_size,
             best_url.clone(),
-            thumb,
+            thumb_url,
             None,
             None,
             Some("https://www.instagram.com/".to_string()),
             best_url,
         );
-
-        media.variants = parsed_variants
-            .into_iter()
-            .map(|(w, h, url, size)| MediaVariant {
-                url,
-                dimensions: if w > 0 && h > 0 {
-                    Some(MediaDimensions { width: w, height: h })
-                } else {
-                    None
-                },
-                file_size_bytes: size,
-                label: Some(format!("{w}w")),
-            })
-            .collect();
+        media.variants = parsed_variants;
 
         Some(media)
     }
+}
+
+/// Helper to parse and deduplicate raw URL/dimension variants from a JSON array
+fn extract_variants(raw_list: &[Value]) -> Vec<MediaVariant> {
+    let mut variants = Vec::new();
+    let mut seen_urls = HashSet::new();
+
+    for entry in raw_list {
+        if let Some(raw_url) = entry.get("url").and_then(|u| u.as_str()) {
+            let cleaned = clean_url(raw_url);
+            if seen_urls.insert(cleaned.clone()) {
+                let w = entry.get("width").and_then(|n| n.as_u64()).unwrap_or(0) as usize;
+                let h = entry.get("height").and_then(|n| n.as_u64()).unwrap_or(0) as usize;
+                let size = entry
+                    .get("file_size")
+                    .or_else(|| entry.get("file_size_bytes"))
+                    .and_then(|s| s.as_u64());
+
+                let dimensions = if w > 0 && h > 0 {
+                    Some(MediaDimensions { width: w, height: h })
+                } else {
+                    None
+                };
+
+                let label = if w > 0 && h > 0 {
+                    Some(format!("{w}x{h}"))
+                } else {
+                    None
+                };
+
+                variants.push(MediaVariant {
+                    url: cleaned,
+                    dimensions,
+                    file_size_bytes: size,
+                    label,
+                });
+            }
+        }
+    }
+
+    variants
 }
 
 // -----------------------------------------------------------------------------
