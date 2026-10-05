@@ -497,7 +497,7 @@ async fn extract_highlight_links(input_url: &str, client: &Client) -> Result<Ext
 }
 
 // -----------------------------------------------------------------------------
-// User Profile Feed: Discovers post URLs, then resolves each full post via GraphQL
+// User Profile Feed: Crawls timeline & resolves each post via post extractor
 // -----------------------------------------------------------------------------
 async fn extract_user_profile_feed(
     input_url: &str,
@@ -709,43 +709,42 @@ async fn extract_user_profile_feed(
         bail!("No posts found for @{username}");
     }
 
-    info!(username, total_posts = discovered_shortcodes.len(), "=== Stage 2: Fetching individual posts for full media, dates & locations ===");
+    info!(username, total_posts = discovered_shortcodes.len(), "=== Stage 2: Fetching individual posts for media, dates & locations ===");
 
-    // --- Stage 2: Fetch each post to get full metadata, publishing date, location & media variants ---
+    // --- Stage 2: Call the post extractor directly for each discovered shortcode ---
     let mut all_media_items = Vec::new();
-    let mut collected_tags = HashSet::new();
-    let mut first_published_at = None;
-    let mut resolved_location = None;
     let total_count = discovered_shortcodes.len();
 
     for (idx, code) in discovered_shortcodes.iter().enumerate() {
         debug!(progress = format!("{}/{}", idx + 1, total_count), shortcode = %code, "Fetching post details");
 
-        let post_meta = match fetch_graphql_post_info(code, client).await {
+        let post_result = match fetch_graphql_post_info(code, client).await {
             Ok(meta) => Ok(meta),
             Err(gql_err) => {
-                debug!(shortcode = %code, error = %gql_err, "GraphQL post fetch failed, trying mobile API fallback");
+                debug!(shortcode = %code, error = %gql_err, "GraphQL post fetch failed, falling back to mobile API");
                 fetch_mobile_post_info(code, client).await
             }
         };
 
-        match post_meta {
-            Ok(meta) => {
-                if first_published_at.is_none() {
-                    first_published_at = meta.published_at.clone();
-                }
-                if resolved_location.is_none() && meta.location.is_some() {
-                    resolved_location = meta.location.clone();
-                }
-                for tag in meta.tags {
-                    collected_tags.insert(tag);
-                }
+        match post_result {
+            Ok(mut meta) => {
+                let post_url = format!("https://www.instagram.com/p/{code}/");
                 let count = meta.items.len();
+
+                // Lock each item directly to its owning post's metadata
+                for item in &mut meta.items {
+                    item.source_post_url = Some(post_url.clone());
+                    item.caption = Some(meta.caption.clone());
+                    item.published_at = meta.published_at.clone();
+                    item.location = meta.location.clone();
+                    item.tags = meta.tags.clone();
+                }
+
                 all_media_items.extend(meta.items);
-                info!(progress = format!("{}/{}", idx + 1, total_count), shortcode = %code, media_count = count, "Post ingested");
+                info!(progress = format!("{}/{}", idx + 1, total_count), shortcode = %code, media_count = count, "Post ingested with individual metadata");
             }
             Err(e) => {
-                warn!(progress = format!("{}/{}", idx + 1, total_count), shortcode = %code, error = %e, "Failed to fetch details for post, skipping");
+                warn!(progress = format!("{}/{}", idx + 1, total_count), shortcode = %code, error = %e, "Failed to fetch post details, skipping");
             }
         }
 
@@ -764,10 +763,10 @@ async fn extract_user_profile_feed(
         author: username.to_string(),
         caption: format!("Extracted {} items from @{username}", all_media_items.len()),
         post_text: None,
-        published_at: first_published_at,
-        tags: collected_tags.into_iter().collect(),
+        published_at: None,
+        tags: Vec::new(),
         items: all_media_items,
-        location: resolved_location,
+        location: None,
         next_page_url: None,
         discovered_post_urls,
         embedded_player_urls: Vec::new(),

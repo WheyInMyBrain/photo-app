@@ -1,19 +1,19 @@
 // src/models.rs
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MediaType {
     Video,
     Image,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MediaDimensions {
     pub width: usize,
     pub height: usize,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MediaVariant {
     pub url: String,
     pub dimensions: Option<MediaDimensions>,
@@ -21,7 +21,7 @@ pub struct MediaVariant {
     pub label: Option<String>, // e.g. "4k", "1080p", "640w"
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MediaItem {
     pub media_type: MediaType,
     pub mime_type: String,
@@ -33,7 +33,14 @@ pub struct MediaItem {
     pub subtitles_url: Option<String>,
     pub referer_required: Option<String>,
     pub raw_master_url: String,
-    pub variants: Vec<MediaVariant>, 
+    pub variants: Vec<MediaVariant>,
+
+    // Per-post metadata overrides (prevents profile items sharing identical metadata)
+    pub caption: Option<String>,
+    pub published_at: Option<String>,
+    pub location: Option<ExtractedLocation>,
+    pub tags: Vec<String>,
+    pub source_post_url: Option<String>,
 }
 
 impl MediaItem {
@@ -69,6 +76,11 @@ impl MediaItem {
             referer_required,
             raw_master_url: raw_master_url.into(),
             variants: vec![initial_variant],
+            caption: None,
+            published_at: None,
+            location: None,
+            tags: Vec::new(),
+            source_post_url: None,
         }
     }
 }
@@ -81,7 +93,7 @@ pub struct ExtractedLocation {
     pub location_id: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExtractedMediaMetadata {
     pub platform: String,
     pub author: String,
