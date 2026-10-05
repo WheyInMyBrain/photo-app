@@ -473,7 +473,7 @@ async fn extract_highlight_links(input_url: &str, client: &Client) -> Result<Ext
 }
 
 // -----------------------------------------------------------------------------
-// User Profile Feed (Full GraphQL Pagination Loop)
+// User Profile Feed (Discovers All Post URLs For Dedicated Post Ingestion)
 // -----------------------------------------------------------------------------
 async fn extract_user_profile_feed(
     input_url: &str,
@@ -511,8 +511,8 @@ async fn extract_user_profile_feed(
         .or_else(|| extract_cookie_val(cookie, "sessionid").and_then(|s| s.split(':').next().map(|v| v.to_string())))
         .unwrap_or_else(|| "0".to_string());
 
-    let mut items = Vec::new();
     let mut discovered_post_urls = Vec::new();
+    let mut seen_codes = HashSet::new();
     let mut cursor: Option<String> = None;
     let mut page_count = 0;
     const MAX_PAGES: usize = 100;
@@ -582,7 +582,7 @@ async fn extract_user_profile_feed(
             .await?;
 
         if !resp.status().is_success() {
-            if items.is_empty() {
+            if discovered_post_urls.is_empty() {
                 bail!("Instagram GraphQL query failed with HTTP {}", resp.status());
             } else {
                 break;
@@ -597,7 +597,7 @@ async fn extract_user_profile_feed(
         let payload: Value = match serde_json::from_str(&body) {
             Ok(val) => val,
             Err(e) => {
-                if items.is_empty() {
+                if discovered_post_urls.is_empty() {
                     bail!("Failed to parse Instagram GraphQL JSON: {e}. Raw: {}", &body[..body.len().min(200)]);
                 } else {
                     break;
@@ -607,7 +607,7 @@ async fn extract_user_profile_feed(
 
         if let Some(err_code) = payload.get("error") {
             let msg = payload.get("errorSummary").and_then(|s| s.as_str()).unwrap_or("unknown error");
-            if items.is_empty() {
+            if discovered_post_urls.is_empty() {
                 bail!("Meta GraphQL error {err_code}: {msg}. Verify session cookies and credentials in .env.");
             } else {
                 break;
@@ -619,7 +619,7 @@ async fn extract_user_profile_feed(
         } else if let Some(conn) = payload.pointer("/data/user/edge_owner_to_timeline_media") {
             (conn.get("edges").and_then(|e| e.as_array()), conn.get("page_info"))
         } else {
-            if items.is_empty() {
+            if discovered_post_urls.is_empty() {
                 let debug_preview = &body[..body.len().min(300)];
                 bail!("Failed to locate timeline connection in GraphQL response. Preview: {debug_preview}");
             } else {
@@ -635,23 +635,8 @@ async fn extract_user_profile_feed(
         for edge in raw_edges {
             let node = edge.get("node").unwrap_or(edge);
             if let Some(code) = node.get("code").or_else(|| node.get("shortcode")).and_then(|c| c.as_str()) {
-                discovered_post_urls.push(format!("https://www.instagram.com/p/{code}/"));
-            }
-
-            if let Some(media_item) = parse_media_item(node).or_else(|| parse_graphql_node(node)) {
-                items.push(media_item);
-            } else if let Some(carousels) = node.get("carousel_media").and_then(|c| c.as_array()) {
-                for c in carousels {
-                    if let Some(item) = parse_media_item(c) {
-                        items.push(item);
-                    }
-                }
-            } else if let Some(carousels) = node.pointer("/edge_sidecar_to_children/edges").and_then(|c| c.as_array()) {
-                for c in carousels {
-                    let child_node = c.get("node").unwrap_or(c);
-                    if let Some(item) = parse_graphql_node(child_node) {
-                        items.push(item);
-                    }
+                if seen_codes.insert(code.to_string()) {
+                    discovered_post_urls.push(format!("https://www.instagram.com/p/{code}/"));
                 }
             }
         }
@@ -674,8 +659,8 @@ async fn extract_user_profile_feed(
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
 
-    if items.is_empty() {
-        bail!("No items returned for @{username}");
+    if discovered_post_urls.is_empty() {
+        bail!("No posts found for @{username}");
     }
 
     Ok(ExtractedMediaMetadata {
@@ -685,7 +670,7 @@ async fn extract_user_profile_feed(
         post_text: None,
         published_at: None,
         tags: Vec::new(),
-        items,
+        items: Vec::new(), // Left empty so downstream queues download each post directly
         location: None,
         next_page_url: None,
         discovered_post_urls,
@@ -802,7 +787,7 @@ async fn extract_direct_pk_links(
         published_at,
         tags: Vec::new(),
         items,
-        location: location,
+        location,
         next_page_url: None,
         discovered_post_urls: Vec::new(),
         embedded_player_urls: Vec::new(),
