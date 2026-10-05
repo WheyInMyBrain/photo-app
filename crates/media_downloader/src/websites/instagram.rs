@@ -181,6 +181,14 @@ async fn fetch_mobile_post_info(shortcode: &str, client: &Client) -> Result<Extr
 
     let tags = extract_hashtags_from_text(&caption);
 
+    let published_at = item
+        .get("taken_at")
+        .and_then(|t| t.as_i64())
+        .and_then(format_epoch_timestamp);
+
+    let location = extract_and_resolve_location(item.get("location"), client).await;
+    let post_url = format!("https://www.instagram.com/p/{shortcode}/");
+
     let raw_nodes: Vec<&Value> =
         if let Some(arr) = item.get("carousel_media").and_then(|c| c.as_array()) {
             arr.iter().collect()
@@ -190,7 +198,25 @@ async fn fetch_mobile_post_info(shortcode: &str, client: &Client) -> Result<Extr
 
     let mut items = Vec::new();
     for node in raw_nodes {
-        if let Some(media_item) = parse_media_item(node) {
+        if let Some(mut media_item) = parse_media_item(node) {
+            // Check for per-slide location or fall back to the post-level location
+            let slide_location = if node.get("location").is_some() {
+                extract_and_resolve_location(node.get("location"), client).await
+            } else {
+                location.clone()
+            };
+
+            // Stamp metadata directly onto the media item
+            media_item.source_post_url = Some(post_url.clone());
+            media_item.caption = if !caption.is_empty() {
+                Some(caption.clone())
+            } else {
+                None
+            };
+            media_item.published_at = published_at.clone();
+            media_item.location = slide_location;
+            media_item.tags = tags.clone();
+
             items.push(media_item);
         }
     }
@@ -200,18 +226,13 @@ async fn fetch_mobile_post_info(shortcode: &str, client: &Client) -> Result<Extr
         bail!("Failed to parse media items from mobile payload for shortcode: {shortcode}");
     }
 
-    let location = extract_and_resolve_location(item.get("location"), client).await;
-
     debug!(shortcode, author = %author, items_count = items.len(), "Successfully fetched post via mobile API");
     Ok(ExtractedMediaMetadata {
         platform: "instagram".to_string(),
         author,
         caption: caption.clone(),
         post_text: Some(caption),
-        published_at: item
-            .get("taken_at")
-            .and_then(|t| t.as_i64())
-            .and_then(format_epoch_timestamp),
+        published_at,
         tags,
         items,
         location,
@@ -573,16 +594,8 @@ async fn extract_user_profile_feed(
     cfg: &DownloaderConfig,
     client: &Client,
 ) -> Result<ExtractedMediaMetadata> {
-    let clean_path = reqwest::Url::parse(input_url)?
-        .path()
-        .trim_matches('/')
-        .to_string();
-    let username = clean_path
-        .split('/')
-        .next()
-        .filter(|s| !s.is_empty() && *s != "explore" && *s != "direct")
-        .context("Could not extract username from Instagram profile URL")?
-        .to_string();
+    let username = extract_username_from_url(input_url)
+        .context("Could not extract username from Instagram profile URL")?;
 
     // Step 1: Discover all profile post URLs
     let post_urls = discover_profile_post_urls(input_url, cfg, client).await?;
@@ -687,15 +700,10 @@ pub async fn discover_profile_post_urls(
     cfg: &DownloaderConfig,
     client: &Client,
 ) -> Result<Vec<String>> {
-    let parsed_url = reqwest::Url::parse(input_url)?;
-    let clean_path = parsed_url.path().trim_matches('/');
-    let username = clean_path
-        .split('/')
-        .next()
-        .filter(|s| !s.is_empty() && *s != "explore" && *s != "direct")
+    let username = extract_username_from_url(input_url)
         .context("Could not extract username from Instagram profile URL")?;
 
-    info!(username, "Starting profile timeline post discovery");
+    info!(username = %username, "Starting profile timeline post discovery");
 
     let cookie = cfg.ig_cookie.as_deref().unwrap_or("");
     let csrf_token = cfg
@@ -715,7 +723,7 @@ pub async fn discover_profile_post_urls(
         })
         .unwrap_or_else(|| "0".to_string());
 
-    debug!(username, ds_user_id = %ds_user_id, "Built profile request credentials");
+    debug!(username = %username, ds_user_id = %ds_user_id, "Built profile request credentials");
 
     let mut discovered_post_urls = Vec::new();
     let mut seen_codes = HashSet::new();
@@ -725,7 +733,7 @@ pub async fn discover_profile_post_urls(
 
     loop {
         page_count += 1;
-        debug!(username, page = page_count, has_cursor = cursor.is_some(), "Requesting profile timeline page");
+        debug!(username = %username, page = page_count, has_cursor = cursor.is_some(), "Requesting profile timeline page");
 
         let (doc_id, friendly_name, variables) = if let Some(ref c) = cursor {
             (
@@ -790,7 +798,7 @@ pub async fn discover_profile_post_urls(
 
         let status = resp.status();
         if !status.is_success() {
-            error!(username, page = page_count, status = %status, "Instagram GraphQL query failed");
+            error!(username = %username, page = page_count, status = %status, "Instagram GraphQL query failed");
             if discovered_post_urls.is_empty() {
                 bail!("Instagram GraphQL query failed with HTTP {status}");
             } else {
@@ -806,7 +814,7 @@ pub async fn discover_profile_post_urls(
         let payload: Value = match serde_json::from_str(&body) {
             Ok(val) => val,
             Err(e) => {
-                error!(username, error = %e, preview = %&body[..body.len().min(300)], "Failed to parse timeline JSON");
+                error!(username = %username, error = %e, preview = %&body[..body.len().min(300)], "Failed to parse timeline JSON");
                 if discovered_post_urls.is_empty() {
                     bail!("Failed to parse Instagram GraphQL JSON: {e}");
                 } else {
@@ -817,7 +825,7 @@ pub async fn discover_profile_post_urls(
 
         if let Some(err_code) = payload.get("error") {
             let msg = payload.get("errorSummary").and_then(|s| s.as_str()).unwrap_or("unknown error");
-            error!(username, error_code = %err_code, summary = %msg, "Meta returned an API-level error");
+            error!(username = %username, error_code = %err_code, summary = %msg, "Meta returned an API-level error");
             if discovered_post_urls.is_empty() {
                 bail!("Meta GraphQL error {err_code}: {msg}. Verify session cookies in .env.");
             } else {
@@ -830,7 +838,7 @@ pub async fn discover_profile_post_urls(
         } else if let Some(conn) = payload.pointer("/data/user/edge_owner_to_timeline_media") {
             (conn.get("edges").and_then(|e| e.as_array()), conn.get("page_info"))
         } else {
-            warn!(username, preview = %&body[..body.len().min(300)], "Could not locate timeline connection in payload");
+            warn!(username = %username, preview = %&body[..body.len().min(300)], "Could not locate timeline connection in payload");
             if discovered_post_urls.is_empty() {
                 bail!("Failed to locate timeline connection in GraphQL response.");
             } else {
@@ -841,7 +849,7 @@ pub async fn discover_profile_post_urls(
         let raw_edges = match edges {
             Some(arr) if !arr.is_empty() => arr,
             _ => {
-                debug!(username, "No edges found on this page, ending pagination");
+                debug!(username = %username, "No edges found on this page, ending pagination");
                 break;
             }
         };
@@ -857,7 +865,7 @@ pub async fn discover_profile_post_urls(
             }
         }
 
-        info!(username, page = page_count, new_posts = new_on_page, total_discovered = discovered_post_urls.len(), "Timeline page processed");
+        info!(username = %username, page = page_count, new_posts = new_on_page, total_discovered = discovered_post_urls.len(), "Timeline page processed");
 
         let has_next_page = page_info
             .and_then(|p| p.get("has_next_page"))
@@ -870,7 +878,7 @@ pub async fn discover_profile_post_urls(
             .map(|s| s.to_string());
 
         if !has_next_page || next_cursor.is_none() || page_count >= MAX_PAGES {
-            debug!(username, has_next_page, max_pages_reached = page_count >= MAX_PAGES, "Finished timeline pagination loop");
+            debug!(username = %username, has_next_page, max_pages_reached = page_count >= MAX_PAGES, "Finished timeline pagination loop");
             break;
         }
 
@@ -879,11 +887,11 @@ pub async fn discover_profile_post_urls(
     }
 
     if discovered_post_urls.is_empty() {
-        error!(username, "0 posts discovered for profile");
+        error!(username = %username, "0 posts discovered for profile");
         bail!("No posts found for @{username}");
     }
 
-    info!(username, total_posts = discovered_post_urls.len(), "Discovered all profile post links");
+    info!(username = %username, total_posts = discovered_post_urls.len(), "Discovered all profile post links");
     Ok(discovered_post_urls)
 }
 
@@ -1330,4 +1338,42 @@ fn shortcode_to_id(shortcode: &str) -> Result<u128> {
 
 fn format_epoch_timestamp(epoch_secs: i64) -> Option<String> {
     chrono::DateTime::from_timestamp(epoch_secs, 0).map(|dt| dt.to_rfc3339())
+}
+
+fn extract_username_from_url(input_url: &str) -> Option<String> {
+    // 1. Strip scheme and parse as Url to isolate the path from any query parameters or fragments
+    let path = if let Ok(parsed) = reqwest::Url::parse(input_url) {
+        parsed.path().trim_matches('/').to_string()
+    } else {
+        // Fallback for raw paths or malformed URLs
+        let without_query = input_url.split('?').next().unwrap_or(input_url);
+        let without_fragment = without_query.split('#').next().unwrap_or(without_query);
+        without_fragment
+            .trim_start_matches("https://")
+            .trim_start_matches("http://")
+            .trim_start_matches("www.")
+            .trim_start_matches("instagram.com/")
+            .trim_start_matches("instagr.am/")
+            .trim_matches('/')
+            .to_string()
+    };
+
+    // 2. Extract the first valid path segment that is not an internal route
+    let username = path
+        .split('/')
+        .next()?
+        .trim();
+
+    if username.is_empty()
+        || username == "explore"
+        || username == "direct"
+        || username == "stories"
+        || username == "p"
+        || username == "reel"
+        || username == "reels"
+    {
+        return None;
+    }
+
+    Some(username.to_string())
 }

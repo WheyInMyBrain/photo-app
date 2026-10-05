@@ -67,7 +67,7 @@
   let detailAbortCtrl: AbortController | null = null;
 
   // =========================================================================
-  // Reactive Transform Engine
+  // Reactive Transform & Mobile Gesture Engine
   // =========================================================================
   let scale = 1.0;
   let translateX = 0;
@@ -75,8 +75,13 @@
   let isDragging = false;
   let dragStartX = 0;
   let dragStartY = 0;
+  let dragStartTime = 0;
   let startTranslateX = 0;
   let startTranslateY = 0;
+
+  // Gesture tracking modes: 'none' | 'pan' | 'dismiss' | 'swipe'
+  let gestureMode: 'none' | 'pan' | 'dismiss' | 'swipe' = 'none';
+  let horizontalSwipeOffset = 0;
 
   // Dismiss Swipe Tracking (Swipe Down to Exit)
   let dismissOffsetY = 0;
@@ -90,6 +95,8 @@
     translateX = 0;
     translateY = 0;
     isDragging = false;
+    gestureMode = 'none';
+    horizontalSwipeOffset = 0;
     dismissOffsetY = 0;
     dismissProgress = 0;
   }
@@ -131,14 +138,19 @@
     }
   }
 
-  // Pointer / Mouse Drag Events
+  // Pointer / Mouse / Touch Drag Events
   function onPointerDown(e: PointerEvent) {
     if (e.button !== 0) return;
     isDragging = true;
+    dragStartTime = Date.now();
     dragStartX = e.clientX;
     dragStartY = e.clientY;
     startTranslateX = translateX;
     startTranslateY = translateY;
+    horizontalSwipeOffset = 0;
+    dismissOffsetY = 0;
+    dismissProgress = 0;
+    gestureMode = scale > 1.05 ? 'pan' : 'none';
 
     (e.currentTarget as HTMLElement)?.setPointerCapture(e.pointerId);
   }
@@ -148,15 +160,36 @@
     const deltaX = e.clientX - dragStartX;
     const deltaY = e.clientY - dragStartY;
 
-    if (scale <= 1.05) {
-      if (deltaY > 0 && Math.abs(deltaY) > Math.abs(deltaX)) {
-        dismissOffsetY = deltaY;
-        dismissProgress = Math.min(1.0, deltaY / 400);
-      }
-    } else {
+    if (scale > 1.05) {
+      // Zoomed-in pan
       translateX = startTranslateX + deltaX;
       translateY = startTranslateY + deltaY;
       clampPan();
+    } else {
+      // 1. Lock in the gesture direction after small deadband (8px)
+      if (gestureMode === 'none') {
+        if (Math.abs(deltaY) > Math.abs(deltaX) && Math.abs(deltaY) > 8) {
+          if (deltaY > 0) gestureMode = 'dismiss';
+        } else if (Math.abs(deltaX) > Math.abs(deltaY) && Math.abs(deltaX) > 8) {
+          gestureMode = 'swipe';
+        }
+      }
+
+      // 2. Execute locked gesture
+      if (gestureMode === 'dismiss') {
+        dismissOffsetY = Math.max(0, deltaY);
+        dismissProgress = Math.min(1.0, dismissOffsetY / 400);
+        horizontalSwipeOffset = 0;
+      } else if (gestureMode === 'swipe') {
+        dismissOffsetY = 0;
+        dismissProgress = 0;
+        // Apply rubber-band friction if swiping past queue edges
+        if ((deltaX > 0 && !hasPrev) || (deltaX < 0 && !hasNext)) {
+          horizontalSwipeOffset = deltaX * 0.28;
+        } else {
+          horizontalSwipeOffset = deltaX;
+        }
+      }
     }
   }
 
@@ -164,12 +197,51 @@
     if (!isDragging) return;
     isDragging = false;
 
-    if (dismissOffsetY > 140) {
-      dispatch('close');
-    } else {
+    const deltaX = e.clientX - dragStartX;
+    const deltaY = e.clientY - dragStartY;
+    const duration = Date.now() - dragStartTime;
+
+    // A. Tap detection (< 12px motion within 300ms)
+    if (Math.abs(deltaX) < 12 && Math.abs(deltaY) < 12 && duration < 300) {
       dismissOffsetY = 0;
       dismissProgress = 0;
+      horizontalSwipeOffset = 0;
+      gestureMode = 'none';
+
+      const screenW = window.innerWidth;
+      // Tap left 22% of screen -> Prev
+      if (e.clientX < screenW * 0.22 && hasPrev) {
+        dispatch('prev');
+        return;
+      }
+      // Tap right 22% of screen -> Next
+      else if (e.clientX > screenW * 0.78 && hasNext) {
+        dispatch('next');
+        return;
+      }
+      return;
     }
+
+    // B. Dismiss swipe threshold
+    if (dismissOffsetY > 130) {
+      dispatch('close');
+      return;
+    }
+
+    // C. Horizontal swipe threshold (> 50px)
+    if (gestureMode === 'swipe' || (Math.abs(deltaX) > 50 && Math.abs(deltaY) < 80)) {
+      if (deltaX > 50 && hasPrev) {
+        dispatch('prev');
+      } else if (deltaX < -50 && hasNext) {
+        dispatch('next');
+      }
+    }
+
+    // Reset offsets
+    dismissOffsetY = 0;
+    dismissProgress = 0;
+    horizontalSwipeOffset = 0;
+    gestureMode = 'none';
   }
 
   function clampPan() {
@@ -406,6 +478,9 @@
       const scaleDown = 1 - dismissProgress * 0.28;
       return `transform: translate3d(0, ${dismissOffsetY}px, 0) scale(${scaleDown}); border-radius: ${dismissProgress * 24}px;`;
     }
+    if (scale <= 1.05 && horizontalSwipeOffset !== 0) {
+      return `transform: translate3d(${horizontalSwipeOffset}px, 0, 0);`;
+    }
     return `transform: translate3d(${translateX}px, ${translateY}px, 0) scale(${scale}); cursor: ${scale > 1.05 ? (isDragging ? 'grabbing' : 'grab') : 'default'};`;
   })();
 </script>
@@ -496,7 +571,7 @@
         style="background: radial-gradient(circle, var(--accent-primary, #6366f1) 0%, transparent 70%);"
       ></div>
 
-      <!-- Navigation Arrows -->
+      <!-- Navigation Arrows (Desktop) -->
       {#if hasPrev && scale <= 1.05 && dismissOffsetY === 0}
         <button
           type="button"
@@ -527,7 +602,7 @@
 
       <!-- Media Canvas -->
       <div
-        class="w-full h-full flex items-center justify-center {isMorphing || (!isDragging && scale > 1.0) ? 'transition-transform duration-150 ease-out' : ''}"
+        class="w-full h-full flex items-center justify-center {isMorphing || (!isDragging && (scale > 1.0 || horizontalSwipeOffset === 0)) ? 'transition-transform duration-200 ease-out' : ''}"
         style={heroStyle}
       >
         {#if isMotionMedia}
