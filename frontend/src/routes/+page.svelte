@@ -1,7 +1,7 @@
 <!-- photo-app/frontend/src/routes/+page.svelte -->
 <script lang="ts">
   import { onMount, onDestroy } from 'svelte';
-  import { fade, scale } from 'svelte/transition';
+  import { fade } from 'svelte/transition';
 
   import { filterStore, filterQueryString } from '$lib/stores/filterStore';
   import { albumStore } from '$lib/stores/albumStore';
@@ -39,7 +39,6 @@
   let showAddToAlbumModal = false;
   let showManageAlbumModal = false;
 
-  // Touch disambiguation to prevent accidental selections while scrolling
   let touchStartX = 0;
   let touchStartY = 0;
   let isScrollDrag = false;
@@ -149,7 +148,7 @@
   function scrollToSection(index: number) {
     const el = document.getElementById(`section-marker-${index}`);
     if (el) {
-      const topOffset = el.getBoundingClientRect().top + window.scrollY - 70;
+      const topOffset = el.getBoundingClientRect().top + window.scrollY - 30;
       window.scrollTo({ top: topOffset, behavior: 'smooth' });
     }
   }
@@ -172,17 +171,20 @@
     }
   }
 
-  function handleCardClick(e: MouseEvent, assetId: string, secIdx: number, itemIdx: number) {
-    // If the touch was part of a swipe or scroll, do not register a tap
+  function handleCardClick(
+    e: MouseEvent | KeyboardEvent,
+    assetId: string,
+    secIdx: number,
+    itemIdx: number
+  ) {
     if (isScrollDrag) {
       isScrollDrag = false;
       return;
     }
 
-    const card = (e.currentTarget as HTMLElement);
+    const card = e.currentTarget as HTMLElement;
     const target = e.target as HTMLElement;
 
-    // Check if the click target was specifically the select button or if selection mode is currently on
     if (target.closest('[data-select-btn]') || $isSelectionActive) {
       e.stopPropagation();
       selection.toggle(assetId, card);
@@ -294,32 +296,33 @@
 
 <div
   style="padding-bottom: max(3.5rem, calc(var(--sab) + 2.5rem));"
-  class="px-2 pt-16 sm:px-4 md:px-8 max-w-[1920px] mx-auto min-h-screen flex flex-col select-none relative transition-transform duration-300 ease-out {activeCoords !== null ? 'scale-[0.985] opacity-80 pointer-events-none' : 'scale-100 opacity-100'}"
+  class="px-2 pt-14 sm:px-4 md:px-8 max-w-[1920px] mx-auto min-h-screen flex flex-col select-none relative transition-transform duration-300 ease-out {activeCoords !== null ? 'scale-[0.985] opacity-80 pointer-events-none' : 'scale-100 opacity-100'}"
 >
-  <!-- Apple-Style Floating Bar -->
-  <div class="flex items-center justify-between gap-3 px-1 py-1 min-h-[38px] mb-2 sticky top-14 z-30">
-    <div class="flex items-center gap-1.5 text-xs text-[var(--text-muted)] overflow-x-auto no-scrollbar py-1">
-      <button
-        type="button"
-        on:click={() => {
-          filterStore.clearAlbum();
-          filterStore.setFolderPath('');
-        }}
-        class="h-8 px-3 rounded-full flex items-center gap-1.5 font-medium transition-all spring-tap cursor-pointer {!currentAlbumPath ? 'bg-purple-500/15 text-purple-600 dark:text-purple-300 border border-purple-500/30 shadow-sm' : 'hover:bg-[var(--card-bg)] text-[var(--text-muted)]'}"
-        title="All Photos"
-        aria-label="Root view"
-      >
-        <svg xmlns="http://www.w3.org/2000/svg" class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
-          <rect x="3" y="3" width="18" height="18" rx="2" ry="2"></rect>
-          <circle cx="8.5" cy="8.5" r="1.5"></circle>
-          <polyline points="21 15 16 10 5 21"></polyline>
-        </svg>
-        <span class="text-[11px] font-semibold tracking-tight">Library</span>
-      </button>
+  <!-- Minimal Clean Header Strip -->
+  <div class="flex items-center justify-between gap-3 px-1 py-1 min-h-[38px] mb-3">
+    <div class="flex items-center gap-1.5 text-xs text-[var(--text-muted)] overflow-x-auto no-scrollbar py-0.5">
+      <!-- Icon-only jump home when inside albums -->
+      {#if currentAlbumPath}
+        <button
+          type="button"
+          on:click={() => {
+            filterStore.clearAlbum();
+            filterStore.setFolderPath('');
+          }}
+          class="w-7 h-7 rounded-full flex items-center justify-center transition-all spring-tap cursor-pointer bg-[var(--card-bg)] text-[var(--text-muted)] hover:text-[var(--text-main)] border border-[var(--border-glass)]"
+          title="Back to all"
+          aria-label="Back to all"
+        >
+          <svg xmlns="http://www.w3.org/2000/svg" class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+            <polyline points="15 18 9 12 15 6"></polyline>
+          </svg>
+        </button>
+      {/if}
 
+      <!-- Breadcrumbs without the "Library" label -->
       {#if breadcrumbSegments.length > 0}
         {#each breadcrumbSegments as seg, idx (seg.path)}
-          <span class="opacity-30 text-[11px]">/</span>
+          {#if idx > 0}<span class="opacity-25 text-[10px]">/</span>{/if}
           {@const isLast = idx === breadcrumbSegments.length - 1}
 
           <div class="inline-flex items-center gap-1.5 px-3 py-1 rounded-full liquid-breadcrumb text-[var(--text-main)] text-xs">
@@ -336,7 +339,7 @@
                 type="button"
                 on:click={() => (showManageAlbumModal = true)}
                 class="text-[var(--text-muted)] hover:text-[var(--text-main)] p-0.5 cursor-pointer transition-colors"
-                title="Options"
+                title="Album Options"
               >
                 <svg xmlns="http://www.w3.org/2000/svg" class="w-3 h-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2">
                   <circle cx="12" cy="12" r="1"></circle>
@@ -371,74 +374,90 @@
     </div>
   </div>
 
-  <!-- ROOT ALBUMS SHELF -->
+  <!-- ROOT ALBUMS (Cinematic Stacked Cards) -->
   {#if $filterStore.view_mode === 'albums' && !currentAlbumPath && rootAlbums.length > 0}
-    <div class="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-6 gap-3 mb-6" in:fade={{ duration: 150 }}>
+    <div class="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6 gap-3.5 mb-8" in:fade={{ duration: 150 }}>
       {#each rootAlbums as album (album.id)}
         <button
           type="button"
           on:click={() => filterStore.setAlbumId(album.id)}
-          class="album-card group text-left p-2 rounded-2xl bg-[var(--card-bg)] hover:bg-[var(--dock-bg-hover)] border border-[var(--border-glass)] hover:border-purple-500/40 transition-all cursor-pointer flex flex-col gap-2 spring-tap shadow-sm"
+          class="album-stack group text-left relative aspect-[4/5] rounded-2xl overflow-hidden cursor-pointer transition-all duration-300 spring-tap focus:outline-none focus:ring-2 focus:ring-purple-400"
         >
-          <div class="w-full aspect-square rounded-xl overflow-hidden bg-black/10 dark:bg-black/30 flex items-center justify-center relative">
+          <!-- Background Stack Illusion Layers -->
+          <div class="stack-underlay"></div>
+
+          <!-- Main Cover Image -->
+          <div class="w-full h-full bg-[#121216] relative overflow-hidden rounded-2xl">
             {#if album.cover_thumb}
               <img
                 src={album.cover_thumb.startsWith('/') ? album.cover_thumb : `/${album.cover_thumb}`}
                 alt={album.title}
                 loading="lazy"
-                class="w-full h-full object-cover group-hover:scale-105 transition-transform duration-500"
+                class="w-full h-full object-cover group-hover:scale-106 transition-transform duration-500 ease-out"
               />
             {:else}
-              <div class="w-8 h-8 text-[var(--text-muted)] opacity-30">
-                <svg xmlns="http://www.w3.org/2000/svg" class="w-full h-full" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
+              <div class="w-full h-full flex items-center justify-center text-[var(--text-muted)] opacity-20 bg-gradient-to-br from-white/5 to-white/0">
+                <svg xmlns="http://www.w3.org/2000/svg" class="w-12 h-12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.2">
                   <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path>
                 </svg>
               </div>
             {/if}
-            <div class="absolute bottom-1.5 right-1.5 bg-black/60 backdrop-blur-md px-2 py-0.5 rounded-lg text-[10px] text-white font-mono">
-              {album.media_count}
-            </div>
-          </div>
 
-          <div class="px-1 truncate text-xs font-semibold text-[var(--text-main)] group-hover:text-purple-500 transition-colors">
-            {album.rootName}
+            <!-- Bottom Gradient Scrim Overlay -->
+            <div class="absolute inset-0 bg-gradient-to-t from-black/85 via-black/20 to-transparent pointer-events-none"></div>
+
+            <!-- Typography & Counts Embedded into the Card -->
+            <div class="absolute inset-x-0 bottom-0 p-3.5 flex flex-col gap-0.5 pointer-events-none">
+              <span class="text-xs sm:text-sm font-bold text-white tracking-tight drop-shadow-md truncate">
+                {album.rootName}
+              </span>
+              <span class="text-[11px] font-mono text-white/70 font-medium">
+                {album.media_count} {album.media_count === 1 ? 'item' : 'items'}
+              </span>
+            </div>
           </div>
         </button>
       {/each}
     </div>
   {/if}
 
-  <!-- CHILD SUB-ALBUMS SHELF -->
+  <!-- SUB-ALBUMS SHELF (Matching Modern Cinematic Style) -->
   {#if currentAlbumPath && childAlbums.length > 0}
-    <div class="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-6 gap-3 mb-6" in:fade={{ duration: 150 }}>
+    <div class="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6 gap-3.5 mb-8" in:fade={{ duration: 150 }}>
       {#each childAlbums as subAlbum (subAlbum.id || subAlbum.directSubName)}
         <button
           type="button"
           on:click={() => openChildAlbum(subAlbum)}
-          class="album-card group text-left p-2 rounded-2xl bg-[var(--card-bg)] hover:bg-[var(--dock-bg-hover)] border border-[var(--border-glass)] hover:border-purple-500/40 transition-all cursor-pointer flex flex-col gap-2 spring-tap shadow-sm"
+          class="album-stack group text-left relative aspect-[4/5] rounded-2xl overflow-hidden cursor-pointer transition-all duration-300 spring-tap focus:outline-none focus:ring-2 focus:ring-purple-400"
         >
-          <div class="w-full aspect-square rounded-xl overflow-hidden bg-black/10 dark:bg-black/30 flex items-center justify-center relative">
+          <div class="stack-underlay"></div>
+
+          <div class="w-full h-full bg-[#121216] relative overflow-hidden rounded-2xl">
             {#if subAlbum.cover_thumb}
               <img
                 src={subAlbum.cover_thumb.startsWith('/') ? subAlbum.cover_thumb : `/${subAlbum.cover_thumb}`}
                 alt={subAlbum.displayTitle}
                 loading="lazy"
-                class="w-full h-full object-cover group-hover:scale-105 transition-transform duration-500"
+                class="w-full h-full object-cover group-hover:scale-106 transition-transform duration-500 ease-out"
               />
             {:else}
-              <div class="w-8 h-8 text-[var(--text-muted)] opacity-30">
-                <svg xmlns="http://www.w3.org/2000/svg" class="w-full h-full" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
+              <div class="w-full h-full flex items-center justify-center text-[var(--text-muted)] opacity-20 bg-gradient-to-br from-white/5 to-white/0">
+                <svg xmlns="http://www.w3.org/2000/svg" class="w-12 h-12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.2">
                   <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path>
                 </svg>
               </div>
             {/if}
-            <div class="absolute bottom-1.5 right-1.5 bg-black/60 backdrop-blur-md px-2 py-0.5 rounded-lg text-[10px] text-white font-mono">
-              {subAlbum.media_count}
-            </div>
-          </div>
 
-          <div class="px-1 truncate text-xs font-semibold text-[var(--text-main)] group-hover:text-purple-500 transition-colors">
-            {subAlbum.displayTitle}
+            <div class="absolute inset-0 bg-gradient-to-t from-black/85 via-black/20 to-transparent pointer-events-none"></div>
+
+            <div class="absolute inset-x-0 bottom-0 p-3.5 flex flex-col gap-0.5 pointer-events-none">
+              <span class="text-xs sm:text-sm font-bold text-white tracking-tight drop-shadow-md truncate">
+                {subAlbum.displayTitle}
+              </span>
+              <span class="text-[11px] font-mono text-white/70 font-medium">
+                {subAlbum.media_count} {subAlbum.media_count === 1 ? 'item' : 'items'}
+              </span>
+            </div>
           </div>
         </button>
       {/each}
@@ -459,31 +478,28 @@
       <p class="text-xs text-[var(--text-muted)] mt-1">Try clearing filters or uploading new photos</p>
     </div>
   {:else}
-    <!-- Timeline Container (Always smooth scrolling, no touch lockouts) -->
+    <!-- Timeline: Natural Scrolling (NO sticky pinning) -->
     <div
       role="region"
       aria-label="Media grid"
-      class="space-y-6 md:space-y-8 select-none touch-pan-y"
+      class="space-y-6 md:space-y-7 select-none touch-pan-y"
       style="--grid-cols: {currentDensity.cols}; --grid-cols-mobile: {currentDensity.colsMobile};"
       on:touchstart={handleTouchStart}
       on:touchmove={handleTouchMove}
     >
       {#each $sections as section, secIdx (section.id || section.title)}
         <section id="section-marker-{secIdx}" class="section-container">
-          <!-- Floating Apple-Style Date Header -->
-          <div class="sticky top-12 z-20 py-2.5 px-2 flex items-center justify-between backdrop-blur-2xl bg-[var(--bg-primary)]/80 mb-2 border-b border-[var(--border-glass)]/50 rounded-xl transition-all">
-            <div class="flex items-center gap-2">
-              <span class="w-2 h-2 rounded-full bg-purple-500 shadow-[0_0_8px_rgba(168,85,247,0.7)]"></span>
-              <h2 class="text-xs sm:text-sm font-bold tracking-tight text-[var(--text-main)]">
-                {section.title}
-              </h2>
-            </div>
-            <span class="text-[11px] font-mono text-[var(--text-muted)] bg-[var(--pill-bg)] px-2.5 py-0.5 rounded-full border border-[var(--border-glass)]">
-              {section.items.length} {section.items.length === 1 ? 'item' : 'items'}
+          <!-- Static Natural Header: Scrolls with the gallery, never stays stuck -->
+          <div class="pt-2 pb-1.5 px-0.5 flex items-baseline justify-between mb-1.5">
+            <h2 class="text-xs sm:text-sm font-semibold tracking-tight text-[var(--text-main)]">
+              {section.title}
+            </h2>
+            <span class="text-[10px] font-mono text-[var(--text-muted)] opacity-60">
+              {section.items.length}
             </span>
           </div>
 
-          <!-- Uniform Grid Cells -->
+          <!-- Seamless Photo Grid -->
           <div class="gallery-grid">
             {#each section.items as asset, itemIdx (asset.id)}
               {@const isPriority = secIdx === 0 && itemIdx < 20}
@@ -500,12 +516,12 @@
                 on:click={(e) => handleCardClick(e, asset.id, secIdx, itemIdx)}
                 on:keydown={(e) => {
                   if (e.key === 'Enter' || e.key === ' ') {
-                    handleCardClick(e as any, asset.id, secIdx, itemIdx);
+                    handleCardClick(e, asset.id, secIdx, itemIdx);
                   }
                 }}
-                class="tile-card group relative aspect-square rounded-lg overflow-hidden cursor-pointer focus:outline-none transition-transform duration-150 {isSelected ? 'scale-[0.93] ring-3 ring-purple-500 shadow-md' : 'hover:scale-[1.015]'}"
+                class="tile-card group relative aspect-square rounded-md overflow-hidden cursor-pointer focus:outline-none transition-transform duration-150 {isSelected ? 'scale-[0.93] ring-3 ring-purple-500 shadow-md' : 'hover:scale-[1.015]'}"
               >
-                <!-- Thumbnail Image with Static Native Placeholder -->
+                <!-- Thumbnail Image -->
                 <img
                   src={asset.thumb_path.startsWith('/') ? asset.thumb_path : `/${asset.thumb_path}`}
                   alt={asset.file_name}
@@ -548,7 +564,7 @@
                   </div>
                 {/if}
 
-                <!-- Days Remaining Badge in Trash View -->
+                <!-- Days Remaining in Trash -->
                 {#if asset.days_remaining !== null && asset.days_remaining !== undefined && $gridDensity > 0}
                   <div class="absolute bottom-1.5 left-1.5 bg-rose-600/70 backdrop-blur-md border border-rose-400/40 px-2 py-0.5 rounded-md text-[9px] text-white font-mono font-medium z-10 pointer-events-none shadow-sm">
                     <span>{asset.days_remaining}d left</span>
@@ -566,7 +582,7 @@
     </div>
   {/if}
 
-  <!-- Prefetch Scroll Anchor -->
+  <!-- Infinite Scroll Pre-fetch Anchor -->
   <div bind:this={scrollTrigger} class="py-12 flex justify-center items-center min-h-[4rem]">
     {#if $isLoading}
       <div class="flex items-center gap-2 text-xs font-mono text-[var(--text-muted)] bg-[var(--card-bg)] px-4 py-2 rounded-full border border-[var(--border-glass)] shadow-sm">
@@ -658,9 +674,32 @@
 
   .section-container {
     content-visibility: auto;
-    contain-intrinsic-size: auto 420px;
+    contain-intrinsic-size: auto 380px;
   }
 
+  /* Album Stack Effect */
+  .album-stack {
+    border: 1px solid var(--border-glass, rgba(255, 255, 255, 0.1));
+    box-shadow: 0 4px 16px rgba(0, 0, 0, 0.25);
+  }
+
+  .stack-underlay {
+    position: absolute;
+    inset: -2px;
+    background: var(--card-bg, #1a1a20);
+    border-radius: 1rem;
+    z-index: -1;
+    transform: translateY(2px) scale(0.97);
+    opacity: 0.5;
+    border: 1px solid var(--border-glass, rgba(255, 255, 255, 0.08));
+  }
+
+  .album-stack:hover {
+    box-shadow: 0 12px 28px -6px rgba(0, 0, 0, 0.45);
+    border-color: rgba(168, 85, 247, 0.35);
+  }
+
+  /* Uniform Gallery Grid */
   .gallery-grid {
     display: grid;
     gap: 0.25rem;
