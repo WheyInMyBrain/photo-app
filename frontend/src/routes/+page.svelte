@@ -47,7 +47,6 @@
   $: prevAsset = resolveAsset($sections, getPrevCoords($sections, activeCoords));
   $: nextAsset = resolveAsset($sections, getNextCoords($sections, activeCoords));
 
-  // Define or import your Album type
   interface Album {
     id: string;
     title?: string | null;
@@ -56,13 +55,13 @@
     [key: string]: any;
   }
 
-  $: currentAlbum =$filterStore.album_id
-    ? ($albumStore as Album[]).find((a: Album) => a.id ===$filterStore.album_id) ?? null
+  $: currentAlbum = $filterStore.album_id
+    ? ($albumStore as Album[]).find((a: Album) => a.id === $filterStore.album_id) ?? null
     : null;
 
   $: currentAlbumPath = currentAlbum
     ? (currentAlbum.title || '').replace(/^\/+|\/+$/g, '')
-    : ($filterStore.folder_path || '').replace(/^\/+\vert{}\/+$/g, '');
+    : ($filterStore.folder_path || '').replace(/^\/+|\/+$/g, '');
 
   $: breadcrumbSegments = (() => {
     if (!currentAlbumPath) return [];
@@ -143,13 +142,23 @@
 
   $: currentDensity = DENSITY_PRESETS[$gridDensity];
 
-  // Fast reactive Set for O(1) checks on every render
-  $: selectedSet = new Set<string>(
-    Array.from(
+  // Explicitly depend on $selectedCount and $isSelectionActive to guarantee
+  // that Svelte re-evaluates the selection set on every single click/toggle
+  $: selectedSet = (() => {
+    void $selectedCount;
+    void $isSelectionActive;
+
+    const raw =
       (selection as any).selectedIds ??
-      (typeof (selection as any).getSelectedIds === 'function' ? (selection as any).getSelectedIds() : [])
-    )
-  );
+      (typeof (selection as any).getSelectedIds === 'function'
+        ? (selection as any).getSelectedIds()
+        : []);
+
+    if (raw instanceof Set) {
+      return new Set<string>(raw);
+    }
+    return new Set<string>(Array.from(raw || []));
+  })();
 
   $: selectedAssetIds = Array.from(selectedSet);
 
@@ -333,7 +342,6 @@
   <!-- Minimal Clean Header Strip -->
   <div class="flex items-center justify-between gap-3 px-1 py-1 min-h-[38px] mb-3">
     <div class="flex items-center gap-1.5 text-xs text-[var(--text-muted)] overflow-x-auto no-scrollbar py-0.5">
-      <!-- Icon-only jump home when inside albums -->
       {#if currentAlbumPath}
         <button
           type="button"
@@ -351,7 +359,6 @@
         </button>
       {/if}
 
-      <!-- Breadcrumbs without the "Library" label -->
       {#if breadcrumbSegments.length > 0}
         {#each breadcrumbSegments as seg, idx (seg.path)}
           {#if idx > 0}<span class="opacity-25 text-[10px]">/</span>{/if}
@@ -391,9 +398,9 @@
         <button
           type="button"
           on:click={() => selection.clearSelection()}
-          class="px-3 py-1 rounded-full bg-[var(--card-bg)] border border-[var(--border-glass)] text-xs font-semibold text-[var(--text-main)] hover:bg-[var(--dock-bg-hover)] transition-all cursor-pointer shadow-sm"
+          class="px-3 py-1 rounded-full bg-purple-600 border border-purple-400 text-xs font-semibold text-white hover:bg-purple-500 transition-all cursor-pointer shadow-md active:scale-95"
         >
-          Done
+          Done ({$selectedCount})
         </button>
       {/if}
 
@@ -415,10 +422,8 @@
           on:click={() => filterStore.setAlbumId(album.id)}
           class="album-stack group text-left relative aspect-[4/5] rounded-2xl overflow-hidden cursor-pointer transition-all duration-300 spring-tap focus:outline-none focus:ring-2 focus:ring-purple-400"
         >
-          <!-- Background Stack Illusion Layers -->
           <div class="stack-underlay"></div>
 
-          <!-- Main Cover Image -->
           <div class="w-full h-full bg-[#121216] relative overflow-hidden rounded-2xl">
             {#if album.cover_thumb}
               <img
@@ -435,10 +440,8 @@
               </div>
             {/if}
 
-            <!-- Bottom Gradient Scrim Overlay -->
             <div class="absolute inset-0 bg-gradient-to-t from-black/85 via-black/20 to-transparent pointer-events-none"></div>
 
-            <!-- Typography & Counts Embedded into the Card -->
             <div class="absolute inset-x-0 bottom-0 p-3.5 flex flex-col gap-0.5 pointer-events-none">
               <span class="text-xs sm:text-sm font-bold text-white tracking-tight drop-shadow-md truncate">
                 {album.rootName}
@@ -453,7 +456,7 @@
     </div>
   {/if}
 
-  <!-- SUB-ALBUMS SHELF (Matching Modern Cinematic Style) -->
+  <!-- SUB-ALBUMS SHELF -->
   {#if currentAlbumPath && childAlbums.length > 0}
     <div class="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6 gap-3.5 mb-8" in:fade={{ duration: 150 }}>
       {#each childAlbums as subAlbum (subAlbum.id || subAlbum.directSubName)}
@@ -510,7 +513,6 @@
       <p class="text-xs text-[var(--text-muted)] mt-1">Try clearing filters or uploading new photos</p>
     </div>
   {:else}
-    <!-- Timeline: Natural Scrolling (NO sticky pinning) -->
     <div
       role="region"
       aria-label="Media grid"
@@ -521,7 +523,6 @@
     >
       {#each $sections as section, secIdx (section.id || section.title)}
         <section id="section-marker-{secIdx}" class="section-container">
-          <!-- Static Natural Header: Scrolls with the gallery, never stays stuck -->
           <div class="pt-2 pb-1.5 px-0.5 flex items-baseline justify-between mb-1.5">
             <h2 class="text-xs sm:text-sm font-semibold tracking-tight text-[var(--text-main)]">
               {section.title}
@@ -551,42 +552,42 @@
                     handleCardClick(e, asset.id, secIdx, itemIdx);
                   }
                 }}
-                class="tile-card group relative aspect-square rounded-lg overflow-hidden cursor-pointer focus:outline-none transition-all duration-200 {isSelected ? 'selected' : 'hover:scale-[1.01]'}"
+                class="tile-card group relative aspect-square rounded-xl overflow-hidden cursor-pointer focus:outline-none transition-all duration-200 {isSelected ? 'selected ring-3 ring-purple-500 shadow-lg' : 'hover:scale-[1.015]'}"
               >
-                <!-- Thumbnail Image (Smoothly scales down when selected) -->
-                <img
-                  src={asset.thumb_path.startsWith('/') ? asset.thumb_path : `/${asset.thumb_path}`}
-                  alt={asset.file_name}
-                  loading={isPriority ? 'eager' : 'lazy'}
-                  decoding="async"
-                  fetchpriority={isPriority ? 'high' : 'auto'}
-                  on:load={handleImageLoad}
-                  class="tile-image w-full h-full object-cover pointer-events-none transition-transform duration-200 {isSelected ? 'scale-[0.88] rounded-md' : 'scale-100'}"
-                />
+                <!-- Thumbnail Image (Smoothly insets and pads when selected) -->
+                <div class="w-full h-full overflow-hidden transition-all duration-200 {isSelected ? 'p-1.5 bg-purple-950/40' : 'p-0'}">
+                  <img
+                    src={asset.thumb_path.startsWith('/') ? asset.thumb_path : `/${asset.thumb_path}`}
+                    alt={asset.file_name}
+                    loading={isPriority ? 'eager' : 'lazy'}
+                    decoding="async"
+                    fetchpriority={isPriority ? 'high' : 'auto'}
+                    on:load={handleImageLoad}
+                    class="tile-image w-full h-full object-cover pointer-events-none transition-all duration-200 {isSelected ? 'rounded-lg brightness-90 saturate-125' : 'rounded-none'}"
+                  />
+                </div>
 
-                <!-- Selected State Backdrop Overlay & Inset Ring (Cannot be clipped) -->
+                <!-- Luminous Purple Overlay when Selected -->
                 {#if isSelected}
-                  <div class="selection-overlay pointer-events-none absolute inset-0 z-10 flex items-center justify-center">
-                    <div class="selection-ring absolute inset-0 rounded-lg pointer-events-none"></div>
-                  </div>
+                  <div class="absolute inset-0 pointer-events-none z-10 bg-purple-500/20 border-2 border-purple-400 rounded-xl shadow-[inset_0_0_12px_rgba(168,85,247,0.4)]"></div>
                 {/if}
 
-                <!-- Selection Circle Badge -->
+                <!-- Selection Checkmark Capsule Badge -->
                 <button
                   type="button"
                   data-select-btn
-                  class="select-btn absolute top-1.5 left-1.5 w-6 h-6 rounded-full flex items-center justify-center transition-all z-20 cursor-pointer active:scale-90 {isSelected ? 'opacity-100 scale-100 bg-purple-600 border-2 border-white text-white shadow-lg' : ($isSelectionActive ? 'opacity-100 scale-95 bg-black/40 border border-white/60 text-transparent' : 'opacity-0 scale-90 group-hover:opacity-100 bg-black/40 border border-white/60 text-transparent')}"
+                  class="select-btn absolute top-2 left-2 w-6 h-6 rounded-full flex items-center justify-center transition-all z-20 cursor-pointer active:scale-90 {isSelected ? 'opacity-100 scale-100 bg-purple-600 border-2 border-white text-white shadow-md' : ($isSelectionActive ? 'opacity-100 scale-95 bg-black/40 border border-white/70 text-transparent' : 'opacity-0 scale-90 group-hover:opacity-100 bg-black/40 border border-white/60 text-transparent')}"
                   title="Select"
                   aria-label="Select photo"
                 >
-                  <svg xmlns="http://www.w3.org/2000/svg" class="w-3.5 h-3.5 pointer-events-none transition-opacity duration-150 {isSelected ? 'opacity-100 text-white' : 'opacity-0'}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round">
+                  <svg xmlns="http://www.w3.org/2000/svg" class="w-3.5 h-3.5 pointer-events-none stroke-[3] {isSelected ? 'opacity-100 text-white' : 'opacity-0'}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round">
                     <polyline points="20 6 9 17 4 12"></polyline>
                   </svg>
                 </button>
 
                 <!-- Favorite Badge -->
                 {#if asset.is_favorite}
-                  <div class="absolute top-1.5 right-1.5 bg-black/50 backdrop-blur-md px-1.5 py-1 rounded-full text-amber-300 z-10 pointer-events-none shadow-sm border border-white/10 flex items-center justify-center">
+                  <div class="absolute top-2 right-2 bg-black/55 backdrop-blur-md px-1.5 py-1 rounded-full text-amber-300 z-10 pointer-events-none shadow-sm border border-white/10 flex items-center justify-center">
                     <svg xmlns="http://www.w3.org/2000/svg" class="w-2.5 h-2.5 fill-amber-300 stroke-amber-300" viewBox="0 0 24 24" stroke-width="2">
                       <polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"></polygon>
                     </svg>
@@ -595,7 +596,7 @@
 
                 <!-- Video Duration HUD -->
                 {#if asset.duration_seconds && $gridDensity > 0}
-                  <div class="absolute bottom-1.5 right-1.5 bg-black/65 backdrop-blur-md border border-white/15 px-2 py-0.5 rounded-md text-[9px] text-white font-mono font-medium z-10 pointer-events-none flex items-center gap-1 shadow-sm">
+                  <div class="absolute bottom-2 right-2 bg-black/70 backdrop-blur-md border border-white/15 px-2 py-0.5 rounded-md text-[9px] text-white font-mono font-medium z-10 pointer-events-none flex items-center gap-1 shadow-sm">
                     <svg xmlns="http://www.w3.org/2000/svg" class="w-2 h-2 fill-current" viewBox="0 0 24 24">
                       <polygon points="5 3 19 12 5 21 5 3"></polygon>
                     </svg>
@@ -605,11 +606,11 @@
 
                 <!-- Days Remaining in Trash -->
                 {#if asset.days_remaining !== null && asset.days_remaining !== undefined && $gridDensity > 0}
-                  <div class="absolute bottom-1.5 left-1.5 bg-rose-600/70 backdrop-blur-md border border-rose-400/40 px-2 py-0.5 rounded-md text-[9px] text-white font-mono font-medium z-10 pointer-events-none shadow-sm">
+                  <div class="absolute bottom-2 left-2 bg-rose-600/75 backdrop-blur-md border border-rose-400/40 px-2 py-0.5 rounded-md text-[9px] text-white font-mono font-medium z-10 pointer-events-none shadow-sm">
                     <span>{asset.days_remaining}d left</span>
                   </div>
                 {:else if asset.mime_type === 'image/gif' && $gridDensity > 0}
-                  <div class="absolute bottom-1.5 left-1.5 bg-black/65 backdrop-blur-md border border-white/20 px-1.5 py-0.5 rounded text-[8px] text-white font-mono font-bold tracking-wider z-10 pointer-events-none">
+                  <div class="absolute bottom-2 left-2 bg-black/70 backdrop-blur-md border border-white/20 px-1.5 py-0.5 rounded text-[8px] text-white font-mono font-bold tracking-wider z-10 pointer-events-none">
                     GIF
                   </div>
                 {/if}
@@ -759,21 +760,6 @@
     contain: layout paint;
     -webkit-touch-callout: none;
     background-color: var(--card-bg, #1e1e24);
-    transition: background-color 0.2s ease, transform 0.15s ease;
-  }
-
-  /* Distinct Selected State styling */
-  .tile-card.selected {
-    background-color: rgba(168, 85, 247, 0.15);
-  }
-
-  .selection-overlay {
-    background: radial-gradient(circle, rgba(168, 85, 247, 0.18) 0%, rgba(147, 51, 234, 0.28) 100%);
-  }
-
-  .selection-ring {
-    border: 3px solid #a855f7;
-    box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.4), 0 0 16px rgba(168, 85, 247, 0.5);
   }
 
   .select-btn {
@@ -784,7 +770,7 @@
 
   .tile-image {
     opacity: 0;
-    transition: opacity 0.2s ease-out, transform 0.2s cubic-bezier(0.16, 1, 0.3, 1);
+    transition: opacity 0.2s ease-out;
   }
 
   :global(.tile-image.loaded) {
