@@ -552,31 +552,29 @@
                     handleCardClick(e, asset.id, secIdx, itemIdx);
                   }
                 }}
-                class="tile-card group relative aspect-square rounded-xl overflow-hidden cursor-pointer focus:outline-none transition-all duration-200 {isSelected ? 'selected ring-3 ring-purple-500 shadow-lg' : 'hover:scale-[1.015]'}"
+                class="tile-card group relative aspect-square rounded-lg overflow-hidden cursor-pointer focus:outline-none transition-transform duration-200 {isSelected ? 'scale-[0.92]' : 'hover:scale-[1.01]'}"
               >
-                <!-- Thumbnail Image (Smoothly insets and pads when selected) -->
-                <div class="w-full h-full overflow-hidden transition-all duration-200 {isSelected ? 'p-1.5 bg-purple-950/40' : 'p-0'}">
-                  <img
-                    src={asset.thumb_path.startsWith('/') ? asset.thumb_path : `/${asset.thumb_path}`}
-                    alt={asset.file_name}
-                    loading={isPriority ? 'eager' : 'lazy'}
-                    decoding="async"
-                    fetchpriority={isPriority ? 'high' : 'auto'}
-                    on:load={handleImageLoad}
-                    class="tile-image w-full h-full object-cover pointer-events-none transition-all duration-200 {isSelected ? 'rounded-lg brightness-90 saturate-125' : 'rounded-none'}"
-                  />
-                </div>
+                <!-- Thumbnail Image (Stays visible, never resets opacity) -->
+                <img
+                  src={asset.thumb_path.startsWith('/') ? asset.thumb_path : `/${asset.thumb_path}`}
+                  alt={asset.file_name}
+                  loading={isPriority ? 'eager' : 'lazy'}
+                  decoding="async"
+                  fetchpriority={isPriority ? 'high' : 'auto'}
+                  on:load={handleImageLoad}
+                  class="tile-image w-full h-full object-cover pointer-events-none rounded-lg"
+                />
 
-                <!-- Luminous Purple Overlay when Selected -->
+                <!-- Selection Border Ring & Subtle Highlight (Does NOT block or darken the photo) -->
                 {#if isSelected}
-                  <div class="absolute inset-0 pointer-events-none z-10 bg-purple-500/20 border-2 border-purple-400 rounded-xl shadow-[inset_0_0_12px_rgba(168,85,247,0.4)]"></div>
+                  <div class="pointer-events-none absolute inset-0 z-10 rounded-lg ring-3 ring-purple-500 ring-inset bg-purple-500/10"></div>
                 {/if}
 
-                <!-- Selection Checkmark Capsule Badge -->
+                <!-- Selection Circle Badge -->
                 <button
                   type="button"
                   data-select-btn
-                  class="select-btn absolute top-2 left-2 w-6 h-6 rounded-full flex items-center justify-center transition-all z-20 cursor-pointer active:scale-90 {isSelected ? 'opacity-100 scale-100 bg-purple-600 border-2 border-white text-white shadow-md' : ($isSelectionActive ? 'opacity-100 scale-95 bg-black/40 border border-white/70 text-transparent' : 'opacity-0 scale-90 group-hover:opacity-100 bg-black/40 border border-white/60 text-transparent')}"
+                  class="select-btn absolute top-1.5 left-1.5 w-6 h-6 rounded-full flex items-center justify-center transition-all z-20 cursor-pointer active:scale-90 {isSelected ? 'opacity-100 scale-100 bg-purple-600 text-white shadow-md border-2 border-white' : ($isSelectionActive ? 'opacity-100 scale-95 bg-black/40 border border-white/70 text-transparent' : 'opacity-0 scale-90 group-hover:opacity-100 bg-black/40 border border-white/70 text-transparent')}"
                   title="Select"
                   aria-label="Select photo"
                 >
@@ -587,7 +585,7 @@
 
                 <!-- Favorite Badge -->
                 {#if asset.is_favorite}
-                  <div class="absolute top-2 right-2 bg-black/55 backdrop-blur-md px-1.5 py-1 rounded-full text-amber-300 z-10 pointer-events-none shadow-sm border border-white/10 flex items-center justify-center">
+                  <div class="absolute top-1.5 right-1.5 bg-black/55 backdrop-blur-md px-1.5 py-1 rounded-full text-amber-300 z-10 pointer-events-none shadow-sm border border-white/10 flex items-center justify-center">
                     <svg xmlns="http://www.w3.org/2000/svg" class="w-2.5 h-2.5 fill-amber-300 stroke-amber-300" viewBox="0 0 24 24" stroke-width="2">
                       <polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"></polygon>
                     </svg>
@@ -596,7 +594,7 @@
 
                 <!-- Video Duration HUD -->
                 {#if asset.duration_seconds && $gridDensity > 0}
-                  <div class="absolute bottom-2 right-2 bg-black/70 backdrop-blur-md border border-white/15 px-2 py-0.5 rounded-md text-[9px] text-white font-mono font-medium z-10 pointer-events-none flex items-center gap-1 shadow-sm">
+                  <div class="absolute bottom-1.5 right-1.5 bg-black/70 backdrop-blur-md border border-white/15 px-2 py-0.5 rounded-md text-[9px] text-white font-mono font-medium z-10 pointer-events-none flex items-center gap-1 shadow-sm">
                     <svg xmlns="http://www.w3.org/2000/svg" class="w-2 h-2 fill-current" viewBox="0 0 24 24">
                       <polygon points="5 3 19 12 5 21 5 3"></polygon>
                     </svg>
@@ -606,11 +604,11 @@
 
                 <!-- Days Remaining in Trash -->
                 {#if asset.days_remaining !== null && asset.days_remaining !== undefined && $gridDensity > 0}
-                  <div class="absolute bottom-2 left-2 bg-rose-600/75 backdrop-blur-md border border-rose-400/40 px-2 py-0.5 rounded-md text-[9px] text-white font-mono font-medium z-10 pointer-events-none shadow-sm">
+                  <div class="absolute bottom-1.5 left-1.5 bg-rose-600/75 backdrop-blur-md border border-rose-400/40 px-2 py-0.5 rounded-md text-[9px] text-white font-mono font-medium z-10 pointer-events-none shadow-sm">
                     <span>{asset.days_remaining}d left</span>
                   </div>
                 {:else if asset.mime_type === 'image/gif' && $gridDensity > 0}
-                  <div class="absolute bottom-2 left-2 bg-black/70 backdrop-blur-md border border-white/20 px-1.5 py-0.5 rounded text-[8px] text-white font-mono font-bold tracking-wider z-10 pointer-events-none">
+                  <div class="absolute bottom-1.5 left-1.5 bg-black/70 backdrop-blur-md border border-white/20 px-1.5 py-0.5 rounded text-[8px] text-white font-mono font-bold tracking-wider z-10 pointer-events-none">
                     GIF
                   </div>
                 {/if}
@@ -769,8 +767,8 @@
   }
 
   .tile-image {
-    opacity: 0;
-    transition: opacity 0.2s ease-out;
+    opacity: 1;
+    transition: transform 0.2s cubic-bezier(0.16, 1, 0.3, 1);
   }
 
   :global(.tile-image.loaded) {
