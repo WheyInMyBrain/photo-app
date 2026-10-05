@@ -729,7 +729,7 @@ pub async fn discover_profile_post_urls(
     let mut seen_codes = HashSet::new();
     let mut cursor: Option<String> = None;
     let mut page_count = 0;
-    const MAX_PAGES: usize = 100;
+    const MAX_PAGES: usize = 500;
 
     loop {
         page_count += 1;
