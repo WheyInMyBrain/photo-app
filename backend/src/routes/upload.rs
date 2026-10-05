@@ -338,7 +338,7 @@ pub async fn upload_ingest(
         .and_then(|h| h.to_str().ok())
         .unwrap_or("");
 
-    // Case 1: JSON Payloads (Handles both CommitLinkRequest AND Apple Shortcut {"url": "..."})
+    // Case 1: JSON Payloads (CommitLinkRequest OR Apple Shortcut / Web Link {"url": "..."})
     if content_type.starts_with("application/json") || body.starts_with(b"{") {
         // 1a: Try CommitLinkRequest (web app selective import)
         if let Ok(commit_req) = serde_json::from_slice::<CommitLinkRequest>(&body) {
@@ -346,16 +346,33 @@ pub async fn upload_ingest(
                 .folder
                 .unwrap_or_else(|| commit_req.platform.clone());
 
-            let receipt = execute_item_downloads(
-                &state,
-                &auth_user,
-                commit_req.selected_items,
-                &target_folder,
-                &commit_req.platform,
-            )
-            .await?;
+            let state_clone = state.clone();
+            let user_clone = auth_user.clone();
+            let items = commit_req.selected_items;
+            let platform = commit_req.platform;
 
-            return Ok(Json(IngestResponse::Batch(receipt)));
+            // Spawn background task so HTTP connection does not block
+            tokio::spawn(async move {
+                if let Err(e) = execute_item_downloads(
+                    &state_clone,
+                    &user_clone,
+                    items,
+                    &target_folder,
+                    &platform,
+                )
+                .await
+                {
+                    tracing::error!(error = %e, "Background item downloads failed");
+                }
+            });
+
+            return Ok(Json(IngestResponse::File(UploadItemResult {
+                file_name: "batch_download".to_string(),
+                status: "queued".to_string(),
+                id: None,
+                relative_path: None,
+                message: Some("Items accepted and queued for download".to_string()),
+            })));
         }
 
         // 1b: Catch Apple Shortcut JSON: {"url": "https://..."} or {"link": "..."}
@@ -365,24 +382,44 @@ pub async fn upload_ingest(
                 .or_else(|| val.get("link"))
                 .or_else(|| val.get("target"))
                 .and_then(|v| v.as_str())
-                .map(|s| s.trim());
+                .map(|s| s.trim().to_string());
 
             if let Some(target_url) = extracted_url {
                 if target_url.starts_with("http://") || target_url.starts_with("https://") {
-                    let manifest =
-                        resolve_or_scrape_manifest(&state, &auth_user, target_url).await?;
-                    let target_folder = query.folder.unwrap_or(manifest.suggested_folder);
+                    let state_clone = state.clone();
+                    let user_clone = auth_user.clone();
+                    let requested_folder = query.folder.clone();
+                    let target_url_clone = target_url.clone();
 
-                    let receipt = execute_item_downloads(
-                        &state,
-                        &auth_user,
-                        manifest.items,
-                        &target_folder,
-                        &manifest.platform,
-                    )
-                    .await?;
+                    tokio::spawn(async move {
+                        match resolve_or_scrape_manifest(&state_clone, &user_clone, &target_url_clone).await {
+                            Ok(manifest) => {
+                                let target_folder = requested_folder.unwrap_or(manifest.suggested_folder);
+                                if let Err(e) = execute_item_downloads(
+                                    &state_clone,
+                                    &user_clone,
+                                    manifest.items,
+                                    &target_folder,
+                                    &manifest.platform,
+                                )
+                                .await
+                                {
+                                    tracing::error!(url = %target_url_clone, error = %e, "Background download execution failed");
+                                }
+                            }
+                            Err(e) => {
+                                tracing::error!(url = %target_url_clone, error = %e, "Background link resolution failed");
+                            }
+                        }
+                    });
 
-                    return Ok(Json(IngestResponse::Batch(receipt)));
+                    return Ok(Json(IngestResponse::File(UploadItemResult {
+                        file_name: target_url,
+                        status: "queued".to_string(),
+                        id: None,
+                        relative_path: None,
+                        message: Some("Link queued for background resolution and download".to_string()),
+                    })));
                 }
             }
         }
@@ -397,21 +434,42 @@ pub async fn upload_ingest(
 
     if is_text_or_url {
         if let Ok(raw_str) = std::str::from_utf8(&body) {
-            let trimmed = raw_str.trim();
+            let trimmed = raw_str.trim().to_string();
             if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
-                let manifest = resolve_or_scrape_manifest(&state, &auth_user, trimmed).await?;
-                let target_folder = query.folder.unwrap_or(manifest.suggested_folder);
+                let state_clone = state.clone();
+                let user_clone = auth_user.clone();
+                let requested_folder = query.folder.clone();
+                let target_url = trimmed.clone();
 
-                let receipt = execute_item_downloads(
-                    &state,
-                    &auth_user,
-                    manifest.items,
-                    &target_folder,
-                    &manifest.platform,
-                )
-                .await?;
+                tokio::spawn(async move {
+                    match resolve_or_scrape_manifest(&state_clone, &user_clone, &target_url).await {
+                        Ok(manifest) => {
+                            let target_folder = requested_folder.unwrap_or(manifest.suggested_folder);
+                            if let Err(e) = execute_item_downloads(
+                                &state_clone,
+                                &user_clone,
+                                manifest.items,
+                                &target_folder,
+                                &manifest.platform,
+                            )
+                            .await
+                            {
+                                tracing::error!(url = %target_url, error = %e, "Background download execution failed");
+                            }
+                        }
+                        Err(e) => {
+                            tracing::error!(url = %target_url, error = %e, "Background link resolution failed");
+                        }
+                    }
+                });
 
-                return Ok(Json(IngestResponse::Batch(receipt)));
+                return Ok(Json(IngestResponse::File(UploadItemResult {
+                    file_name: trimmed,
+                    status: "queued".to_string(),
+                    id: None,
+                    relative_path: None,
+                    message: Some("Link queued for background resolution and download".to_string()),
+                })));
             }
         }
     }

@@ -1,8 +1,9 @@
 // src/downloader/metadata.rs
 
 use anyhow::{bail, Context, Result};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use tokio::fs;
 use tokio::process::Command;
 
 #[derive(Debug, Clone, Default)]
@@ -17,28 +18,95 @@ pub struct MediaMetadataPayload<'a> {
     pub longitude: Option<f64>,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum RealFormat {
+    Jpeg,
+    Png,
+    Webp,
+    Video,
+    Unknown,
+}
+
+async fn detect_real_format(path: &Path) -> RealFormat {
+    let mut header = [0u8; 16];
+    let Ok(mut file) = tokio::fs::File::open(path).await else {
+        return RealFormat::Unknown;
+    };
+    use tokio::io::AsyncReadExt;
+    if file.read_exact(&mut header).await.is_err() {
+        return RealFormat::Unknown;
+    }
+
+    if header.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        return RealFormat::Jpeg;
+    }
+    if header.starts_with(&[0x89, 0x50, 0x4E, 0x47]) {
+        return RealFormat::Png;
+    }
+    if header.starts_with(b"RIFF") && &header[8..12] == b"WEBP" {
+        return RealFormat::Webp;
+    }
+    if &header[4..8] == b"ftyp" {
+        return RealFormat::Video;
+    }
+
+    RealFormat::Unknown
+}
+
 pub async fn inject_metadata<P: AsRef<Path>>(
     file_path: P,
     meta: &MediaMetadataPayload<'_>,
-) -> Result<()> {
-    let path = file_path.as_ref();
-    let ext = path
-        .extension()
-        .and_then(|e| e.to_str())
-        .unwrap_or("")
-        .to_lowercase();
+) -> Result<PathBuf> {
+    let mut path = file_path.as_ref().to_path_buf();
+    let format = detect_real_format(&path).await;
 
-    match ext.as_str() {
-        "jpg" | "jpeg" | "png" | "webp" => {
-            inject_image_exiftool(path, meta).await?;
+    // Fix extension mismatch if a WebP or MP4 was named .jpg
+    match format {
+        RealFormat::Webp if path.extension().and_then(|e| e.to_str()) != Some("webp") => {
+            let correct_path = path.with_extension("webp");
+            fs::rename(&path, &correct_path).await?;
+            path = correct_path;
         }
-        "mp4" | "mov" | "m4v" => {
-            inject_video_ffmpeg(path, meta).await?;
+        RealFormat::Jpeg if path.extension().and_then(|e| e.to_str()) != Some("jpg") && path.extension().and_then(|e| e.to_str()) != Some("jpeg") => {
+            let correct_path = path.with_extension("jpg");
+            fs::rename(&path, &correct_path).await?;
+            path = correct_path;
+        }
+        RealFormat::Video if path.extension().and_then(|e| e.to_str()) != Some("mp4") => {
+            let correct_path = path.with_extension("mp4");
+            fs::rename(&path, &correct_path).await?;
+            path = correct_path;
         }
         _ => {}
     }
 
-    Ok(())
+    match format {
+        RealFormat::Jpeg | RealFormat::Png | RealFormat::Webp => {
+            inject_image_exiftool(&path, meta).await?;
+        }
+        RealFormat::Video => {
+            inject_video_ffmpeg(&path, meta).await?;
+        }
+        RealFormat::Unknown => {
+            // Fall back to extension check if magic bytes didn't match known signatures
+            let ext = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("")
+                .to_lowercase();
+            match ext.as_str() {
+                "jpg" | "jpeg" | "png" | "webp" => {
+                    inject_image_exiftool(&path, meta).await?;
+                }
+                "mp4" | "mov" | "m4v" => {
+                    inject_video_ffmpeg(&path, meta).await?;
+                }
+                _ => {}
+            }
+        }
+    }
+
+    Ok(path)
 }
 
 async fn inject_image_exiftool(path: &Path, meta: &MediaMetadataPayload<'_>) -> Result<()> {
@@ -66,7 +134,6 @@ async fn inject_image_exiftool(path: &Path, meta: &MediaMetadataPayload<'_>) -> 
     }
 
     if let Some(published) = meta.published_at {
-        // EXIF date standard: "YYYY:MM:DD HH:MM:SS"
         let clean_date = published.replace('-', ":").replace('T', " ").replace('Z', "");
         let exif_date = clean_date.split('.').next().unwrap_or(&clean_date);
         cmd.arg(format!("-DateTimeOriginal={exif_date}"));

@@ -16,6 +16,7 @@ use std::collections::HashSet;
 use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
+use tracing::{debug, error, info, warn};
 
 const BROWSER_UA: &str =
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/27.0.1 Safari/605.1.15";
@@ -48,10 +49,12 @@ pub async fn extract_instagram(
     input_url: &str,
     config: Option<&DownloaderConfig>,
 ) -> Result<ExtractedMediaMetadata> {
+    info!(url = %input_url, "Starting Instagram extraction");
     let has_auth = config.map_or(false, |c| c.has_instagram_auth());
 
     // 1. Stories and Highlights strictly require session cookies
     if input_url.contains("/stories/") {
+        info!("URL matched as Instagram Story or Highlight");
         let cfg = config.context("DownloaderConfig required for Instagram stories")?;
         let auth_client = build_auth_client(cfg).context(
             "ig_cookie and ig_csrf_token must be set in DownloaderConfig to scrape stories and highlights.",
@@ -67,26 +70,32 @@ pub async fn extract_instagram(
     if input_url.contains("/p/") || input_url.contains("/reel/") || input_url.contains("/reels/") {
         let shortcode =
             extract_shortcode(input_url).context("Could not extract Instagram shortcode")?;
+        info!(shortcode, "URL matched as single post/reel");
 
         if has_auth {
             if let Some(cfg) = config {
                 if let Ok(auth_client) = build_auth_client(cfg) {
-                    if let Ok(meta) = fetch_mobile_post_info(shortcode, &auth_client).await {
-                        return Ok(meta);
+                    debug!(shortcode, "Attempting authenticated mobile post fetch");
+                    match fetch_mobile_post_info(shortcode, &auth_client).await {
+                        Ok(meta) => return Ok(meta),
+                        Err(e) => warn!(error = %e, shortcode, "Authenticated mobile endpoint failed, falling back to GraphQL"),
                     }
                 }
             }
         }
 
         let guest_client = build_guest_client()?;
-        if let Ok(meta) = fetch_graphql_post_info(shortcode, &guest_client).await {
-            return Ok(meta);
+        debug!(shortcode, "Attempting GraphQL post fetch");
+        match fetch_graphql_post_info(shortcode, &guest_client).await {
+            Ok(meta) => return Ok(meta),
+            Err(e) => warn!(error = %e, shortcode, "GraphQL post fetch failed, falling back to guest mobile API"),
         }
 
         return fetch_mobile_post_info(shortcode, &guest_client).await;
     }
 
     // 3. Profile Grid Feed (Requires Authenticated GraphQL client)
+    info!("URL matched as Instagram profile feed");
     let cfg = config.context("DownloaderConfig with active credentials required to scrape profile feed")?;
     let auth_client = build_auth_client(cfg)?;
     extract_user_profile_feed(input_url, cfg, &auth_client).await
@@ -115,6 +124,7 @@ async fn extract_and_resolve_location(
 
     if (latitude.is_none() || longitude.is_none()) && location_id.is_some() {
         if let Some(ref lid) = location_id {
+            debug!(location_name = %name, location_id = %lid, "Fetching missing coordinates from location API");
             let loc_api = format!("https://www.instagram.com/api/v1/locations/{lid}/info/");
             if let Ok(resp) = client
                 .get(&loc_api)
@@ -136,6 +146,7 @@ async fn extract_and_resolve_location(
         }
     }
 
+    debug!(name = %name, ?latitude, ?longitude, "Resolved location");
     Some(ExtractedLocation {
         name,
         latitude,
@@ -151,6 +162,7 @@ async fn fetch_mobile_post_info(shortcode: &str, client: &Client) -> Result<Extr
     let media_id = shortcode_to_id(shortcode)?;
     let api_url = format!("https://www.instagram.com/api/v1/media/{media_id}/info/");
 
+    debug!(shortcode, media_id = %media_id, "Calling mobile post info API");
     let resp = client
         .get(&api_url)
         .header(REFERER, "https://www.instagram.com/")
@@ -159,10 +171,12 @@ async fn fetch_mobile_post_info(shortcode: &str, client: &Client) -> Result<Extr
 
     let final_url = resp.url().as_str();
     if final_url.contains("/login/") || final_url.contains("/accounts/") {
+        error!(shortcode, "Mobile endpoint redirected to login wall. Session expired or missing.");
         bail!("Instagram redirected to login wall. Session expired or missing sessionid.");
     }
 
     if !resp.status().is_success() {
+        warn!(shortcode, status = %resp.status(), "Mobile feed API returned non-success HTTP status");
         bail!("Mobile feed API HTTP {}", resp.status());
     }
 
@@ -202,11 +216,13 @@ async fn fetch_mobile_post_info(shortcode: &str, client: &Client) -> Result<Extr
     }
 
     if items.is_empty() {
+        error!(shortcode, "Failed to parse any media item from mobile API response");
         bail!("Failed to parse media items from mobile payload for shortcode: {shortcode}");
     }
 
     let location = extract_and_resolve_location(item.get("location"), client).await;
 
+    debug!(shortcode, author = %author, items_count = items.len(), "Successfully fetched post via mobile API");
     Ok(ExtractedMediaMetadata {
         platform: "instagram".to_string(),
         author,
@@ -226,13 +242,14 @@ async fn fetch_mobile_post_info(shortcode: &str, client: &Client) -> Result<Extr
 }
 
 // -----------------------------------------------------------------------------
-// Public Web GraphQL Query (Zero-Cookie Fallback for single post)
+// Public Web GraphQL Query (Extracts Full Resolution Variants, Timestamps & Loc)
 // -----------------------------------------------------------------------------
 async fn fetch_graphql_post_info(shortcode: &str, client: &Client) -> Result<ExtractedMediaMetadata> {
     let gql_url = format!(
         "https://www.instagram.com/graphql/query/?doc_id={GQL_POST_DOC_ID}&variables=%7B%22shortcode%22%3A%22{shortcode}%22%7D"
     );
 
+    debug!(shortcode, "Executing GraphQL post query");
     let resp = client
         .get(&gql_url)
         .header(REFERER, format!("https://www.instagram.com/p/{shortcode}/"))
@@ -240,6 +257,7 @@ async fn fetch_graphql_post_info(shortcode: &str, client: &Client) -> Result<Ext
         .await?;
 
     if !resp.status().is_success() {
+        warn!(shortcode, status = %resp.status(), "GraphQL single-post query returned non-success HTTP status");
         bail!("GraphQL returned HTTP {}", resp.status());
     }
 
@@ -280,11 +298,13 @@ async fn fetch_graphql_post_info(shortcode: &str, client: &Client) -> Result<Ext
     }
 
     if items.is_empty() {
+        error!(shortcode, "Zero media items parsed from GraphQL response");
         bail!("No items parsed from GraphQL for {shortcode}");
     }
 
     let location = extract_and_resolve_location(media.get("location"), client).await;
 
+    debug!(shortcode, author = %author, items_count = items.len(), "Successfully fetched post via GraphQL");
     Ok(ExtractedMediaMetadata {
         platform: "instagram".to_string(),
         author,
@@ -411,6 +431,7 @@ async fn extract_highlight_links(input_url: &str, client: &Client) -> Result<Ext
         .next()
         .context("Missing highlight ID in URL")?;
 
+    info!(highlight_id, "Extracting highlight");
     let reel_id = format!("highlight:{highlight_id}");
     let api_url = format!("https://www.instagram.com/api/v1/feed/reels_media/?reel_ids={reel_id}");
 
@@ -421,6 +442,7 @@ async fn extract_highlight_links(input_url: &str, client: &Client) -> Result<Ext
         .await?;
 
     if !resp.status().is_success() {
+        error!(highlight_id, status = %resp.status(), "Highlight API request failed");
         bail!("Highlight API returned HTTP {}", resp.status());
     }
 
@@ -435,6 +457,7 @@ async fn extract_highlight_links(input_url: &str, client: &Client) -> Result<Ext
         .unwrap_or(&empty_vec);
 
     if raw_items.is_empty() {
+        warn!(highlight_id, "Highlight returned 0 items");
         bail!("Highlight {highlight_id} contains 0 media items.");
     }
 
@@ -457,6 +480,7 @@ async fn extract_highlight_links(input_url: &str, client: &Client) -> Result<Ext
         .and_then(|t| t.as_i64())
         .and_then(format_epoch_timestamp);
 
+    info!(highlight_id, author = %user_name, count = items.len(), "Successfully extracted highlight items");
     Ok(ExtractedMediaMetadata {
         platform: "instagram".to_string(),
         author: user_name,
@@ -473,7 +497,7 @@ async fn extract_highlight_links(input_url: &str, client: &Client) -> Result<Ext
 }
 
 // -----------------------------------------------------------------------------
-// User Profile Feed (Discovers All Post URLs For Dedicated Post Ingestion)
+// User Profile Feed: Discovers post URLs, then resolves each full post via GraphQL
 // -----------------------------------------------------------------------------
 async fn extract_user_profile_feed(
     input_url: &str,
@@ -487,6 +511,8 @@ async fn extract_user_profile_feed(
         .next()
         .filter(|s| !s.is_empty() && *s != "explore" && *s != "direct")
         .context("Could not extract username from Instagram profile URL")?;
+
+    info!(username, "Starting profile timeline scrape");
 
     let cookie = cfg.ig_cookie.as_deref().unwrap_or("");
     let csrf_token = cfg
@@ -511,6 +537,11 @@ async fn extract_user_profile_feed(
         .or_else(|| extract_cookie_val(cookie, "sessionid").and_then(|s| s.split(':').next().map(|v| v.to_string())))
         .unwrap_or_else(|| "0".to_string());
 
+    debug!(username, ds_user_id = %ds_user_id, has_dtsg = !dtsg.is_empty(), has_lsd = !lsd.is_empty(), "Built profile request credentials");
+
+    // --- Stage 1: Collect all shortcodes from the profile timeline ---
+    info!(username, "=== Stage 1: Discovering posts from profile timeline ===");
+    let mut discovered_shortcodes = Vec::new();
     let mut discovered_post_urls = Vec::new();
     let mut seen_codes = HashSet::new();
     let mut cursor: Option<String> = None;
@@ -519,6 +550,7 @@ async fn extract_user_profile_feed(
 
     loop {
         page_count += 1;
+        debug!(username, page = page_count, has_cursor = cursor.is_some(), "Requesting profile timeline page");
 
         let (doc_id, friendly_name, variables) = if let Some(ref c) = cursor {
             (
@@ -581,9 +613,11 @@ async fn extract_user_profile_feed(
             .send()
             .await?;
 
-        if !resp.status().is_success() {
-            if discovered_post_urls.is_empty() {
-                bail!("Instagram GraphQL query failed with HTTP {}", resp.status());
+        let status = resp.status();
+        if !status.is_success() {
+            error!(username, page = page_count, status = %status, "Instagram GraphQL query failed");
+            if discovered_shortcodes.is_empty() {
+                bail!("Instagram GraphQL query failed with HTTP {status}");
             } else {
                 break;
             }
@@ -597,8 +631,9 @@ async fn extract_user_profile_feed(
         let payload: Value = match serde_json::from_str(&body) {
             Ok(val) => val,
             Err(e) => {
-                if discovered_post_urls.is_empty() {
-                    bail!("Failed to parse Instagram GraphQL JSON: {e}. Raw: {}", &body[..body.len().min(200)]);
+                error!(username, error = %e, preview = %&body[..body.len().min(300)], "Failed to parse timeline JSON");
+                if discovered_shortcodes.is_empty() {
+                    bail!("Failed to parse Instagram GraphQL JSON: {e}");
                 } else {
                     break;
                 }
@@ -607,8 +642,9 @@ async fn extract_user_profile_feed(
 
         if let Some(err_code) = payload.get("error") {
             let msg = payload.get("errorSummary").and_then(|s| s.as_str()).unwrap_or("unknown error");
-            if discovered_post_urls.is_empty() {
-                bail!("Meta GraphQL error {err_code}: {msg}. Verify session cookies and credentials in .env.");
+            error!(username, error_code = %err_code, summary = %msg, "Meta returned an API-level error");
+            if discovered_shortcodes.is_empty() {
+                bail!("Meta GraphQL error {err_code}: {msg}. Verify session cookies in .env.");
             } else {
                 break;
             }
@@ -619,9 +655,9 @@ async fn extract_user_profile_feed(
         } else if let Some(conn) = payload.pointer("/data/user/edge_owner_to_timeline_media") {
             (conn.get("edges").and_then(|e| e.as_array()), conn.get("page_info"))
         } else {
-            if discovered_post_urls.is_empty() {
-                let debug_preview = &body[..body.len().min(300)];
-                bail!("Failed to locate timeline connection in GraphQL response. Preview: {debug_preview}");
+            warn!(username, preview = %&body[..body.len().min(300)], "Could not locate timeline connection in payload");
+            if discovered_shortcodes.is_empty() {
+                bail!("Failed to locate timeline connection in GraphQL response.");
             } else {
                 break;
             }
@@ -629,17 +665,25 @@ async fn extract_user_profile_feed(
 
         let raw_edges = match edges {
             Some(arr) if !arr.is_empty() => arr,
-            _ => break,
+            _ => {
+                debug!(username, "No edges found on this page, ending pagination");
+                break;
+            }
         };
 
+        let mut new_on_page = 0;
         for edge in raw_edges {
             let node = edge.get("node").unwrap_or(edge);
             if let Some(code) = node.get("code").or_else(|| node.get("shortcode")).and_then(|c| c.as_str()) {
                 if seen_codes.insert(code.to_string()) {
+                    discovered_shortcodes.push(code.to_string());
                     discovered_post_urls.push(format!("https://www.instagram.com/p/{code}/"));
+                    new_on_page += 1;
                 }
             }
         }
+
+        info!(username, page = page_count, new_posts = new_on_page, total_discovered = discovered_shortcodes.len(), "Timeline page processed");
 
         let has_next_page = page_info
             .and_then(|p| p.get("has_next_page"))
@@ -652,26 +696,78 @@ async fn extract_user_profile_feed(
             .map(|s| s.to_string());
 
         if !has_next_page || next_cursor.is_none() || page_count >= MAX_PAGES {
+            debug!(username, has_next_page, max_pages_reached = page_count >= MAX_PAGES, "Finished timeline pagination loop");
             break;
         }
 
         cursor = next_cursor;
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        tokio::time::sleep(Duration::from_millis(400)).await;
     }
 
-    if discovered_post_urls.is_empty() {
+    if discovered_shortcodes.is_empty() {
+        error!(username, "0 posts discovered for profile");
         bail!("No posts found for @{username}");
     }
+
+    info!(username, total_posts = discovered_shortcodes.len(), "=== Stage 2: Fetching individual posts for full media, dates & locations ===");
+
+    // --- Stage 2: Fetch each post to get full metadata, publishing date, location & media variants ---
+    let mut all_media_items = Vec::new();
+    let mut collected_tags = HashSet::new();
+    let mut first_published_at = None;
+    let mut resolved_location = None;
+    let total_count = discovered_shortcodes.len();
+
+    for (idx, code) in discovered_shortcodes.iter().enumerate() {
+        debug!(progress = format!("{}/{}", idx + 1, total_count), shortcode = %code, "Fetching post details");
+
+        let post_meta = match fetch_graphql_post_info(code, client).await {
+            Ok(meta) => Ok(meta),
+            Err(gql_err) => {
+                debug!(shortcode = %code, error = %gql_err, "GraphQL post fetch failed, trying mobile API fallback");
+                fetch_mobile_post_info(code, client).await
+            }
+        };
+
+        match post_meta {
+            Ok(meta) => {
+                if first_published_at.is_none() {
+                    first_published_at = meta.published_at.clone();
+                }
+                if resolved_location.is_none() && meta.location.is_some() {
+                    resolved_location = meta.location.clone();
+                }
+                for tag in meta.tags {
+                    collected_tags.insert(tag);
+                }
+                let count = meta.items.len();
+                all_media_items.extend(meta.items);
+                info!(progress = format!("{}/{}", idx + 1, total_count), shortcode = %code, media_count = count, "Post ingested");
+            }
+            Err(e) => {
+                warn!(progress = format!("{}/{}", idx + 1, total_count), shortcode = %code, error = %e, "Failed to fetch details for post, skipping");
+            }
+        }
+
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+
+    if all_media_items.is_empty() {
+        error!(username, "Failed to extract any media items across all discovered posts");
+        bail!("Failed to extract media items from discovered posts for @{username}");
+    }
+
+    info!(username, total_media_items = all_media_items.len(), total_posts = discovered_post_urls.len(), "Profile extraction complete");
 
     Ok(ExtractedMediaMetadata {
         platform: "instagram".to_string(),
         author: username.to_string(),
-        caption: format!("Profile grid feed for @{username}"),
+        caption: format!("Extracted {} items from @{username}", all_media_items.len()),
         post_text: None,
-        published_at: None,
-        tags: Vec::new(),
-        items: Vec::new(), // Left empty so downstream queues download each post directly
-        location: None,
+        published_at: first_published_at,
+        tags: collected_tags.into_iter().collect(),
+        items: all_media_items,
+        location: resolved_location,
         next_page_url: None,
         discovered_post_urls,
         embedded_player_urls: Vec::new(),
@@ -695,6 +791,8 @@ async fn extract_story_links(input_url: &str, client: &Client) -> Result<Extract
         .copied()
         .context("Missing username in story URL")?;
 
+    info!(username, "Extracting active stories");
+
     if let Some(media_pk) = segments.get(story_idx + 2).copied() {
         return extract_direct_pk_links(media_pk, username, client).await;
     }
@@ -709,6 +807,7 @@ async fn extract_story_links(input_url: &str, client: &Client) -> Result<Extract
         .await?;
 
     if !resp.status().is_success() {
+        error!(username, status = %resp.status(), "Stories tray API request failed");
         bail!("Stories API returned HTTP {}", resp.status());
     }
 
@@ -723,6 +822,7 @@ async fn extract_story_links(input_url: &str, client: &Client) -> Result<Extract
         .unwrap_or(&empty_vec);
 
     if raw_items.is_empty() {
+        warn!(username, "0 active stories found in tray");
         bail!("@{username} has 0 active stories in tray.");
     }
 
@@ -733,6 +833,7 @@ async fn extract_story_links(input_url: &str, client: &Client) -> Result<Extract
         }
     }
 
+    info!(username, count = items.len(), "Successfully extracted stories");
     Ok(ExtractedMediaMetadata {
         platform: "instagram".to_string(),
         author: username.to_string(),
@@ -753,6 +854,7 @@ async fn extract_direct_pk_links(
     username: &str,
     client: &Client,
 ) -> Result<ExtractedMediaMetadata> {
+    info!(media_pk, username, "Extracting single story PK item");
     let info_url = format!("https://www.instagram.com/api/v1/media/{media_pk}/info/");
     let resp = client
         .get(&info_url)
@@ -779,6 +881,7 @@ async fn extract_direct_pk_links(
 
     let location = extract_and_resolve_location(item.get("location"), client).await;
 
+    info!(media_pk, username, count = items.len(), "Story PK item extracted");
     Ok(ExtractedMediaMetadata {
         platform: "instagram".to_string(),
         author: username.to_string(),
@@ -933,6 +1036,7 @@ fn parse_media_item(item: &Value) -> Option<MediaItem> {
 // Numeric ID Resolver
 // -----------------------------------------------------------------------------
 async fn resolve_numeric_user_id(username: &str, client: &Client) -> Result<String> {
+    debug!(username, "Resolving numeric user ID via topsearch API");
     let search_url = format!("https://www.instagram.com/api/v1/web/search/topsearch/?query={username}");
     if let Ok(resp) = client
         .get(&search_url)
@@ -956,6 +1060,7 @@ async fn resolve_numeric_user_id(username: &str, client: &Client) -> Result<Stri
                                         .map(|s| s.to_string())
                                         .or_else(|| v.as_i64().map(|n| n.to_string()))
                                 }) {
+                                    debug!(username, user_id = %pk, "Successfully resolved user ID");
                                     return Ok(pk);
                                 }
                             }
@@ -966,6 +1071,7 @@ async fn resolve_numeric_user_id(username: &str, client: &Client) -> Result<Stri
         }
     }
 
+    error!(username, "Could not resolve numeric target ID");
     bail!("Could not resolve numeric target ID for @{username}");
 }
 
