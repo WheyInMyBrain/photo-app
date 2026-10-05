@@ -44,6 +44,13 @@ pub struct CandidateItem {
     pub audio_url: Option<String>,        // Present for split DASH streams (Reddit/YouTube)
     pub suggested_filename: String,       // e.g. "caption_slug_1.webp"
     pub referer: Option<String>,
+    pub caption: Option<String>,
+    pub published_at: Option<String>,
+    pub location_name: Option<String>,
+    pub latitude: Option<f64>,
+    pub longitude: Option<f64>,
+    pub tags: Vec<String>,
+    pub source_post_url: Option<String>,
 }
 
 #[derive(Clone, Debug)]

@@ -14,7 +14,7 @@ pub struct ScrapedPostRecord {
     pub location_name: Option<String>,
     pub latitude: Option<f64>,
     pub longitude: Option<f64>,
-    pub published_at: Option<String>, 
+    pub published_at: Option<String>,
     pub next_page_url: Option<String>,
 }
 
@@ -29,6 +29,15 @@ pub struct ScrapedMediaItemRecord {
     pub width: Option<i64>,
     pub height: Option<i64>,
     pub variants: Vec<ScrapedVariantRecord>,
+
+    // Per-item metadata overrides
+    pub caption: Option<String>,
+    pub published_at: Option<String>,
+    pub location_name: Option<String>,
+    pub latitude: Option<f64>,
+    pub longitude: Option<f64>,
+    pub tags: Vec<String>,
+    pub source_url: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -51,7 +60,7 @@ pub struct ScrapedItemContext {
     pub latitude: Option<f64>,
     pub longitude: Option<f64>,
     pub source_url: String,
-    pub published_at: Option<String>, 
+    pub published_at: Option<String>,
 }
 
 pub struct ScrapesRepo;
@@ -105,7 +114,8 @@ impl ScrapesRepo {
     ) -> Result<Vec<ScrapedMediaItemRecord>, sqlx::Error> {
         let rows = sqlx::query(
             r#"
-            SELECT id, media_type, cdn_url, audio_url, thumbnail_url, suggested_filename, width, height
+            SELECT id, media_type, cdn_url, audio_url, thumbnail_url, suggested_filename, width, height,
+                   caption, published_at, location_name, latitude, longitude, tags, source_url
             FROM scraped_media_items
             WHERE scraped_post_id = ?1
             ORDER BY item_index ASC
@@ -144,6 +154,11 @@ impl ScrapesRepo {
                 })
                 .collect();
 
+            let tags_raw: Option<String> = r.get("tags");
+            let tags = tags_raw
+                .and_then(|t| serde_json::from_str(&t).ok())
+                .unwrap_or_default();
+
             items.push(ScrapedMediaItemRecord {
                 id: item_id,
                 media_type: r.get("media_type"),
@@ -154,6 +169,13 @@ impl ScrapesRepo {
                 width: r.get("width"),
                 height: r.get("height"),
                 variants,
+                caption: r.get("caption"),
+                published_at: r.get("published_at"),
+                location_name: r.get("location_name"),
+                latitude: r.get("latitude"),
+                longitude: r.get("longitude"),
+                tags,
+                source_url: r.get("source_url"),
             });
         }
 
@@ -237,21 +259,35 @@ impl ScrapesRepo {
             qb.build().execute(&mut *tx).await?;
         }
 
-        // 3. Insert items and their alternate resolution variants
+        // 3. Insert items with their individual metadata overrides
         for (idx, item) in items.iter().enumerate() {
+            let item_tags_json = if !item.tags.is_empty() {
+                Some(serde_json::to_string(&item.tags).unwrap_or_else(|_| "[]".to_string()))
+            } else {
+                None
+            };
+
             sqlx::query(
                 r#"
                 INSERT INTO scraped_media_items (
                     id, scraped_post_id, item_index, media_type, cdn_url,
-                    audio_url, thumbnail_url, suggested_filename, width, height, status
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'pending')
+                    audio_url, thumbnail_url, suggested_filename, width, height, status,
+                    caption, published_at, location_name, latitude, longitude, tags, source_url
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'pending', ?11, ?12, ?13, ?14, ?15, ?16, ?17)
                 ON CONFLICT(id) DO UPDATE SET
                     cdn_url = excluded.cdn_url,
                     audio_url = excluded.audio_url,
                     thumbnail_url = excluded.thumbnail_url,
                     suggested_filename = excluded.suggested_filename,
                     width = excluded.width,
-                    height = excluded.height
+                    height = excluded.height,
+                    caption = excluded.caption,
+                    published_at = excluded.published_at,
+                    location_name = excluded.location_name,
+                    latitude = excluded.latitude,
+                    longitude = excluded.longitude,
+                    tags = excluded.tags,
+                    source_url = excluded.source_url
                 "#,
             )
             .bind(&item.id)
@@ -264,6 +300,13 @@ impl ScrapesRepo {
             .bind(&item.suggested_filename)
             .bind(item.width)
             .bind(item.height)
+            .bind(&item.caption)
+            .bind(&item.published_at)
+            .bind(&item.location_name)
+            .bind(item.latitude)
+            .bind(item.longitude)
+            .bind(item_tags_json)
+            .bind(&item.source_url)
             .execute(&mut *tx)
             .await?;
 
@@ -347,15 +390,23 @@ impl ScrapesRepo {
         }))
     }
 
-    /// Fetch parent post metadata for a specific media item
+    /// Fetch contextual metadata for an item: item-level metadata takes priority over post-level
     pub async fn get_item_context(
         pool: &SqlitePool,
         item_id: &str,
     ) -> Result<Option<ScrapedItemContext>, sqlx::Error> {
         let row = sqlx::query(
             r#"
-            SELECT sp.platform, sp.author, sp.caption, sp.tags, sp.location_name,
-                   sp.latitude, sp.longitude, sp.source_url, sp.published_at
+            SELECT
+                sp.platform,
+                sp.author,
+                COALESCE(smi.caption, sp.caption) AS caption,
+                COALESCE(smi.tags, sp.tags) AS tags,
+                COALESCE(smi.location_name, sp.location_name) AS location_name,
+                COALESCE(smi.latitude, sp.latitude) AS latitude,
+                COALESCE(smi.longitude, sp.longitude) AS longitude,
+                COALESCE(smi.source_url, sp.source_url) AS source_url,
+                COALESCE(smi.published_at, sp.published_at) AS published_at
             FROM scraped_media_items smi
             JOIN scraped_posts sp ON smi.scraped_post_id = sp.id
             WHERE smi.id = ?1

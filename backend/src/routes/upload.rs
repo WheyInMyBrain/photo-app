@@ -813,6 +813,7 @@ async fn resolve_or_scrape_manifest(
 ) -> Result<CandidateManifest, AppError> {
     let clean_url = url.trim();
 
+    // 1. Cached path: fetch from DB and populate CandidateItem with per-item metadata
     if let Some(post) = ScrapesRepo::find_post_by_url(&state.db, &auth_user.id, clean_url)
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?
@@ -821,28 +822,38 @@ async fn resolve_or_scrape_manifest(
             .await
             .map_err(|e| AppError::Internal(e.to_string()))?;
 
+        let candidate_items = items
+            .into_iter()
+            .map(|i| CandidateItem {
+                id: i.id,
+                media_type: i.media_type,
+                mime_type: "application/octet-stream".to_string(),
+                thumbnail_url: i.thumbnail_url.unwrap_or_default(),
+                thumbnail_base64: None,
+                high_res_url: i.cdn_url,
+                audio_url: i.audio_url,
+                suggested_filename: i.suggested_filename,
+                referer: Some(clean_url.to_string()),
+                caption: i.caption.or_else(|| post.caption.clone()),
+                published_at: i.published_at.or_else(|| post.published_at.clone()),
+                location_name: i.location_name.or_else(|| post.location_name.clone()),
+                latitude: i.latitude.or(post.latitude),
+                longitude: i.longitude.or(post.longitude),
+                tags: if !i.tags.is_empty() { i.tags } else { post.tags.clone() },
+                source_post_url: i.source_url.or_else(|| Some(clean_url.to_string())),
+            })
+            .collect();
+
         return Ok(CandidateManifest {
             platform: post.platform.clone(),
             author: post.author.clone(),
             caption: post.caption.unwrap_or_default(),
             suggested_folder: format!("{}/{}", post.platform, post.author),
-            items: items
-                .into_iter()
-                .map(|i| CandidateItem {
-                    id: i.id,
-                    media_type: i.media_type,
-                    mime_type: "application/octet-stream".to_string(),
-                    thumbnail_url: i.thumbnail_url.unwrap_or_default(),
-                    thumbnail_base64: None,
-                    high_res_url: i.cdn_url,
-                    audio_url: i.audio_url,
-                    suggested_filename: i.suggested_filename,
-                    referer: Some(clean_url.to_string()),
-                })
-                .collect(),
+            items: candidate_items,
         });
     }
 
+    // 2. Scrape path: extract media manifest
     let extracted: ExtractedMediaMetadata = extract_media(clean_url, Some(&state.config.downloader))
         .await
         .map_err(|e| AppError::BadRequest(format!("Link extraction failed: {e}")))?;
@@ -850,10 +861,26 @@ async fn resolve_or_scrape_manifest(
     let post_uuid = Uuid::new_v4().to_string();
     let total_items = extracted.items.len();
 
+    // -------------------------------------------------------------------------
+    // Pass 1: Count total items per distinct post so carousels know their group total
+    // -------------------------------------------------------------------------
+    let mut post_item_totals: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for item in &extracted.items {
+        let post_key = item
+            .source_post_url
+            .clone()
+            .unwrap_or_else(|| clean_url.to_string());
+        *post_item_totals.entry(post_key).or_insert(0) += 1;
+    }
+
+    // -------------------------------------------------------------------------
+    // Pass 2: Generate filename per individual post
+    // -------------------------------------------------------------------------
+    let mut post_item_indices: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     let mut db_items: Vec<ScrapedMediaItemRecord> = Vec::with_capacity(total_items);
     let mut candidate_items: Vec<CandidateItem> = Vec::with_capacity(total_items);
 
-    for (idx, item) in extracted.items.iter().enumerate() {
+    for item in extracted.items.iter() {
         let media_type_str = match item.media_type {
             MediaType::Video => "video",
             MediaType::Image => {
@@ -865,8 +892,33 @@ async fn resolve_or_scrape_manifest(
             }
         };
 
+        let post_key = item
+            .source_post_url
+            .clone()
+            .unwrap_or_else(|| clean_url.to_string());
+
+        let this_post_total = *post_item_totals.get(&post_key).unwrap_or(&1);
+        let this_post_index = post_item_indices.entry(post_key).or_insert(0);
+        let current_index_for_this_post = *this_post_index;
+        *this_post_index += 1;
+
+        // Caption resolution: prefer item caption, fallback to post caption
+        let caption_for_filename = item
+            .caption
+            .as_deref()
+            .filter(|c| !c.is_empty())
+            .unwrap_or(&extracted.caption);
+
         let ext = ext_from_mime(&item.mime_type, &item.media_type);
-        let suggested_filename = build_suggested_filename(&extracted.caption, idx, total_items, ext);
+
+        // Name relative to THIS post's index and THIS post's total
+        let suggested_filename = build_suggested_filename(
+            caption_for_filename,
+            current_index_for_this_post,
+            this_post_total,
+            ext,
+        );
+
         let item_id = Uuid::new_v4().to_string();
 
         let (w, h) = item
@@ -896,6 +948,29 @@ async fn resolve_or_scrape_manifest(
             })
             .collect();
 
+        // Build item-level metadata with manifest fallbacks
+        let item_caption = item.caption.clone().or_else(|| {
+            if !extracted.caption.is_empty() {
+                Some(extracted.caption.clone())
+            } else {
+                None
+            }
+        });
+        let item_published_at = item.published_at.clone().or_else(|| extracted.published_at.clone());
+        let item_location_name = item.location.as_ref().map(|l| l.name.clone())
+            .or_else(|| extracted.location.as_ref().map(|l| l.name.clone()));
+        let item_lat = item.location.as_ref().and_then(|l| l.latitude)
+            .or_else(|| extracted.location.as_ref().and_then(|l| l.latitude));
+        let item_lng = item.location.as_ref().and_then(|l| l.longitude)
+            .or_else(|| extracted.location.as_ref().and_then(|l| l.longitude));
+        let item_tags = if !item.tags.is_empty() {
+            item.tags.clone()
+        } else {
+            extracted.tags.clone()
+        };
+        let item_source_url = item.source_post_url.clone().or_else(|| Some(clean_url.to_string()));
+
+        // Push to DB record batch
         db_items.push(ScrapedMediaItemRecord {
             id: item_id.clone(),
             media_type: media_type_str.to_string(),
@@ -906,8 +981,16 @@ async fn resolve_or_scrape_manifest(
             width: w,
             height: h,
             variants,
+            caption: item_caption.clone(),
+            published_at: item_published_at.clone(),
+            location_name: item_location_name.clone(),
+            latitude: item_lat,
+            longitude: item_lng,
+            tags: item_tags.clone(),
+            source_url: item_source_url.clone(),
         });
 
+        // Push to CandidateItem batch
         candidate_items.push(CandidateItem {
             id: item_id,
             media_type: media_type_str.to_string(),
@@ -917,7 +1000,17 @@ async fn resolve_or_scrape_manifest(
             high_res_url: item.high_res_url.clone(),
             audio_url: item.audio_url.clone(),
             suggested_filename,
-            referer: item.referer_required.clone().or_else(|| Some(clean_url.to_string())),
+            referer: item
+                .referer_required
+                .clone()
+                .or_else(|| item_source_url.clone()),
+            caption: item_caption,
+            published_at: item_published_at,
+            location_name: item_location_name,
+            latitude: item_lat,
+            longitude: item_lng,
+            tags: item_tags,
+            source_post_url: item_source_url,
         });
     }
 
@@ -1009,39 +1102,31 @@ async fn execute_item_downloads(
             continue;
         }
 
-        // 2. Query contextual metadata from DB
+        // 2. Query contextual metadata from DB as secondary fallback
         let ctx = ScrapesRepo::get_item_context(&state.db, &item.id)
             .await
             .unwrap_or(None);
 
-        let (platform_val, author, caption, tags, source_url, published_at, location_name, latitude, longitude) =
-            if let Some(c) = ctx {
-                (
-                    Some(c.platform),
-                    Some(c.author),
-                    c.caption,
-                    c.tags,
-                    Some(c.source_url),
-                    c.published_at,
-                    c.location_name,
-                    c.latitude,
-                    c.longitude,
-                )
-            } else {
-                (
-                    Some(platform.to_string()),
-                    None,
-                    None,
-                    Vec::new(),
-                    item.referer.clone(),
-                    None,
-                    None,
-                    None,
-                    None,
-                )
-            };
+        let platform_val = ctx.as_ref().map(|c| c.platform.clone()).or_else(|| Some(platform.to_string()));
+        let author = ctx.as_ref().map(|c| c.author.clone());
 
-        // 3. Inject EXIF / QuickTime/MP4 tags into file headers
+        let caption = item.caption.clone().or_else(|| ctx.as_ref().and_then(|c| c.caption.clone()));
+        let published_at = item.published_at.clone().or_else(|| ctx.as_ref().and_then(|c| c.published_at.clone()));
+        let location_name = item.location_name.clone().or_else(|| ctx.as_ref().and_then(|c| c.location_name.clone()));
+        let latitude = item.latitude.or_else(|| ctx.as_ref().and_then(|c| c.latitude));
+        let longitude = item.longitude.or_else(|| ctx.as_ref().and_then(|c| c.longitude));
+
+        let tags = if !item.tags.is_empty() {
+            item.tags.clone()
+        } else {
+            ctx.as_ref().map(|c| c.tags.clone()).unwrap_or_default()
+        };
+
+        let source_url = item.source_post_url.clone().or_else(|| {
+            ctx.as_ref().map(|c| c.source_url.clone()).or_else(|| item.referer.clone())
+        });
+
+        // 3. Inject per-post EXIF / QuickTime/MP4 tags into file headers
         let meta_payload = MediaMetadataPayload {
             author: author.as_deref(),
             caption: caption.as_deref(),
@@ -1053,20 +1138,39 @@ async fn execute_item_downloads(
             longitude,
         };
 
-        if let Err(err) = inject_metadata(&temp_file_path, &meta_payload).await {
-            tracing::warn!(
-                file = %item.suggested_filename,
-                error = %err,
-                "Metadata injection skipped or failed"
-            );
-        }
+        // TRACK THE ACTUAL FILE PATH RETURNED AFTER POSSIBLE EXTENSION RENAMES
+        let final_disk_path = match inject_metadata(&temp_file_path, &meta_payload).await {
+            Ok(new_path) => new_path,
+            Err(err) => {
+                tracing::warn!(
+                    file = %item.suggested_filename,
+                    error = %err,
+                    "Metadata injection skipped or failed"
+                );
+                temp_file_path.clone()
+            }
+        };
+
+        let actual_filename = final_disk_path
+            .file_name()
+            .and_then(|f| f.to_str())
+            .map(|f| {
+                // Strip the UUID prefix so the logical filename reflects any extension fix
+                if let Some((_, orig)) = f.split_once('_') {
+                    orig.to_string()
+                } else {
+                    item.suggested_filename.clone()
+                }
+            })
+            .unwrap_or(item.suggested_filename.clone());
 
         let asset_id = Uuid::new_v4().to_string();
-        let file_size_bytes = match tokio::fs::metadata(&temp_file_path).await {
+        let file_size_bytes = match tokio::fs::metadata(&final_disk_path).await {
             Ok(m) => m.len() as i64,
             Err(_) => 0,
         };
 
+        // 4. Pass genuine per-post metadata to background processor payload
         let job_payload = JobPayload {
             author,
             platform: platform_val,
@@ -1079,15 +1183,15 @@ async fn execute_item_downloads(
             longitude,
         };
 
-        // 4. Enqueue into Stage 0 "assemble" job (worker handles hash, duplicate check, and move)
+        // 5. Enqueue into Stage 0 "assemble" job WITH THE ACTUAL DISK PATH
         let job = DbJob {
             id: Uuid::new_v4().to_string(),
             user_id: auth_user.id.clone(),
             asset_id: asset_id.clone(),
-            file_name: item.suggested_filename.clone(),
+            file_name: actual_filename,
             rel_path: String::new(),
             folder_path: sanitized_folder.clone(),
-            disk_path: temp_file_path.clone(),
+            disk_path: final_disk_path, // Points to the actual file that exists on disk
             sha256: String::new(),
             job_type: "assemble".to_string(),
             file_size_bytes,
@@ -1098,9 +1202,8 @@ async fn execute_item_downloads(
             ai_poses_done: 0,
         };
 
-        // Write durable WAL entry in SQLite
         if let Err(e) = JobRepo::enqueue_with_status(&state.db, &job, "pending", None).await {
-            let _ = tokio::fs::remove_file(&temp_file_path).await;
+            let _ = tokio::fs::remove_file(&job.disk_path).await;
             results.push(UploadItemResult {
                 file_name: item.suggested_filename,
                 status: "error".to_string(),
@@ -1109,7 +1212,6 @@ async fn execute_item_downloads(
                 message: Some(format!("Failed to enqueue downloaded media: {e}")),
             });
         } else {
-            // Push directly to Worker 0 channel
             let _ = state.channels.assemble_tx.send(job).await;
 
             results.push(UploadItemResult {

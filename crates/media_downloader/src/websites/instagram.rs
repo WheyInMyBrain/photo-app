@@ -45,14 +45,16 @@ impl Extractor for InstagramExtractor {
     }
 }
 
+// -----------------------------------------------------------------------------
+// Main Instagram Router Entry Point
+// -----------------------------------------------------------------------------
 pub async fn extract_instagram(
     input_url: &str,
     config: Option<&DownloaderConfig>,
 ) -> Result<ExtractedMediaMetadata> {
     info!(url = %input_url, "Starting Instagram extraction");
-    let has_auth = config.map_or(false, |c| c.has_instagram_auth());
 
-    // 1. Stories and Highlights strictly require session cookies
+    // 1. Stories and Highlights
     if input_url.contains("/stories/") {
         info!("URL matched as Instagram Story or Highlight");
         let cfg = config.context("DownloaderConfig required for Instagram stories")?;
@@ -66,35 +68,13 @@ pub async fn extract_instagram(
         }
     }
 
-    // 2. Posts, Reels, and Carousels
+    // 2. Posts, Reels, and Carousels -> Handled strictly by extract_single_post
     if input_url.contains("/p/") || input_url.contains("/reel/") || input_url.contains("/reels/") {
-        let shortcode =
-            extract_shortcode(input_url).context("Could not extract Instagram shortcode")?;
-        info!(shortcode, "URL matched as single post/reel");
-
-        if has_auth {
-            if let Some(cfg) = config {
-                if let Ok(auth_client) = build_auth_client(cfg) {
-                    debug!(shortcode, "Attempting authenticated mobile post fetch");
-                    match fetch_mobile_post_info(shortcode, &auth_client).await {
-                        Ok(meta) => return Ok(meta),
-                        Err(e) => warn!(error = %e, shortcode, "Authenticated mobile endpoint failed, falling back to GraphQL"),
-                    }
-                }
-            }
-        }
-
-        let guest_client = build_guest_client()?;
-        debug!(shortcode, "Attempting GraphQL post fetch");
-        match fetch_graphql_post_info(shortcode, &guest_client).await {
-            Ok(meta) => return Ok(meta),
-            Err(e) => warn!(error = %e, shortcode, "GraphQL post fetch failed, falling back to guest mobile API"),
-        }
-
-        return fetch_mobile_post_info(shortcode, &guest_client).await;
+        info!("URL matched as single post/reel");
+        return extract_single_post(input_url, config).await;
     }
 
-    // 3. Profile Grid Feed (Requires Authenticated GraphQL client)
+    // 3. Profile Grid Feed -> Discovers links and passes each through extract_single_post
     info!("URL matched as Instagram profile feed");
     let cfg = config.context("DownloaderConfig with active credentials required to scrape profile feed")?;
     let auth_client = build_auth_client(cfg)?;
@@ -304,17 +284,34 @@ async fn fetch_graphql_post_info(shortcode: &str, client: &Client) -> Result<Ext
 
     let location = extract_and_resolve_location(media.get("location"), client).await;
 
+    let published_at = media
+        .get("taken_at_timestamp")
+        .or_else(|| media.get("taken_at"))
+        .and_then(|t| t.as_i64())
+        .and_then(format_epoch_timestamp);
+
+    let post_url = format!("https://www.instagram.com/p/{shortcode}/");
+
+    // Stamp this post's exact metadata onto every MediaItem parsed
+    for item in &mut items {
+        item.source_post_url = Some(post_url.clone());
+        item.caption = if !caption.is_empty() {
+            Some(caption.clone())
+        } else {
+            None
+        };
+        item.published_at = published_at.clone();
+        item.location = location.clone();
+        item.tags = tags.clone();
+    }
+
     debug!(shortcode, author = %author, items_count = items.len(), "Successfully fetched post via GraphQL");
     Ok(ExtractedMediaMetadata {
         platform: "instagram".to_string(),
         author,
         caption: caption.clone(),
         post_text: Some(caption),
-        published_at: media
-            .get("taken_at_timestamp")
-            .or_else(|| media.get("taken_at"))
-            .and_then(|t| t.as_i64())
-            .and_then(format_epoch_timestamp),
+        published_at,
         tags,
         items,
         location,
@@ -422,6 +419,50 @@ fn parse_graphql_node(node: &Value) -> Option<MediaItem> {
 }
 
 // -----------------------------------------------------------------------------
+// Single Post Resolution (The Single Function That Handles All Posts)
+// -----------------------------------------------------------------------------
+pub async fn extract_single_post(
+    input_url: &str,
+    config: Option<&DownloaderConfig>,
+) -> Result<ExtractedMediaMetadata> {
+    let shortcode =
+        extract_shortcode(input_url).context("Could not extract Instagram shortcode from URL")?;
+    let has_auth = config.map_or(false, |c| c.has_instagram_auth());
+
+    // 1. Authenticated Mobile API (Best for raw master files & stories)
+    if has_auth {
+        if let Some(cfg) = config {
+            if let Ok(auth_client) = build_auth_client(cfg) {
+                debug!(shortcode, "Attempting authenticated mobile post fetch");
+                match fetch_mobile_post_info(shortcode, &auth_client).await {
+                    Ok(meta) => return Ok(meta),
+                    Err(e) => warn!(
+                        error = %e,
+                        shortcode,
+                        "Authenticated mobile fetch failed, falling back to GraphQL"
+                    ),
+                }
+            }
+        }
+    }
+
+    // 2. Public Web GraphQL Query (Best for exact ISO timestamp, tags, locations & sidecars)
+    let guest_client = build_guest_client()?;
+    debug!(shortcode, "Attempting GraphQL post fetch");
+    match fetch_graphql_post_info(shortcode, &guest_client).await {
+        Ok(meta) => return Ok(meta),
+        Err(e) => warn!(
+            error = %e,
+            shortcode,
+            "GraphQL fetch failed, falling back to guest mobile API"
+        ),
+    }
+
+    // 3. Guest Mobile API Fallback
+    fetch_mobile_post_info(shortcode, &guest_client).await
+}
+
+// -----------------------------------------------------------------------------
 // Highlights Extractor
 // -----------------------------------------------------------------------------
 async fn extract_highlight_links(input_url: &str, client: &Client) -> Result<ExtractedMediaMetadata> {
@@ -469,16 +510,44 @@ async fn extract_highlight_links(input_url: &str, client: &Client) -> Result<Ext
 
     let mut items = Vec::new();
     for raw in raw_items {
-        if let Some(media_item) = parse_media_item(raw) {
+        if let Some(mut media_item) = parse_media_item(raw) {
+            // Per-slide timestamp
+            let slide_date = raw
+                .get("taken_at")
+                .and_then(|t| t.as_i64())
+                .and_then(format_epoch_timestamp);
+
+            // Per-slide caption
+            let slide_caption = raw
+                .pointer("/caption/text")
+                .and_then(|t| t.as_str())
+                .map(|s| s.to_string());
+
+            let slide_tags = slide_caption
+                .as_deref()
+                .map(extract_hashtags_from_text)
+                .unwrap_or_default();
+
+            // Per-slide location
+            let slide_location = extract_and_resolve_location(raw.get("location"), client).await;
+
+            // Direct PK link for source URL
+            let pk = raw.get("pk").or_else(|| raw.get("id")).and_then(|v| {
+                v.as_str().map(|s| s.to_string()).or_else(|| v.as_i64().map(|n| n.to_string()))
+            });
+            let source_post_url = pk.map(|id| format!("https://www.instagram.com/stories/{user_name}/{id}/"));
+
+            media_item.published_at = slide_date;
+            media_item.caption = slide_caption.or_else(|| Some(format!("Highlight {highlight_id}")));
+            media_item.tags = slide_tags;
+            media_item.location = slide_location;
+            media_item.source_post_url = source_post_url;
+
             items.push(media_item);
         }
     }
 
-    let published_at = raw_items
-        .first()
-        .and_then(|item| item.get("taken_at"))
-        .and_then(|t| t.as_i64())
-        .and_then(format_epoch_timestamp);
+    let fallback_date = items.first().and_then(|i| i.published_at.clone());
 
     info!(highlight_id, author = %user_name, count = items.len(), "Successfully extracted highlight items");
     Ok(ExtractedMediaMetadata {
@@ -486,7 +555,7 @@ async fn extract_highlight_links(input_url: &str, client: &Client) -> Result<Ext
         author: user_name,
         caption: format!("Highlight {highlight_id}"),
         post_text: None,
-        published_at,
+        published_at: fallback_date,
         tags: Vec::new(),
         items,
         location: None,
@@ -504,6 +573,120 @@ async fn extract_user_profile_feed(
     cfg: &DownloaderConfig,
     client: &Client,
 ) -> Result<ExtractedMediaMetadata> {
+    let clean_path = reqwest::Url::parse(input_url)?
+        .path()
+        .trim_matches('/')
+        .to_string();
+    let username = clean_path
+        .split('/')
+        .next()
+        .filter(|s| !s.is_empty() && *s != "explore" && *s != "direct")
+        .context("Could not extract username from Instagram profile URL")?
+        .to_string();
+
+    // Step 1: Discover all profile post URLs
+    let post_urls = discover_profile_post_urls(input_url, cfg, client).await?;
+    let total_count = post_urls.len();
+    info!(
+        username = %username,
+        total_posts = total_count,
+        "Executing post extraction for each discovered link"
+    );
+
+    // Step 2: Loop every link through the single post extractor
+    let mut all_media_items = Vec::new();
+    let mut aggregated_tags = HashSet::new();
+    let mut latest_post_date = None;
+    let mut primary_location = None;
+
+    for (idx, post_url) in post_urls.iter().enumerate() {
+        debug!(progress = format!("{}/{}", idx + 1, total_count), url = %post_url, "Extracting post metadata & media");
+
+        match extract_single_post(post_url, Some(cfg)).await {
+            Ok(post_meta) => {
+                let count = post_meta.items.len();
+
+                // Capture profile-level fallbacks from the newest post if needed
+                if latest_post_date.is_none() && post_meta.published_at.is_some() {
+                    latest_post_date = post_meta.published_at.clone();
+                }
+                if primary_location.is_none() && post_meta.location.is_some() {
+                    primary_location = post_meta.location.clone();
+                }
+
+                // Explicitly bind ONLY this specific post's metadata to its items
+                for mut item in post_meta.items {
+                    item.source_post_url = Some(post_url.clone());
+                    item.caption = if !post_meta.caption.is_empty() {
+                        Some(post_meta.caption.clone())
+                    } else {
+                        None
+                    };
+                    item.published_at = post_meta.published_at.clone();
+                    item.location = post_meta.location.clone();
+                    item.tags = post_meta.tags.clone();
+
+                    for tag in &post_meta.tags {
+                        aggregated_tags.insert(tag.clone());
+                    }
+
+                    all_media_items.push(item);
+                }
+
+                info!(
+                    progress = format!("{}/{}", idx + 1, total_count),
+                    url = %post_url,
+                    media_count = count,
+                    date = ?post_meta.published_at,
+                    has_location = post_meta.location.is_some(),
+                    "Post resolved successfully with individual metadata"
+                );
+            }
+            Err(e) => {
+                warn!(
+                    progress = format!("{}/{}", idx + 1, total_count),
+                    url = %post_url,
+                    error = %e,
+                    "Failed to extract post, skipping"
+                );
+            }
+        }
+
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+
+    if all_media_items.is_empty() {
+        bail!("Failed to extract media items from discovered posts for @{username}");
+    }
+
+    info!(
+        username = %username,
+        total_media_items = all_media_items.len(),
+        total_posts = post_urls.len(),
+        "Profile extraction complete"
+    );
+
+    Ok(ExtractedMediaMetadata {
+        platform: "instagram".to_string(),
+        author: username.clone(),
+        caption: format!("Profile feed for @{username}"),
+        post_text: None,
+        published_at: latest_post_date,
+        tags: aggregated_tags.into_iter().collect(),
+        items: all_media_items,
+        location: primary_location,
+        next_page_url: None,
+        discovered_post_urls: post_urls,
+        embedded_player_urls: Vec::new(),
+    })
+}
+
+/// Discovers all post URLs for a given Instagram profile URL.
+pub async fn discover_profile_post_urls(
+    input_url: &str,
+    cfg: &DownloaderConfig,
+    client: &Client,
+) -> Result<Vec<String>> {
     let parsed_url = reqwest::Url::parse(input_url)?;
     let clean_path = parsed_url.path().trim_matches('/');
     let username = clean_path
@@ -512,7 +695,7 @@ async fn extract_user_profile_feed(
         .filter(|s| !s.is_empty() && *s != "explore" && *s != "direct")
         .context("Could not extract username from Instagram profile URL")?;
 
-    info!(username, "Starting profile timeline scrape");
+    info!(username, "Starting profile timeline post discovery");
 
     let cookie = cfg.ig_cookie.as_deref().unwrap_or("");
     let csrf_token = cfg
@@ -521,27 +704,19 @@ async fn extract_user_profile_feed(
         .or_else(|| extract_cookie_val(cookie, "csrftoken"))
         .unwrap_or_default();
 
-    let lsd = cfg
-        .ig_lsd
-        .clone()
-        .unwrap_or_else(|| csrf_token.clone());
-
-    let dtsg = cfg
-        .ig_fb_dtsg
-        .clone()
-        .unwrap_or_default();
-
+    let lsd = cfg.ig_lsd.clone().unwrap_or_else(|| csrf_token.clone());
+    let dtsg = cfg.ig_fb_dtsg.clone().unwrap_or_default();
     let jazoest = compute_jazoest(&dtsg);
 
     let ds_user_id = extract_cookie_val(cookie, "ds_user_id")
-        .or_else(|| extract_cookie_val(cookie, "sessionid").and_then(|s| s.split(':').next().map(|v| v.to_string())))
+        .or_else(|| {
+            extract_cookie_val(cookie, "sessionid")
+                .and_then(|s| s.split(':').next().map(|v| v.to_string()))
+        })
         .unwrap_or_else(|| "0".to_string());
 
-    debug!(username, ds_user_id = %ds_user_id, has_dtsg = !dtsg.is_empty(), has_lsd = !lsd.is_empty(), "Built profile request credentials");
+    debug!(username, ds_user_id = %ds_user_id, "Built profile request credentials");
 
-    // --- Stage 1: Collect all shortcodes from the profile timeline ---
-    info!(username, "=== Stage 1: Discovering posts from profile timeline ===");
-    let mut discovered_shortcodes = Vec::new();
     let mut discovered_post_urls = Vec::new();
     let mut seen_codes = HashSet::new();
     let mut cursor: Option<String> = None;
@@ -616,7 +791,7 @@ async fn extract_user_profile_feed(
         let status = resp.status();
         if !status.is_success() {
             error!(username, page = page_count, status = %status, "Instagram GraphQL query failed");
-            if discovered_shortcodes.is_empty() {
+            if discovered_post_urls.is_empty() {
                 bail!("Instagram GraphQL query failed with HTTP {status}");
             } else {
                 break;
@@ -632,7 +807,7 @@ async fn extract_user_profile_feed(
             Ok(val) => val,
             Err(e) => {
                 error!(username, error = %e, preview = %&body[..body.len().min(300)], "Failed to parse timeline JSON");
-                if discovered_shortcodes.is_empty() {
+                if discovered_post_urls.is_empty() {
                     bail!("Failed to parse Instagram GraphQL JSON: {e}");
                 } else {
                     break;
@@ -643,7 +818,7 @@ async fn extract_user_profile_feed(
         if let Some(err_code) = payload.get("error") {
             let msg = payload.get("errorSummary").and_then(|s| s.as_str()).unwrap_or("unknown error");
             error!(username, error_code = %err_code, summary = %msg, "Meta returned an API-level error");
-            if discovered_shortcodes.is_empty() {
+            if discovered_post_urls.is_empty() {
                 bail!("Meta GraphQL error {err_code}: {msg}. Verify session cookies in .env.");
             } else {
                 break;
@@ -656,7 +831,7 @@ async fn extract_user_profile_feed(
             (conn.get("edges").and_then(|e| e.as_array()), conn.get("page_info"))
         } else {
             warn!(username, preview = %&body[..body.len().min(300)], "Could not locate timeline connection in payload");
-            if discovered_shortcodes.is_empty() {
+            if discovered_post_urls.is_empty() {
                 bail!("Failed to locate timeline connection in GraphQL response.");
             } else {
                 break;
@@ -676,14 +851,13 @@ async fn extract_user_profile_feed(
             let node = edge.get("node").unwrap_or(edge);
             if let Some(code) = node.get("code").or_else(|| node.get("shortcode")).and_then(|c| c.as_str()) {
                 if seen_codes.insert(code.to_string()) {
-                    discovered_shortcodes.push(code.to_string());
                     discovered_post_urls.push(format!("https://www.instagram.com/p/{code}/"));
                     new_on_page += 1;
                 }
             }
         }
 
-        info!(username, page = page_count, new_posts = new_on_page, total_discovered = discovered_shortcodes.len(), "Timeline page processed");
+        info!(username, page = page_count, new_posts = new_on_page, total_discovered = discovered_post_urls.len(), "Timeline page processed");
 
         let has_next_page = page_info
             .and_then(|p| p.get("has_next_page"))
@@ -704,73 +878,13 @@ async fn extract_user_profile_feed(
         tokio::time::sleep(Duration::from_millis(400)).await;
     }
 
-    if discovered_shortcodes.is_empty() {
+    if discovered_post_urls.is_empty() {
         error!(username, "0 posts discovered for profile");
         bail!("No posts found for @{username}");
     }
 
-    info!(username, total_posts = discovered_shortcodes.len(), "=== Stage 2: Fetching individual posts for media, dates & locations ===");
-
-    // --- Stage 2: Call the post extractor directly for each discovered shortcode ---
-    let mut all_media_items = Vec::new();
-    let total_count = discovered_shortcodes.len();
-
-    for (idx, code) in discovered_shortcodes.iter().enumerate() {
-        debug!(progress = format!("{}/{}", idx + 1, total_count), shortcode = %code, "Fetching post details");
-
-        let post_result = match fetch_graphql_post_info(code, client).await {
-            Ok(meta) => Ok(meta),
-            Err(gql_err) => {
-                debug!(shortcode = %code, error = %gql_err, "GraphQL post fetch failed, falling back to mobile API");
-                fetch_mobile_post_info(code, client).await
-            }
-        };
-
-        match post_result {
-            Ok(mut meta) => {
-                let post_url = format!("https://www.instagram.com/p/{code}/");
-                let count = meta.items.len();
-
-                // Lock each item directly to its owning post's metadata
-                for item in &mut meta.items {
-                    item.source_post_url = Some(post_url.clone());
-                    item.caption = Some(meta.caption.clone());
-                    item.published_at = meta.published_at.clone();
-                    item.location = meta.location.clone();
-                    item.tags = meta.tags.clone();
-                }
-
-                all_media_items.extend(meta.items);
-                info!(progress = format!("{}/{}", idx + 1, total_count), shortcode = %code, media_count = count, "Post ingested with individual metadata");
-            }
-            Err(e) => {
-                warn!(progress = format!("{}/{}", idx + 1, total_count), shortcode = %code, error = %e, "Failed to fetch post details, skipping");
-            }
-        }
-
-        tokio::time::sleep(Duration::from_millis(250)).await;
-    }
-
-    if all_media_items.is_empty() {
-        error!(username, "Failed to extract any media items across all discovered posts");
-        bail!("Failed to extract media items from discovered posts for @{username}");
-    }
-
-    info!(username, total_media_items = all_media_items.len(), total_posts = discovered_post_urls.len(), "Profile extraction complete");
-
-    Ok(ExtractedMediaMetadata {
-        platform: "instagram".to_string(),
-        author: username.to_string(),
-        caption: format!("Extracted {} items from @{username}", all_media_items.len()),
-        post_text: None,
-        published_at: None,
-        tags: Vec::new(),
-        items: all_media_items,
-        location: None,
-        next_page_url: None,
-        discovered_post_urls,
-        embedded_player_urls: Vec::new(),
-    })
+    info!(username, total_posts = discovered_post_urls.len(), "Discovered all profile post links");
+    Ok(discovered_post_urls)
 }
 
 // -----------------------------------------------------------------------------
@@ -827,10 +941,44 @@ async fn extract_story_links(input_url: &str, client: &Client) -> Result<Extract
 
     let mut items = Vec::new();
     for node in raw_items {
-        if let Some(media_item) = parse_media_item(node) {
+        if let Some(mut media_item) = parse_media_item(node) {
+            // Per-story slide timestamp
+            let slide_date = node
+                .get("taken_at")
+                .and_then(|t| t.as_i64())
+                .and_then(format_epoch_timestamp);
+
+            // Per-story slide caption
+            let slide_caption = node
+                .pointer("/caption/text")
+                .and_then(|t| t.as_str())
+                .map(|s| s.to_string());
+
+            let slide_tags = slide_caption
+                .as_deref()
+                .map(extract_hashtags_from_text)
+                .unwrap_or_default();
+
+            // Per-story slide location
+            let slide_location = extract_and_resolve_location(node.get("location"), client).await;
+
+            // Direct PK link
+            let pk = node.get("pk").or_else(|| node.get("id")).and_then(|v| {
+                v.as_str().map(|s| s.to_string()).or_else(|| v.as_i64().map(|n| n.to_string()))
+            });
+            let source_post_url = pk.map(|id| format!("https://www.instagram.com/stories/{username}/{id}/"));
+
+            media_item.published_at = slide_date;
+            media_item.caption = slide_caption.or_else(|| Some(format!("Story from @{username}")));
+            media_item.tags = slide_tags;
+            media_item.location = slide_location;
+            media_item.source_post_url = source_post_url;
+
             items.push(media_item);
         }
     }
+
+    let fallback_date = items.first().and_then(|i| i.published_at.clone());
 
     info!(username, count = items.len(), "Successfully extracted stories");
     Ok(ExtractedMediaMetadata {
@@ -838,7 +986,7 @@ async fn extract_story_links(input_url: &str, client: &Client) -> Result<Extract
         author: username.to_string(),
         caption: format!("Active stories from @{username}"),
         post_text: None,
-        published_at: None,
+        published_at: fallback_date,
         tags: Vec::new(),
         items,
         location: None,
@@ -868,11 +1016,6 @@ async fn extract_direct_pk_links(
         .and_then(|arr| arr.get(0))
         .context("Story item not found")?;
 
-    let mut items = Vec::new();
-    if let Some(media_item) = parse_media_item(item) {
-        items.push(media_item);
-    }
-
     let published_at = item
         .get("taken_at")
         .and_then(|t| t.as_i64())
@@ -880,14 +1023,33 @@ async fn extract_direct_pk_links(
 
     let location = extract_and_resolve_location(item.get("location"), client).await;
 
+    let caption = item
+        .pointer("/caption/text")
+        .and_then(|t| t.as_str())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| format!("Story item {media_pk} from @{username}"));
+
+    let tags = extract_hashtags_from_text(&caption);
+    let post_url = format!("https://www.instagram.com/stories/{username}/{media_pk}/");
+
+    let mut items = Vec::new();
+    if let Some(mut media_item) = parse_media_item(item) {
+        media_item.published_at = published_at.clone();
+        media_item.caption = Some(caption.clone());
+        media_item.location = location.clone();
+        media_item.tags = tags.clone();
+        media_item.source_post_url = Some(post_url.clone());
+        items.push(media_item);
+    }
+
     info!(media_pk, username, count = items.len(), "Story PK item extracted");
     Ok(ExtractedMediaMetadata {
         platform: "instagram".to_string(),
         author: username.to_string(),
-        caption: format!("Story item {media_pk} from @{username}"),
-        post_text: None,
+        caption: caption.clone(),
+        post_text: Some(caption),
         published_at,
-        tags: Vec::new(),
+        tags,
         items,
         location,
         next_page_url: None,
