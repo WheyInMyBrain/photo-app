@@ -120,6 +120,7 @@ impl Config {
             ig_csrf_token: std::env::var("IG_CSRF_TOKEN").ok().filter(|s| !s.trim().is_empty()),
             ig_lsd: std::env::var("IG_LSD").ok().filter(|s| !s.trim().is_empty()),
             ig_fb_dtsg: std::env::var("IG_FB_DTSG").ok().filter(|s| !s.trim().is_empty()),
+            ..Default::default()
         };
 
         // 9. AI config

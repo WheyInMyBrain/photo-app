@@ -1,5 +1,5 @@
 // photo-app/crates/db/src/scrapes_repo.rs
-
+use std::collections::HashSet;
 use sqlx::{QueryBuilder, Row, Sqlite, SqlitePool};
 
 #[derive(Debug, Clone)]
@@ -433,5 +433,28 @@ impl ScrapesRepo {
                 published_at: r.get("published_at"),
             }
         }))
+    }
+
+    /// Fast set retrieval of existing post IDs for a specific user & author
+    pub async fn get_existing_post_ids(
+        pool: &SqlitePool,
+        user_id: &str,
+        platform: &str,
+        author: &str,
+    ) -> Result<HashSet<String>, sqlx::Error> {
+        let rows = sqlx::query_scalar::<_, String>(
+            r#"
+            SELECT external_post_id
+            FROM scraped_posts
+            WHERE user_id = ?1 AND platform = ?2 AND LOWER(author) = LOWER(?3)
+            "#,
+        )
+        .bind(user_id)
+        .bind(platform)
+        .bind(author)
+        .fetch_all(pool)
+        .await?;
+
+        Ok(rows.into_iter().collect())
     }
 }

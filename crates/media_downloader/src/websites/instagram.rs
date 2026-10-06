@@ -627,6 +627,7 @@ async fn extract_user_profile_feed(
     let mut cursor: Option<String> = None;
     let mut page_count = 0;
     const MAX_PAGES: usize = 500;
+    let mut hit_known_boundary = false;
 
     loop {
         page_count += 1;
@@ -696,7 +697,7 @@ async fn extract_user_profile_feed(
         let status = resp.status();
         if !status.is_success() {
             error!(username = %username, page = page_count, status = %status, "Timeline query failed");
-            if all_media_items.is_empty() {
+            if all_media_items.is_empty() && !hit_known_boundary {
                 bail!("Instagram GraphQL query failed with HTTP {status}");
             } else {
                 break;
@@ -712,7 +713,7 @@ async fn extract_user_profile_feed(
             Ok(val) => val,
             Err(e) => {
                 error!(username = %username, error = %e, preview = %&body[..body.len().min(300)], "Failed to parse timeline JSON");
-                if all_media_items.is_empty() {
+                if all_media_items.is_empty() && !hit_known_boundary {
                     bail!("Failed to parse Instagram GraphQL JSON: {e}");
                 } else {
                     break;
@@ -723,7 +724,7 @@ async fn extract_user_profile_feed(
         if let Some(err_code) = payload.get("error") {
             let msg = payload.get("errorSummary").and_then(|s| s.as_str()).unwrap_or("unknown error");
             error!(username = %username, error_code = %err_code, summary = %msg, "Meta returned an API-level error");
-            if all_media_items.is_empty() {
+            if all_media_items.is_empty() && !hit_known_boundary {
                 bail!("Meta GraphQL error {err_code}: {msg}. Verify session cookies in .env.");
             } else {
                 break;
@@ -736,7 +737,7 @@ async fn extract_user_profile_feed(
             (conn.get("edges").and_then(|e| e.as_array()), conn.get("page_info"))
         } else {
             warn!(username = %username, preview = %&body[..body.len().min(300)], "Could not locate timeline connection in payload");
-            if all_media_items.is_empty() {
+            if all_media_items.is_empty() && !hit_known_boundary {
                 bail!("Failed to locate timeline connection in GraphQL response.");
             } else {
                 break;
@@ -759,6 +760,17 @@ async fn extract_user_profile_feed(
                 Some(c) => c,
                 None => continue,
             };
+
+            // EARLY-EXIT CHECK: Stop if post was already downloaded previously
+            if cfg.is_known_post(code) {
+                info!(
+                    shortcode = %code,
+                    username = %username,
+                    "Encountered previously downloaded post. Stopping pagination early."
+                );
+                hit_known_boundary = true;
+                break;
+            }
 
             if !seen_codes.insert(code.to_string()) {
                 continue;
@@ -835,6 +847,11 @@ async fn extract_user_profile_feed(
             "Timeline page parsed directly"
         );
 
+        if hit_known_boundary {
+            debug!(username = %username, "Boundary reached, terminating pagination loop");
+            break;
+        }
+
         let has_next_page = page_info
             .and_then(|p| p.get("has_next_page"))
             .and_then(|b| b.as_bool())
@@ -855,7 +872,11 @@ async fn extract_user_profile_feed(
     }
 
     if all_media_items.is_empty() {
-        bail!("No media items could be extracted for @{username}");
+        if hit_known_boundary {
+            info!(username = %username, "Profile is already completely up-to-date (0 new posts found)");
+        } else {
+            bail!("No media items could be extracted for @{username}");
+        }
     }
 
     info!(
@@ -1323,7 +1344,7 @@ fn format_epoch_timestamp(epoch_secs: i64) -> Option<String> {
     chrono::DateTime::from_timestamp(epoch_secs, 0).map(|dt| dt.to_rfc3339())
 }
 
-fn extract_username_from_url(input_url: &str) -> Option<String> {
+pub fn extract_username_from_url(input_url: &str) -> Option<String> {
     // 1. Strip scheme and parse as Url to isolate the path from any query parameters or fragments
     let path = if let Ok(parsed) = reqwest::Url::parse(input_url) {
         parsed.path().trim_matches('/').to_string()

@@ -29,6 +29,7 @@ use db::{AlbumRepo, AssetRepo, JobRepo, UploadRepo};
 use media_downloader::{
     download_media, extract_media, inject_metadata, stream_thumbnail_base64,
     ExtractedMediaMetadata, MediaMetadataPayload, MediaType,
+    websites::instagram::extract_username_from_url,
 };
 
 // ==========================================
@@ -813,48 +814,85 @@ async fn resolve_or_scrape_manifest(
 ) -> Result<CandidateManifest, AppError> {
     let clean_url = url.trim();
 
-    // 1. Cached path: fetch from DB and populate CandidateItem with per-item metadata
-    if let Some(post) = ScrapesRepo::find_post_by_url(&state.db, &auth_user.id, clean_url)
-        .await
-        .map_err(|e| AppError::Internal(e.to_string()))?
-    {
-        let items = ScrapesRepo::fetch_items_for_post(&state.db, &post.id)
+    // 1. Detect if this is an Instagram profile link (not a single post, reel, or story)
+    let lower_url = clean_url.to_lowercase();
+    let is_instagram = lower_url.contains("instagram.com") || lower_url.contains("instagr.am");
+    let is_ig_profile = is_instagram
+        && !lower_url.contains("/p/")
+        && !lower_url.contains("/reel/")
+        && !lower_url.contains("/reels/")
+        && !lower_url.contains("/stories/");
+
+    // 2. Cached path: ONLY check whole-URL cache for single posts, reels, or non-profile links
+    if !is_ig_profile {
+        if let Some(post) = ScrapesRepo::find_post_by_url(&state.db, &auth_user.id, clean_url)
             .await
-            .map_err(|e| AppError::Internal(e.to_string()))?;
+            .map_err(|e| AppError::Internal(e.to_string()))?
+        {
+            let items = ScrapesRepo::fetch_items_for_post(&state.db, &post.id)
+                .await
+                .map_err(|e| AppError::Internal(e.to_string()))?;
 
-        let candidate_items = items
-            .into_iter()
-            .map(|i| CandidateItem {
-                id: i.id,
-                media_type: i.media_type,
-                mime_type: "application/octet-stream".to_string(),
-                thumbnail_url: i.thumbnail_url.unwrap_or_default(),
-                thumbnail_base64: None,
-                high_res_url: i.cdn_url,
-                audio_url: i.audio_url,
-                suggested_filename: i.suggested_filename,
-                referer: Some(clean_url.to_string()),
-                caption: i.caption.or_else(|| post.caption.clone()),
-                published_at: i.published_at.or_else(|| post.published_at.clone()),
-                location_name: i.location_name.or_else(|| post.location_name.clone()),
-                latitude: i.latitude.or(post.latitude),
-                longitude: i.longitude.or(post.longitude),
-                tags: if !i.tags.is_empty() { i.tags } else { post.tags.clone() },
-                source_post_url: i.source_url.or_else(|| Some(clean_url.to_string())),
-            })
-            .collect();
+            if !items.is_empty() {
+                let candidate_items = items
+                    .into_iter()
+                    .map(|i| CandidateItem {
+                        id: i.id,
+                        media_type: i.media_type,
+                        mime_type: "application/octet-stream".to_string(),
+                        thumbnail_url: i.thumbnail_url.unwrap_or_default(),
+                        thumbnail_base64: None,
+                        high_res_url: i.cdn_url,
+                        audio_url: i.audio_url,
+                        suggested_filename: i.suggested_filename,
+                        referer: Some(clean_url.to_string()),
+                        caption: i.caption.or_else(|| post.caption.clone()),
+                        published_at: i.published_at.or_else(|| post.published_at.clone()),
+                        location_name: i.location_name.or_else(|| post.location_name.clone()),
+                        latitude: i.latitude.or(post.latitude),
+                        longitude: i.longitude.or(post.longitude),
+                        tags: if !i.tags.is_empty() { i.tags } else { post.tags.clone() },
+                        source_post_url: i.source_url.or_else(|| Some(clean_url.to_string())),
+                    })
+                    .collect();
 
-        return Ok(CandidateManifest {
-            platform: post.platform.clone(),
-            author: post.author.clone(),
-            caption: post.caption.unwrap_or_default(),
-            suggested_folder: format!("{}/{}", post.platform, post.author),
-            items: candidate_items,
-        });
+                return Ok(CandidateManifest {
+                    platform: post.platform.clone(),
+                    author: post.author.clone(),
+                    caption: post.caption.unwrap_or_default(),
+                    suggested_folder: format!("{}/{}", post.platform, post.author),
+                    items: candidate_items,
+                });
+            }
+        }
     }
 
-    // 2. Scrape path: extract media manifest
-    let extracted: ExtractedMediaMetadata = extract_media(clean_url, Some(&state.config.downloader))
+    // 3. Configure downloader: for Instagram profiles, preload known post IDs for early-exit
+    let mut downloader_config = state.config.downloader.clone();
+
+    if is_ig_profile {
+        if let Some(username) = extract_username_from_url(clean_url) {
+            let existing_ids = ScrapesRepo::get_existing_post_ids(
+                &state.db,
+                &auth_user.id,
+                "instagram",
+                &username,
+            )
+            .await
+            .unwrap_or_default();
+
+            tracing::info!(
+                username = %username,
+                count = existing_ids.len(),
+                "Pre-loaded existing Instagram post IDs for early-exit profile sync"
+            );
+
+            downloader_config.known_post_ids = Some(existing_ids);
+        }
+    }
+
+    // 4. Scrape path: extract media manifest
+    let extracted: ExtractedMediaMetadata = extract_media(clean_url, Some(&downloader_config))
         .await
         .map_err(|e| AppError::BadRequest(format!("Link extraction failed: {e}")))?;
 
@@ -1073,7 +1111,45 @@ async fn execute_item_downloads(
         .await
         .map_err(|e| AppError::Internal(format!("Failed creating temp dir: {e}")))?;
 
+    // 1. Preload existing shortcodes if this batch is from Instagram
+    let known_shortcodes: Option<std::collections::HashSet<String>> = if platform == "instagram" {
+        let first_author = items.iter().find_map(|i| {
+            i.source_post_url
+                .as_deref()
+                .and_then(extract_username_from_url)
+        });
+
+        if let Some(ref author) = first_author {
+            ScrapesRepo::get_existing_post_ids(&state.db, &auth_user.id, "instagram", author)
+                .await
+                .ok()
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
     for item in items {
+        // 2. Skip downloading if this exact Instagram post was already downloaded
+        if let Some(ref known) = known_shortcodes {
+            if let Some(ref post_url) = item.source_post_url {
+                let code_opt = post_url
+                    .split("/p/")
+                    .nth(1)
+                    .or_else(|| post_url.split("/reel/").nth(1))
+                    .or_else(|| post_url.split("/reels/").nth(1))
+                    .and_then(|s| s.split('/').next());
+
+                if let Some(code) = code_opt {
+                    if known.contains(code) {
+                        tracing::debug!(shortcode = %code, "Skipping already downloaded item");
+                        continue;
+                    }
+                }
+            }
+        }
+
         let temp_file_path = temp_download_dir.join(format!("{}_{}", Uuid::new_v4(), item.suggested_filename));
 
         let referer = item.referer.as_deref().or_else(|| match platform {
@@ -1082,7 +1158,7 @@ async fn execute_item_downloads(
             _ => None,
         });
 
-        // 1. Download asset directly to disk
+        // 3. Download asset directly to disk
         if let Err(e) = download_media(
             &item.high_res_url,
             item.audio_url.as_deref(),
@@ -1102,7 +1178,7 @@ async fn execute_item_downloads(
             continue;
         }
 
-        // 2. Query contextual metadata from DB as secondary fallback
+        // 4. Query contextual metadata from DB as secondary fallback
         let ctx = ScrapesRepo::get_item_context(&state.db, &item.id)
             .await
             .unwrap_or(None);
@@ -1126,7 +1202,7 @@ async fn execute_item_downloads(
             ctx.as_ref().map(|c| c.source_url.clone()).or_else(|| item.referer.clone())
         });
 
-        // 3. Inject per-post EXIF / QuickTime/MP4 tags into file headers
+        // 5. Inject per-post EXIF / QuickTime/MP4 tags into file headers
         let meta_payload = MediaMetadataPayload {
             author: author.as_deref(),
             caption: caption.as_deref(),
@@ -1138,7 +1214,6 @@ async fn execute_item_downloads(
             longitude,
         };
 
-        // TRACK THE ACTUAL FILE PATH RETURNED AFTER POSSIBLE EXTENSION RENAMES
         let final_disk_path = match inject_metadata(&temp_file_path, &meta_payload).await {
             Ok(new_path) => new_path,
             Err(err) => {
@@ -1155,7 +1230,6 @@ async fn execute_item_downloads(
             .file_name()
             .and_then(|f| f.to_str())
             .map(|f| {
-                // Strip the UUID prefix so the logical filename reflects any extension fix
                 if let Some((_, orig)) = f.split_once('_') {
                     orig.to_string()
                 } else {
@@ -1170,7 +1244,7 @@ async fn execute_item_downloads(
             Err(_) => 0,
         };
 
-        // 4. Pass genuine per-post metadata to background processor payload
+        // 6. Pass genuine per-post metadata to background processor payload
         let job_payload = JobPayload {
             author,
             platform: platform_val,
@@ -1183,7 +1257,7 @@ async fn execute_item_downloads(
             longitude,
         };
 
-        // 5. Enqueue into Stage 0 "assemble" job WITH THE ACTUAL DISK PATH
+        // 7. Enqueue into Stage 0 "assemble" job WITH THE ACTUAL DISK PATH
         let job = DbJob {
             id: Uuid::new_v4().to_string(),
             user_id: auth_user.id.clone(),
@@ -1191,7 +1265,7 @@ async fn execute_item_downloads(
             file_name: actual_filename,
             rel_path: String::new(),
             folder_path: sanitized_folder.clone(),
-            disk_path: final_disk_path, // Points to the actual file that exists on disk
+            disk_path: final_disk_path,
             sha256: String::new(),
             job_type: "assemble".to_string(),
             file_size_bytes,
