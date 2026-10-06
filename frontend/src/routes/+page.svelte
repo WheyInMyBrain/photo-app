@@ -43,11 +43,6 @@
   let showManageAlbumModal = false;
   let isScrolledDown = false;
 
-  // Flattened stream for continuous random masonry (bypasses date section separation)
-  $: displayItems =$filterStore.sort === 'random'
-    ? $sections.flatMap((s) => s.items)
-    : [];
-
   $: selectedAsset = resolveAsset($sections, activeCoords);
   $: prevAsset = resolveAsset($sections, getPrevCoords($sections, activeCoords));$: nextAsset = resolveAsset($sections, getNextCoords($sections, activeCoords));
 
@@ -96,14 +91,7 @@
     }
 
     clickedCardRect = card.getBoundingClientRect();
-    
-    // Resolve true coords inside sections even when clicked from flat random view
-    if ($filterStore.sort === 'random') {
-      const coords = findCoordsById($sections, assetId);
-      activeCoords = coords ?? [secIdx, itemIdx];
-    } else {
-      activeCoords = [secIdx, itemIdx];
-    }
+    activeCoords = [secIdx, itemIdx];
   }
 
   async function handleRemoveFromAlbum() {
@@ -128,23 +116,25 @@
     return `${m}:${s.toString().padStart(2, '0')}`;
   }
 
+  // Pure server-driven scrubber markers
   $: scrubMarkers = (() => {
     if ($filterStore.sort !== 'timeline') return [];
     const seen = new Set<string>();
     const markers: { label: string; year: string; index: number; count?: number }[] = [];
 
-    $sections.forEach((s: any, idx: number) => {
-      let month = s.month;
-      let year = s.year;
-      if (!month || !year) {
-        const parts: string[] = s.title.split(' ');
-        month = parts[parts.length - 2] || '';
-        year = parts[parts.length - 1] || '';
-      }
+    $sections.forEach((s, idx) => {
+      const month = s.month || '';
+      const year = s.year || '';
       const key = `${month} ${year}`.trim();
+
       if (key && !seen.has(key)) {
         seen.add(key);
-        markers.push({ label: month, year, index: idx, count: s.items?.length });
+        markers.push({
+          label: month,
+          year,
+          index: idx,
+          count: s.items?.length
+        });
       }
     });
 
@@ -228,7 +218,7 @@
     on:manageAlbum={() => (showManageAlbumModal = true)}
   />
 
-  <!-- Main Grid Gallery -->
+  <!-- MAIN PHOTO GRID -->
   {#if $sections.length === 0 && !$isLoading}
     <div in:fade={{ duration: 180 }} class="flex-1 flex flex-col items-center justify-center text-center py-28 text-[var(--text-muted)]">
       <div class="w-12 h-12 opacity-30 mb-3">
@@ -241,100 +231,29 @@
       <p class="text-sm font-semibold tracking-tight text-[var(--text-main)]">No Media Found</p>
       <p class="text-xs text-[var(--text-muted)] mt-1">Try clearing filters</p>
     </div>
-  {:else if $filterStore.sort === 'random'}
-    <!-- UNIFIED CONTINUOUS GRID FOR RANDOM MODE (NO DATE CUTS OR STAGGERED HEADERS) -->
-    <div
-      role="region"
-      aria-label="Media grid"
-      class="gallery-grid select-none touch-pan-y"
-      style="--grid-cols: {currentDensity.cols}; --grid-cols-mobile: {currentDensity.colsMobile};"
-    >
-      {#each displayItems as asset, itemIdx (asset.id)}
-        {@const isPriority = itemIdx < 20}
-        {@const isSelected = selectedSet.has(asset.id)}
-
-        <div
-          role="button"
-          tabindex="0"
-          aria-pressed={isSelected}
-          aria-label={asset.file_name}
-          data-asset-id={asset.id}
-          on:click={(e) => handleCardClick(e, asset.id, 0, itemIdx)}
-          on:keydown={(e) => {
-            if (e.key === 'Enter' || e.key === ' ') handleCardClick(e, asset.id, 0, itemIdx);
-          }}
-          class="tile-card group relative aspect-square rounded-lg overflow-hidden cursor-pointer focus:outline-none transition-transform duration-200 {isSelected ? 'scale-[0.92]' : 'hover:scale-[1.01]'}"
-        >
-          <img
-            src={asset.thumb_path.startsWith('/') ? asset.thumb_path : `/${asset.thumb_path}`}
-            alt={asset.file_name}
-            loading={isPriority ? 'eager' : 'lazy'}
-            decoding="async"
-            fetchpriority={isPriority ? 'high' : 'auto'}
-            on:load={(e) => (e.currentTarget as HTMLElement).classList.add('loaded')}
-            class="tile-image w-full h-full object-cover pointer-events-none rounded-lg"
-          />
-
-          {#if isSelected}
-            <div class="pointer-events-none absolute inset-0 z-10 rounded-lg ring-3 ring-purple-500 ring-inset bg-purple-500/10"></div>
-          {/if}
-
-          <button
-            type="button"
-            data-select-btn
-            class="select-btn absolute top-1.5 left-1.5 w-6 h-6 rounded-full flex items-center justify-center transition-all z-20 cursor-pointer active:scale-90 {isSelected ? 'opacity-100 scale-100 bg-purple-600 text-white shadow-md border-2 border-white' : ($isSelectionActive ? 'opacity-100 scale-95 bg-black/40 border border-white/70 text-transparent' : 'opacity-0 scale-90 group-hover:opacity-100 bg-black/40 border border-white/70 text-transparent')}"
-            title="Select"
-            aria-label="Select photo"
-          >
-            <svg xmlns="http://www.w3.org/2000/svg" class="w-3.5 h-3.5 pointer-events-none stroke-[3] {isSelected ? 'opacity-100 text-white' : 'opacity-0'}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round">
-              <polyline points="20 6 9 17 4 12"></polyline>
-            </svg>
-          </button>
-
-          {#if asset.is_favorite}
-            <div class="absolute top-1.5 right-1.5 bg-black/55 backdrop-blur-md px-1.5 py-1 rounded-full text-amber-300 z-10 pointer-events-none shadow-sm border border-white/10 flex items-center justify-center">
-              <svg xmlns="http://www.w3.org/2000/svg" class="w-2.5 h-2.5 fill-amber-300 stroke-amber-300" viewBox="0 0 24 24" stroke-width="2">
-                <polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"></polygon>
-              </svg>
-            </div>
-          {/if}
-
-          {#if asset.duration_seconds && $gridDensity > 0}
-            <div class="absolute bottom-1.5 right-1.5 bg-black/70 backdrop-blur-md border border-white/15 px-2 py-0.5 rounded-md text-[9px] text-white font-mono font-medium z-10 pointer-events-none flex items-center gap-1 shadow-sm">
-              <svg xmlns="http://www.w3.org/2000/svg" class="w-2 h-2 fill-current" viewBox="0 0 24 24">
-                <polygon points="5 3 19 12 5 21 5 3"></polygon>
-              </svg>
-              <span>{formatTime(asset.duration_seconds)}</span>
-            </div>
-          {/if}
-
-          {#if asset.days_remaining !== null && asset.days_remaining !== undefined && $gridDensity > 0}
-            <div class="absolute bottom-1.5 left-1.5 bg-rose-600/75 backdrop-blur-md border border-rose-400/40 px-2 py-0.5 rounded-md text-[9px] text-white font-mono font-medium z-10 pointer-events-none shadow-sm">
-              <span>{asset.days_remaining}d left</span>
-            </div>
-          {/if}
-        </div>
-      {/each}
-    </div>
   {:else}
-    <!-- DATE-GROUPED SECTIONS FOR TIMELINE MODE -->
+    <!-- UNIFIED SERVER-DRIVEN STREAM -->
     <div
       role="region"
       aria-label="Media grid"
       class="space-y-6 md:space-y-7 select-none touch-pan-y"
       style="--grid-cols: {currentDensity.cols}; --grid-cols-mobile: {currentDensity.colsMobile};"
     >
-      {#each $sections as section, secIdx (section.id || section.title)}
+      {#each $sections as section, secIdx (section.id)}
         <section id="section-marker-{secIdx}" class="section-container">
-          <div class="pt-2 pb-1.5 px-0.5 flex items-baseline justify-between mb-1.5">
-            <h2 class="text-xs sm:text-sm font-semibold tracking-tight text-[var(--text-main)]">
-              {section.title}
-            </h2>
-            <span class="text-[10px] font-mono text-[var(--text-muted)] opacity-60">
-              {section.items.length}
-            </span>
-          </div>
+          <!-- Server-controlled title: renders ONLY when section.title is non-null -->
+          {#if section.title}
+            <div class="pt-2 pb-1.5 px-0.5 flex items-baseline justify-between mb-1.5">
+              <h2 class="text-xs sm:text-sm font-semibold tracking-tight text-[var(--text-main)]">
+                {section.title}
+              </h2>
+              <span class="text-[10px] font-mono text-[var(--text-muted)] opacity-60">
+                {section.items.length}
+              </span>
+            </div>
+          {/if}
 
+          <!-- Grid layout -->
           <div class="gallery-grid">
             {#each section.items as asset, itemIdx (asset.id)}
               {@const isPriority = secIdx === 0 && itemIdx < 20}
@@ -352,6 +271,7 @@
                 }}
                 class="tile-card group relative aspect-square rounded-lg overflow-hidden cursor-pointer focus:outline-none transition-transform duration-200 {isSelected ? 'scale-[0.92]' : 'hover:scale-[1.01]'}"
               >
+                <!-- Thumbnail -->
                 <img
                   src={asset.thumb_path.startsWith('/') ? asset.thumb_path : `/${asset.thumb_path}`}
                   alt={asset.file_name}
@@ -362,10 +282,12 @@
                   class="tile-image w-full h-full object-cover pointer-events-none rounded-lg"
                 />
 
+                <!-- Selection Inset Ring -->
                 {#if isSelected}
                   <div class="pointer-events-none absolute inset-0 z-10 rounded-lg ring-3 ring-purple-500 ring-inset bg-purple-500/10"></div>
                 {/if}
 
+                <!-- Checkmark Badge -->
                 <button
                   type="button"
                   data-select-btn
@@ -378,6 +300,7 @@
                   </svg>
                 </button>
 
+                <!-- Favorite Badge -->
                 {#if asset.is_favorite}
                   <div class="absolute top-1.5 right-1.5 bg-black/55 backdrop-blur-md px-1.5 py-1 rounded-full text-amber-300 z-10 pointer-events-none shadow-sm border border-white/10 flex items-center justify-center">
                     <svg xmlns="http://www.w3.org/2000/svg" class="w-2.5 h-2.5 fill-amber-300 stroke-amber-300" viewBox="0 0 24 24" stroke-width="2">
@@ -386,6 +309,7 @@
                   </div>
                 {/if}
 
+                <!-- Video Duration HUD -->
                 {#if asset.duration_seconds && $gridDensity > 0}
                   <div class="absolute bottom-1.5 right-1.5 bg-black/70 backdrop-blur-md border border-white/15 px-2 py-0.5 rounded-md text-[9px] text-white font-mono font-medium z-10 pointer-events-none flex items-center gap-1 shadow-sm">
                     <svg xmlns="http://www.w3.org/2000/svg" class="w-2 h-2 fill-current" viewBox="0 0 24 24">
@@ -395,6 +319,7 @@
                   </div>
                 {/if}
 
+                <!-- Days Remaining in Trash -->
                 {#if asset.days_remaining !== null && asset.days_remaining !== undefined && $gridDensity > 0}
                   <div class="absolute bottom-1.5 left-1.5 bg-rose-600/75 backdrop-blur-md border border-rose-400/40 px-2 py-0.5 rounded-md text-[9px] text-white font-mono font-medium z-10 pointer-events-none shadow-sm">
                     <span>{asset.days_remaining}d left</span>
@@ -421,7 +346,7 @@
 
 <!-- Scrubber (Timeline mode only) -->
 {#if $filterStore.sort === 'timeline'}
-  <TimelineScrubber markers={scrubMarkers} on:jump={handleJump} />
+  <TimelineScrubber markers={scrubMarkers} on:jump={(e) => scrollToSection(e.detail.index)} />
 {/if}
 
 <!-- Actions and Modals -->
@@ -483,7 +408,7 @@
       if (found) activeCoords = found;
     }}
     on:toggleFavorite={(e) => {
-      if (activeCoords) timeline.patchFavorite(activeCoords, e.detail.is_favorite);
+      if (selectedAsset) timeline.patchFavorite(selectedAsset.id, e.detail.is_favorite);
     }}
     on:setAsCover={() => {
       if (selectedAsset) handleSetCover(selectedAsset.id, selectedAsset.thumb_path);

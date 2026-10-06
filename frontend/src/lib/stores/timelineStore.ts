@@ -1,114 +1,39 @@
-// photo-app/frontend/src/lib/stores/timelineStore.ts
 import { writable } from 'svelte/store';
 import { browser } from '$app/environment';
 import { authStore } from '$lib/stores/authStore';
-import type { SubAlbum, MediaSection, MediaPageResponse, AssetRecord } from '$lib/types/media';
+import type { SubAlbum, BreadcrumbSegment, MediaSection, MediaPageResponse } from '$lib/types/media';
 
-export interface DailyMediaSection extends MediaSection {
-  id?: string;
-  month?: string;
-  year?: string;
-}
-
-/** Formats a timestamp into: "Saturday, 12th September 2026" */
-function formatDayTitle(date: Date): string {
-  const day = date.getDate();
-  const suffix = (d: number) => {
-    if (d > 3 && d < 21) return 'th';
-    switch (d % 10) {
-      case 1:  return 'st';
-      case 2:  return 'nd';
-      case 3:  return 'rd';
-      default: return 'th';
-    }
-  };
-
-  const weekday = date.toLocaleDateString('en-US', { weekday: 'long' });
-  const month = date.toLocaleDateString('en-US', { month: 'long' });
-  const year = date.getFullYear();
-
-  return `${weekday}, ${day}${suffix(day)} ${month} ${year}`;
-}
-
-/** Resolves an asset's day key: "YYYY-MM-DD" */
-function getDayKey(asset: AssetRecord): string {
-  const rawDate = asset.captured_at || asset.created_at;
-  if (!rawDate) return 'undated';
-  const d = new Date(rawDate);
-  if (isNaN(d.getTime())) return 'undated';
-  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
-}
-
-/** Regroups arbitrary sections or flat assets into strict day-by-day sections (TIMELINE ONLY) */
-function repartitionIntoDailySections(incomingSections: MediaSection[]): DailyMediaSection[] {
-  const result: DailyMediaSection[] = [];
-  const map = new Map<string, DailyMediaSection>();
-
-  for (const sec of incomingSections) {
-    for (const item of sec.items) {
-      const dayKey = getDayKey(item);
-
-      if (!map.has(dayKey)) {
-        let title = 'Undated';
-        let month = '';
-        let year = '';
-
-        if (dayKey !== 'undated') {
-          const rawDate = item.captured_at || item.created_at;
-          const d = rawDate ? new Date(rawDate) : null;
-          if (d && !isNaN(d.getTime())) {
-            title = formatDayTitle(d);
-            month = d.toLocaleDateString('en-US', { month: 'short' });
-            year = String(d.getFullYear());
-          }
-        }
-
-        const newSection: DailyMediaSection = {
-          id: dayKey,
-          title,
-          month,
-          year,
-          items: []
-        };
-        map.set(dayKey, newSection);
-        result.push(newSection);
-      }
-
-      map.get(dayKey)!.items.push(item);
-    }
-  }
-
-  return result;
-}
-
-/** Merges incoming sections into existing sections across pagination boundaries */
-function appendSections(current: DailyMediaSection[], incoming: DailyMediaSection[], isTimeline: boolean): DailyMediaSection[] {
+/**
+ * Merges incoming sections across pagination boundaries.
+ * If the first incoming section shares an ID with the last loaded section
+ * (e.g. photos from the same day crossing cursor limits), append items directly.
+ */
+function mergeSections(current: MediaSection[], incoming: MediaSection[]): MediaSection[] {
   if (incoming.length === 0) return current;
-  const cloned = [...current];
+  if (current.length === 0) return incoming;
 
-  if (!isTimeline) {
-    // In random mode: simply append new chunked sections directly
-    return [...cloned, ...incoming];
+  const cloned = [...current];
+  const firstInc = incoming[0];
+  const lastCur = cloned[cloned.length - 1];
+
+  let startIdx = 0;
+
+  if (lastCur.id === firstInc.id && lastCur.id !== 'explore-feed') {
+    lastCur.items = [...lastCur.items, ...firstInc.items];
+    startIdx = 1;
   }
 
-  // In timeline mode: merge matching day boundaries
-  for (const inc of incoming) {
-    if (cloned.length > 0) {
-      const last = cloned[cloned.length - 1];
-      if ((last.id && inc.id && last.id === inc.id) || last.title === inc.title) {
-        last.items = [...last.items, ...inc.items];
-        continue;
-      }
-    }
-    cloned.push(inc);
+  for (let i = startIdx; i < incoming.length; i++) {
+    cloned.push(incoming[i]);
   }
 
   return cloned;
 }
 
 export function createTimelineStore() {
-  const sections = writable<DailyMediaSection[]>([]);
+  const sections = writable<MediaSection[]>([]);
   const albums = writable<SubAlbum[]>([]);
+  const breadcrumbs = writable<BreadcrumbSegment[]>([]);
   const isLoading = writable(false);
   const hasMore = writable(true);
 
@@ -138,17 +63,11 @@ export function createTimelineStore() {
 
       const isTimeline = params.get('sort') === 'timeline';
 
-      // Pass the appropriate cursors based on mode
       if (isTimeline) {
-        if (nextCapturedAt && nextId) {
-          params.set('cursor_captured_at', nextCapturedAt);
-          params.set('cursor_id', nextId);
-        }
+        if (nextCapturedAt) params.set('cursor_captured_at', nextCapturedAt);
+        if (nextId) params.set('cursor_id', nextId);
       } else {
-        // Random mode only needs cursor_id
-        if (nextId) {
-          params.set('cursor_id', nextId);
-        }
+        if (nextId) params.set('cursor_id', nextId);
       }
 
       const res = await fetch(`/api/media?${params.toString()}`, { signal: pageAbortCtrl.signal });
@@ -164,22 +83,19 @@ export function createTimelineStore() {
       const data: MediaPageResponse = await res.json();
       if (requestId !== currentRequestId) return;
 
-      // In timeline mode: re-group into calendar days.
-      // In random mode: KEEP THE EXACT BACKEND RANDOM ORDER!
-      const processedSections: DailyMediaSection[] = isTimeline
-        ? repartitionIntoDailySections(data.sections ?? [])
-        : (data.sections ?? []);
+      const incoming = data.sections ?? [];
 
       if (reset) {
         albums.set(data.albums ?? []);
-        sections.set(processedSections);
+        breadcrumbs.set(data.breadcrumbs ?? []);
+        sections.set(incoming);
       } else {
-        sections.update((curr) => appendSections(curr, processedSections, isTimeline));
+        sections.update((curr) => mergeSections(curr, incoming));
       }
 
-      nextCapturedAt = data.next_cursor_captured_at;
-      nextId = data.next_cursor_id;
-      hasMore.set(data.has_more);
+      nextCapturedAt = data.next_cursor_captured_at ?? null;
+      nextId = data.next_cursor_id ?? null;
+      hasMore.set(Boolean(data.has_more));
     } catch (err: any) {
       if (err?.name !== 'AbortError' && requestId === currentRequestId) {
         console.error('Timeline fetch error:', err);
@@ -212,13 +128,13 @@ export function createTimelineStore() {
       const data: MediaPageResponse = await res.json();
       if (requestId !== currentRequestId) return;
 
-      const dailySections = repartitionIntoDailySections(data.sections ?? []);
-      sections.set(dailySections);
+      sections.set(data.sections ?? []);
       albums.set(data.albums ?? []);
+      breadcrumbs.set(data.breadcrumbs ?? []);
 
-      nextCapturedAt = data.next_cursor_captured_at;
-      nextId = data.next_cursor_id;
-      hasMore.set(data.has_more);
+      nextCapturedAt = data.next_cursor_captured_at ?? null;
+      nextId = data.next_cursor_id ?? null;
+      hasMore.set(Boolean(data.has_more));
     } catch (err: any) {
       if (err?.name !== 'AbortError' && requestId === currentRequestId) {
         console.error('Timeline jump error:', err);
@@ -230,11 +146,21 @@ export function createTimelineStore() {
     }
   }
 
-  function patchFavorite(coords: [number, number], isFav: boolean) {
+  function patchFavorite(coordsOrId: [number, number] | string, isFav: boolean) {
     sections.update((curr) => {
-      const [s, i] = coords;
-      if (curr[s]?.items[i]) {
-        curr[s].items[i].is_favorite = isFav;
+      if (typeof coordsOrId === 'string') {
+        for (const sec of curr) {
+          const item = sec.items.find((i) => i.id === coordsOrId);
+          if (item) {
+            item.is_favorite = isFav;
+            break;
+          }
+        }
+      } else {
+        const [s, i] = coordsOrId;
+        if (curr[s]?.items[i]) {
+          curr[s].items[i].is_favorite = isFav;
+        }
       }
       return curr;
     });
@@ -248,6 +174,7 @@ export function createTimelineStore() {
   return {
     sections,
     albums,
+    breadcrumbs,
     isLoading,
     hasMore,
     fetchMedia,

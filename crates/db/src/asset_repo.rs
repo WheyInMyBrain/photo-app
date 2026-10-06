@@ -1,13 +1,14 @@
 use sqlx::{QueryBuilder, Row, Sqlite, SqlitePool};
 use std::path::Path;
-use chrono::{DateTime, Utc};
+use std::collections::BTreeMap;
+use chrono::{NaiveDate};
 
 use crate::domain::{
     AssetStorageInfo, MediaPageResponse, MediaQuery, SubAlbum, MediaSection,
     NewAssetRecord, DynamicFiltersResponse, FilterOption, AssetCacheMetadata,
     RawMediaRow, MediaItemSummary, MapLocationPoint, MapLocationsQuery,
     AssetObjectDetail, AssetPoseDetail, CheckUploadResponse,
-    ExistingAssetRow, TimelineBucket,
+    ExistingAssetRow, TimelineBucket, BreadcrumbSegment
 };
 
 pub struct AssetRepo;
@@ -58,55 +59,87 @@ impl AssetRepo {
         }
     }
 
-    /// Single-pass sequential grouper (O(N) with zero heap fragmentation)
+    /// Formats an ordinal day suffix: 1 -> "1st", 2 -> "2nd", 3 -> "3rd", 4 -> "4th"
+    #[inline]
+    fn ordinal_suffix(day: u32) -> &'static str {
+        match day {
+            11..=13 => "th",
+            _ => match day % 10 {
+                1 => "st",
+                2 => "nd",
+                3 => "rd",
+                _ => "th",
+            },
+        }
+    }
+
+    /// Pre-formats ready-to-render section metadata:
+    /// Returns: (section_id, title, month_short, year_str, date_iso)
+    /// Example title: "Saturday, 12th September 2026"
+    fn format_daily_section_meta(dt_str: &str) -> (String, Option<String>, Option<String>, Option<String>, Option<String>) {
+        if dt_str.len() >= 10 {
+            let y_slice = &dt_str[0..4];
+            let m_slice = &dt_str[5..7];
+            let d_slice = &dt_str[8..10];
+
+            if let (Ok(y), Ok(m), Ok(d)) = (y_slice.parse::<i32>(), m_slice.parse::<u32>(), d_slice.parse::<u32>()) {
+                if let Some(date) = NaiveDate::from_ymd_opt(y, m, d) {
+                    let weekday = date.format("%A");
+                    let month_full = date.format("%B");
+                    let month_short = date.format("%b").to_string();
+                    let year_str = y.to_string();
+                    let suffix = Self::ordinal_suffix(d);
+
+                    let title = format!("{weekday}, {d}{suffix} {month_full} {year_str}");
+                    let date_iso = format!("{y_slice}-{m_slice}-{d_slice}");
+                    let section_id = format!("section-{date_iso}");
+
+                    return (section_id, Some(title), Some(month_short), Some(year_str), Some(date_iso));
+                }
+            }
+        }
+
+        (
+            "section-undated".to_string(),
+            Some("Undated".to_string()),
+            None,
+            None,
+            None,
+        )
+    }
+
+    /// Single-pass sequential grouper (O(N) with zero heap re-allocations)
+    /// Produces clean, daily-scoped MediaSection partitions for Timeline mode.
     fn build_grouped_sections(rows: Vec<RawMediaRow>) -> Vec<MediaSection> {
         let mut sections: Vec<MediaSection> = Vec::new();
-        let now = Utc::now();
 
         for r in rows {
-            let (section_id, group_title) = match &r.captured_at {
-                Some(dt) if dt.len() >= 7 => {
-                    let y = &dt[0..4];
-                    let m = &dt[5..7];
-                    (format!("section-{y}-{m}"), Self::fast_month_year(y, m))
-                }
-                _ => ("section-undated".to_string(), "Undated".to_string()),
+            let (sec_id, title, month, year, date_iso) = match &r.captured_at {
+                Some(dt) => Self::format_daily_section_meta(dt),
+                None => (
+                    "section-undated".to_string(),
+                    Some("Undated".to_string()),
+                    None,
+                    None,
+                    None,
+                ),
             };
 
-            let days_remaining = r.deleted_at.as_deref().map(|d| {
-                if let Ok(deleted_time) = d.parse::<DateTime<Utc>>() {
-                    let passed = (now - deleted_time).num_days();
-                    (30 - passed).max(0)
-                } else {
-                    30
-                }
-            });
-
-            let item = MediaItemSummary {
-                id: r.id,
-                file_name: r.file_name,
-                thumb_path: r.thumb_path,
-                preview_path: r.preview_path,
-                aspect_ratio: r.aspect_ratio.unwrap_or(1.0),
-                duration_seconds: r.duration_seconds,
-                mime_type: r.mime_type,
-                captured_at: r.captured_at,
-                is_favorite: r.is_favorite == 1,
-                days_remaining,
-                latitude: r.latitude,
-                longitude: r.longitude,
-            };
+            let item = MediaItemSummary::from(r);
 
             if let Some(last_sec) = sections.last_mut() {
-                if last_sec.id == section_id {
+                if last_sec.id == sec_id {
                     last_sec.items.push(item);
                     continue;
                 }
             }
 
             sections.push(MediaSection {
-                id: section_id,
-                title: group_title,
+                id: sec_id,
+                title,
+                month,
+                year,
+                date_iso,
                 items: vec![item],
             });
         }
@@ -114,18 +147,37 @@ impl AssetRepo {
         sections
     }
 
-    #[inline]
-    fn fast_month_year(year: &str, month: &str) -> String {
-        let m = match month {
-            "01" => "January",   "02" => "February", "03" => "March",
-            "04" => "April",     "05" => "May",      "06" => "June",
-            "07" => "July",      "08" => "August",   "09" => "September",
-            "10" => "October",   "11" => "November", "12" => "December",
-            _ => "Unknown",
+    /// Builds a breadcrumb hierarchy from a relative folder path (e.g. "Trips/2026/Goa")
+    fn build_path_breadcrumbs(folder_path: Option<&str>) -> Vec<BreadcrumbSegment> {
+        let path = match folder_path {
+            Some(p) => p.trim_matches('/'),
+            None => return Vec::new(),
         };
-        format!("{m} {year}")
+
+        if path.is_empty() {
+            return Vec::new();
+        }
+
+        let parts: Vec<&str> = path.split('/').collect();
+        let mut crumbs = Vec::with_capacity(parts.len());
+        let mut cumulative = String::new();
+
+        for part in parts {
+            if !cumulative.is_empty() {
+                cumulative.push('/');
+            }
+            cumulative.push_str(part);
+
+            crumbs.push(BreadcrumbSegment {
+                name: part.to_string(),
+                path: cumulative.clone(),
+                album_id: None,
+            });
+        }
+
+        crumbs
     }
-    
+
     pub async fn query_media(
         pool: &SqlitePool,
         user_id: &str,
@@ -305,9 +357,7 @@ impl AssetRepo {
 
         // --- PAGINATION & ORDERING ---
         if is_random {
-            // Safe, universal integer hash using valid SQLite operators:
-            // Hash formula computes over first 4 characters of a.id with seed multiplier.
-            // Formula: abs(((unicode(substr(id,1,1))*31 + unicode(substr(id,2,1)))*31 + unicode(substr(id,3,1))) * seed) % 1000003
+            // Polynomial hash with modulo 1000003 for stable seeded random ordering
             let seed_scalar: i64 = (random_seed % 100_000) + 1;
 
             if let Some(ref cid) = q.cursor_id {
@@ -374,6 +424,9 @@ impl AssetRepo {
             Vec::new()
         };
 
+        // Breadcrumbs: generated server-side from folder_path
+        let breadcrumbs = Self::build_path_breadcrumbs(q.folder_path.as_deref());
+
         // 2. Fetch rows
         let mut rows = builder.build_query_as::<RawMediaRow>().fetch_all(pool).await?;
         let has_more = rows.len() > limit;
@@ -386,20 +439,20 @@ impl AssetRepo {
         let next_cursor_id = rows.last().map(|i| i.id.clone());
 
         // 4. Group into sections:
+        // - Random mode: 1 flat continuous section with title: None so frontend skips date headers.
+        // - Timeline mode: Cleanly daily-partitioned sections with pre-formatted title, month, year.
         let sections = if is_random {
             if rows.is_empty() {
                 Vec::new()
             } else {
-                let items: Vec<MediaItemSummary> = rows.into_iter().map(MediaItemSummary::from).collect();
-                items
-                    .chunks(30)
-                    .enumerate()
-                    .map(|(idx, chunk)| MediaSection {
-                        id: format!("explore-chunk-{idx}"),
-                        title: "Explore".to_string(),
-                        items: chunk.to_vec(),
-                    })
-                    .collect()
+                vec![MediaSection {
+                    id: "explore-feed".to_string(),
+                    title: None,
+                    month: None,
+                    year: None,
+                    date_iso: None,
+                    items: rows.into_iter().map(MediaItemSummary::from).collect(),
+                }]
             }
         } else {
             Self::build_grouped_sections(rows)
@@ -407,6 +460,7 @@ impl AssetRepo {
 
         Ok(MediaPageResponse {
             albums,
+            breadcrumbs,
             sections,
             next_cursor_captured_at,
             next_cursor_id,
@@ -958,22 +1012,25 @@ impl AssetRepo {
         Ok(info)
     }
 
-    /// Discovers immediate child folders under a given path
+    /// Discovers immediate child folders under a given path with counts and latest cover thumbnail
     pub async fn get_sub_albums(
         pool: &SqlitePool,
         user_id: &str,
         current_folder: &str,
         media_type: Option<&str>,
     ) -> Result<Vec<SubAlbum>, sqlx::Error> {
-        let prefix = if current_folder.is_empty() || current_folder == "root" {
+        let clean_current = current_folder.trim_matches('/');
+        let prefix = if clean_current.is_empty() || clean_current == "root" {
             String::new()
         } else {
-            format!("{}/", current_folder.trim_matches('/'))
+            format!("{clean_current}/")
         };
 
         let mut builder: QueryBuilder<Sqlite> = QueryBuilder::new(
             r#"
-            SELECT folder_path, thumb_path
+            SELECT 
+                folder_path, 
+                thumb_path
             FROM assets
             WHERE user_id = 
             "#,
@@ -981,9 +1038,9 @@ impl AssetRepo {
         builder.push_bind(user_id);
         builder.push(" AND deleted_at IS NULL ");
         builder.push(" AND folder_path LIKE ");
-        builder.push_bind(format!("{}%", prefix));
+        builder.push_bind(format!("{prefix}%"));
         builder.push(" AND folder_path != ");
-        builder.push_bind(if current_folder.is_empty() { "root" } else { current_folder });
+        builder.push_bind(if clean_current.is_empty() { "root" } else { clean_current });
 
         // Photo / Video separation in album tree
         if let Some(m_type) = media_type {
@@ -994,21 +1051,23 @@ impl AssetRepo {
             }
         }
 
-        builder.push(" ORDER BY created_at DESC");
+        // Newest assets first so the first row encountered per folder is the latest cover
+        builder.push(" ORDER BY COALESCE(captured_at, created_at) DESC ");
 
         let rows = builder.build().fetch_all(pool).await?;
 
-        use std::collections::BTreeMap;
+        // Map: direct_child_name -> (full_child_path, item_count, latest_cover_thumb)
         let mut groups: BTreeMap<String, (String, i64, Option<String>)> = BTreeMap::new();
 
         for r in rows {
-            let full_fp: String = r.get("folder_path");
-            let thumb: Option<String> = r.get("thumb_path");
+            let full_fp: String = r.try_get("folder_path").unwrap_or_default();
+            let thumb: Option<String> = r.try_get("thumb_path").ok();
 
+            let clean_fp = full_fp.trim_matches('/');
             let remainder = if prefix.is_empty() {
-                full_fp.as_str()
+                clean_fp
             } else {
-                full_fp.strip_prefix(&prefix).unwrap_or(&full_fp)
+                clean_fp.strip_prefix(&prefix).unwrap_or(clean_fp)
             };
 
             let direct_child = remainder.split('/').next().unwrap_or("").trim();
@@ -1019,16 +1078,19 @@ impl AssetRepo {
             let full_child_path = if prefix.is_empty() {
                 direct_child.to_string()
             } else {
-                format!("{}{}", prefix, direct_child)
+                format!("{prefix}{direct_child}")
             };
 
-            let entry = groups.entry(direct_child.to_string()).or_insert((full_child_path, 0, thumb));
+            let entry = groups
+                .entry(direct_child.to_string())
+                .or_insert_with(|| (full_child_path, 0, thumb));
             entry.1 += 1;
         }
 
         let albums = groups
             .into_iter()
             .map(|(name, (path, count, cover_thumb))| SubAlbum {
+                id: None, // Raw folder path directory; None signals filesystem-backed
                 name,
                 path,
                 count,

@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use sqlx::{FromRow};
+use sqlx::FromRow;
 
 #[derive(Debug, Clone)]
 pub struct AssetStorageInfo {
@@ -42,11 +42,16 @@ pub struct MediaItemSummary {
     pub longitude: Option<f64>,
 }
 
-/// Ready-to-render DOM section mapping 1:1 to frontend template loops
+/// Server-driven section contract:
+/// - In Timeline mode: title is "Saturday, 12th September 2026", with month & year populated.
+/// - In Random/Explore mode: title is None (or empty), so frontend renders a continuous grid with no dividers.
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct MediaSection {
-    pub id: String,
-    pub title: String, // e.g. "September 2026", "August 2026", "Undated"
+    pub id: String,                    // Unique section key, e.g. "2026-09-12" or "explore-feed"
+    pub title: Option<String>,         // Pre-formatted day title or None for random
+    pub month: Option<String>,         // e.g. "Sep" (pre-calculated for timeline scrubber)
+    pub year: Option<String>,          // e.g. "2026" (pre-calculated for timeline scrubber)
+    pub date_iso: Option<String>,      // e.g. "2026-09-12"
     pub items: Vec<MediaItemSummary>,
 }
 
@@ -155,17 +160,27 @@ pub struct MediaQuery {
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct SubAlbum {
+    pub id: Option<String>,
     pub name: String,
     pub path: String,
     pub count: i64,
     pub cover_thumb: Option<String>,
 }
 
+/// Server-generated breadcrumb node eliminating frontend string-splitting
+#[derive(Serialize, Deserialize, Clone, Debug)]
+pub struct BreadcrumbSegment {
+    pub name: String,
+    pub path: String,
+    pub album_id: Option<String>,
+}
+
 /// The response sent over the wire to the frontend
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct MediaPageResponse {
     pub albums: Vec<SubAlbum>,
-    pub sections: Vec<MediaSection>, // Cleanly pre-grouped sections
+    pub breadcrumbs: Vec<BreadcrumbSegment>, // Server-computed path breadcrumbs
+    pub sections: Vec<MediaSection>,          // Ready-to-render pre-grouped sections
     pub next_cursor_captured_at: Option<String>,
     pub next_cursor_id: Option<String>,
     pub has_more: bool,
