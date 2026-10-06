@@ -34,26 +34,36 @@
   async function handleSave() {
     if (!album || !title.trim() || isSaving) return;
     isSaving = true;
-    const ok = await albumStore.renameAlbum(album.id, title.trim(), description.trim() || undefined);
-    isSaving = false;
-    if (ok) {
-      window.dispatchEvent(new CustomEvent('vault:refresh-timeline'));
-      dispatch('updated');
-      dispatch('close');
+    try {
+      const ok = await albumStore.renameAlbum(album.id, title.trim(), description.trim() || undefined);
+      if (ok) {
+        window.dispatchEvent(new CustomEvent('vault:refresh-timeline'));
+        dispatch('updated');
+        dispatch('close');
+      }
+    } catch (err) {
+      console.error('Failed to rename album:', err);
+    } finally {
+      isSaving = false;
     }
   }
 
   async function handleDelete(deleteMedia: boolean) {
     if (!album || isSaving) return;
     isSaving = true;
-    const ok = await albumStore.removeAlbum(album.id, deleteMedia);
-    isSaving = false;
-    if (ok) {
-      filterStore.clearAlbum();
-      // If photos were trashed, immediately refresh the photo feed
-      window.dispatchEvent(new CustomEvent('vault:refresh-timeline'));
-      dispatch('deleted');
-      dispatch('close');
+    try {
+      const ok = await albumStore.removeAlbum(album.id, deleteMedia);
+      if (ok) {
+        filterStore.clearAlbum();
+        filterStore.setFolderPath('');
+        window.dispatchEvent(new CustomEvent('vault:refresh-timeline'));
+        dispatch('deleted');
+        dispatch('close');
+      }
+    } catch (err) {
+      console.error('Failed to delete album:', err);
+    } finally {
+      isSaving = false;
     }
   }
 
@@ -159,26 +169,29 @@
         <div class="flex flex-col gap-2 pt-2">
           <button
             type="button"
+            disabled={isSaving}
             on:click={() => handleDelete(false)}
-            class="liquid-card py-2.5 px-4 rounded-xl text-xs text-[var(--text-main)] font-medium text-left flex justify-between items-center spring-tap cursor-pointer"
+            class="liquid-card py-2.5 px-4 rounded-xl text-xs text-[var(--text-main)] font-medium text-left flex justify-between items-center spring-tap cursor-pointer disabled:opacity-50"
           >
-            <span>Delete Album Only</span>
+            <span>{isSaving ? 'Deleting...' : 'Delete Album Only'}</span>
             <span class="text-[10px] text-[var(--text-muted)] font-mono">Keeps photos</span>
           </button>
 
           <button
             type="button"
+            disabled={isSaving}
             on:click={() => handleDelete(true)}
-            class="liquid-trash-btn py-2.5 px-4 rounded-xl text-xs font-semibold text-rose-600 dark:text-rose-300 text-left flex justify-between items-center spring-tap cursor-pointer"
+            class="liquid-trash-btn py-2.5 px-4 rounded-xl text-xs font-semibold text-rose-600 dark:text-rose-300 text-left flex justify-between items-center spring-tap cursor-pointer disabled:opacity-50"
           >
-            <span>Delete Album and Media</span>
+            <span>{isSaving ? 'Trashing...' : 'Delete Album and Media'}</span>
             <span class="text-[10px] text-rose-500/70 font-mono">Trash {album.media_count} items</span>
           </button>
 
           <button
             type="button"
+            disabled={isSaving}
             on:click={() => (showDeleteConfirm = false)}
-            class="py-1.5 text-xs text-[var(--text-muted)] hover:text-[var(--text-main)] transition-colors cursor-pointer text-center"
+            class="py-1.5 text-xs text-[var(--text-muted)] hover:text-[var(--text-main)] transition-colors cursor-pointer text-center disabled:opacity-50"
           >
             Back
           </button>
@@ -224,7 +237,7 @@
     border: 1px solid var(--card-border);
   }
 
-  .liquid-card:hover {
+  .liquid-card:hover:not(:disabled) {
     background: var(--dock-bg-hover);
     border-color: var(--border-subtle);
   }
@@ -234,7 +247,7 @@
     border: 1px solid rgba(244, 63, 94, 0.25);
   }
 
-  .liquid-trash-btn:hover {
+  .liquid-trash-btn:hover:not(:disabled) {
     background: rgba(244, 63, 94, 0.18);
   }
 
@@ -243,7 +256,7 @@
     border: 1px solid var(--card-border);
   }
 
-  .liquid-icon-btn:hover {
+  .liquid-icon-btn:hover:not(:disabled) {
     background: var(--dock-bg-hover);
     border-color: var(--border-subtle);
   }
