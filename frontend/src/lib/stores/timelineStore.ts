@@ -19,7 +19,8 @@ function mergeSections(current: MediaSection[], incoming: MediaSection[]): Media
 
   let startIdx = 0;
 
-  if (lastCur.id === firstInc.id && lastCur.id !== 'explore-feed') {
+  // Stitch items if the boundary section ID matches (covers both matching dates AND 'explore-feed')
+  if (lastCur.id === firstInc.id) {
     lastCur.items = [...lastCur.items, ...firstInc.items];
     startIdx = 1;
   }
@@ -88,6 +89,7 @@ export function createTimelineStore() {
         }
       }
 
+      console.log('Fetching media URL:', `/api/media?${params.toString()}`);
       const res = await fetch(`/api/media?${params.toString()}`, { signal: pageAbortCtrl.signal });
 
       if (requestId !== currentRequestId) return;

@@ -1,4 +1,6 @@
 use serde::{Deserialize, Serialize};
+use serde::de::{self, Deserializer};
+use std::str::FromStr;
 use sqlx::FromRow;
 
 #[derive(Debug, Clone)]
@@ -125,13 +127,46 @@ pub struct NewAssetRecord {
     pub clip_embedding: Option<Vec<u8>>,
 }
 
+/// Deserializes empty query strings (e.g. `?seed=&year=`) as `None` instead of throwing a 400 error.
+fn empty_string_as_none<'de, D, T>(de: D) -> Result<Option<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: FromStr,
+    T::Err: std::fmt::Display,
+{
+    let opt = Option::<String>::deserialize(de)?;
+    match opt.as_deref().map(str::trim) {
+        None | Some("") => Ok(None),
+        Some(s) => s.parse::<T>().map(Some).map_err(de::Error::custom),
+    }
+}
+
+/// Permissive boolean parser for URL queries: accepts `1`/`0`, `true`/`false`, or empty strings.
+fn empty_string_as_bool<'de, D>(de: D) -> Result<Option<bool>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let opt = Option::<String>::deserialize(de)?;
+    match opt.as_deref().map(str::trim) {
+        None | Some("") => Ok(None),
+        Some("true") | Some("1") => Ok(Some(true)),
+        Some("false") | Some("0") => Ok(Some(false)),
+        Some(other) => Err(de::Error::custom(format!("invalid boolean: {other}"))),
+    }
+}
+
 #[derive(Deserialize, Debug, Default, Clone)]
 pub struct MediaQuery {
     pub album_id: Option<String>,
     pub sort: Option<String>,
+
+    #[serde(default, deserialize_with = "empty_string_as_none")]
     pub seed: Option<i64>,
+
     pub q: Option<String>,
     pub media_type: Option<String>,
+
+    #[serde(default, deserialize_with = "empty_string_as_bool")]
     pub is_favorite: Option<bool>,
 
     pub person_id: Option<String>,
@@ -143,15 +178,25 @@ pub struct MediaQuery {
     pub camera_make: Option<String>,
     pub camera_model: Option<String>,
 
+    #[serde(default, deserialize_with = "empty_string_as_none")]
     pub year: Option<i32>,
+
+    #[serde(default, deserialize_with = "empty_string_as_none")]
     pub month: Option<i32>,
+
+    #[serde(default, deserialize_with = "empty_string_as_none")]
     pub day: Option<i32>,
+
     pub from: Option<String>,
     pub to: Option<String>,
 
     pub cursor_captured_at: Option<String>,
     pub cursor_id: Option<String>,
+
+    #[serde(default, deserialize_with = "empty_string_as_none")]
     pub limit: Option<i64>,
+
+    #[serde(default, deserialize_with = "empty_string_as_bool")]
     pub show_trash: Option<bool>,
 
     #[serde(skip)]

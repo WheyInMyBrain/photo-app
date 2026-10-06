@@ -22,9 +22,13 @@ pub async fn list_media(
     auth_user: AuthUser,
     Query(mut params): Query<MediaQuery>,
 ) -> Result<Json<MediaPageResponse>, AppError> {
-    if params.cursor_captured_at.is_some() ^ params.cursor_id.is_some() {
+    let is_timeline = params.sort.as_deref() == Some("timeline");
+
+    // In timeline mode, keyset pagination requires both cursors to preserve total order.
+    // In random mode, only cursor_id is needed.
+    if is_timeline && (params.cursor_captured_at.is_some() ^ params.cursor_id.is_some()) {
         return Err(AppError::BadRequest(
-            "Both cursor_captured_at and cursor_id must be supplied together".into(),
+            "Both cursor_captured_at and cursor_id must be supplied together for timeline pagination".into(),
         ));
     }
 

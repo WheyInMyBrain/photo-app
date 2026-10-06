@@ -326,7 +326,7 @@ impl AssetRepo {
                     FROM album_assets aa \
                     JOIN albums alb ON aa.album_id = alb.id \
                     WHERE alb.id = "
-            );
+                );
             builder.push_bind(album_id);
             builder.push(" AND alb.user_id = ");
             builder.push_bind(user_id);
@@ -359,45 +359,46 @@ impl AssetRepo {
         if is_random {
             let seed_scalar: i64 = (random_seed % 100_000) + 1;
 
-            // Compute cursor hash in Rust to eliminate duplicate dynamic binds in SQLite
+            let hash_expr = format!(
+                "abs(((unicode(substr(a.id, 1, 1)) * 31 + unicode(substr(a.id, 2, 1))) * 31 + unicode(substr(a.id, 3, 1))) * {seed_scalar}) % 1000003"
+            );
+
             if let Some(cid) = q.cursor_id.as_deref().filter(|s| !s.trim().is_empty()) {
-                let c_bytes = cid.as_bytes();
-                let c0 = c_bytes.first().copied().unwrap_or(0) as i64;
-                let c1 = c_bytes.get(1).copied().unwrap_or(0) as i64;
-                let c2 = c_bytes.get(2).copied().unwrap_or(0) as i64;
+                // Compute the cursor's hash in Rust directly.
+                // Unicode codepoints of ASCII characters in Rust match SQLite's unicode() 1:1.
+                let c0 = cid.chars().nth(0).map(|c| c as u32 as i64).unwrap_or(0);
+                let c1 = cid.chars().nth(1).map(|c| c as u32 as i64).unwrap_or(0);
+                let c2 = cid.chars().nth(2).map(|c| c as u32 as i64).unwrap_or(0);
                 let cursor_hash = (((c0 * 31 + c1) * 31 + c2) * seed_scalar).abs() % 1_000_003;
 
-                builder.push(" AND ( \
-                    abs(((unicode(substr(a.id, 1, 1)) * 31 + unicode(substr(a.id, 2, 1))) * 31 + unicode(substr(a.id, 3, 1))) * ");
-                builder.push_bind(seed_scalar);
-                builder.push(") % 1000003 > ");
-                builder.push_bind(cursor_hash);
-                builder.push(" OR ( \
-                    abs(((unicode(substr(a.id, 1, 1)) * 31 + unicode(substr(a.id, 2, 1))) * 31 + unicode(substr(a.id, 3, 1))) * ");
-                builder.push_bind(seed_scalar);
-                builder.push(") % 1000003 = ");
-                builder.push_bind(cursor_hash);
-                builder.push(" AND a.id > ");
+                builder.push(" AND (");
+                builder.push(&hash_expr);
+                builder.push(format!(" > {cursor_hash} OR ("));
+                builder.push(&hash_expr);
+                builder.push(format!(" = {cursor_hash} AND a.id > "));
                 builder.push_bind(cid);
                 builder.push(")) ");
             }
 
-            builder.push(" ORDER BY abs(((unicode(substr(a.id, 1, 1)) * 31 + unicode(substr(a.id, 2, 1))) * 31 + unicode(substr(a.id, 3, 1))) * ");
-            builder.push_bind(seed_scalar);
-            builder.push(") % 1000003 ASC, a.id ASC LIMIT ");
+            builder.push(" ORDER BY ");
+            builder.push(&hash_expr);
+            builder.push(" ASC, a.id ASC LIMIT ");
             builder.push_bind(fetch_limit);
         } else {
             // Deterministic Keyset Pagination (Timeline)
             if let (Some(cat), Some(cid)) = (&q.cursor_captured_at, &q.cursor_id) {
-                builder.push(" AND ( \
-                    COALESCE(a.captured_at, '') < ");
-                builder.push_bind(cat);
-                builder.push(" OR ( \
-                    COALESCE(a.captured_at, '') = ");
-                builder.push_bind(cat);
-                builder.push(" AND a.id < ");
-                builder.push_bind(cid);
-                builder.push(")) ");
+                let cat_clean = cat.trim();
+                let cid_clean = cid.trim();
+
+                if !cat_clean.is_empty() && !cid_clean.is_empty() {
+                    builder.push(" AND (COALESCE(a.captured_at, '') < ");
+                    builder.push_bind(cat_clean);
+                    builder.push(" OR (COALESCE(a.captured_at, '') = ");
+                    builder.push_bind(cat_clean);
+                    builder.push(" AND a.id < ");
+                    builder.push_bind(cid_clean);
+                    builder.push(")) ");
+                }
             }
 
             if fts_query.is_some() {
@@ -430,9 +431,7 @@ impl AssetRepo {
         let next_cursor_captured_at = rows.last().map(|i| i.captured_at.clone().unwrap_or_default());
         let next_cursor_id = rows.last().map(|i| i.id.clone());
 
-        // 4. Group into sections:
-        // - Random mode: 1 flat continuous section with title: None so frontend skips date headers.
-        // - Timeline mode: Clean daily partitions with pre-formatted title, month, year.
+        // 4. Group into sections
         let sections = if is_random {
             if rows.is_empty() {
                 Vec::new()
