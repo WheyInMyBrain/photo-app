@@ -1,6 +1,7 @@
 // photo-app/backend/src/services/trash_purger.rs
 
 use async_recursion::async_recursion;
+use db::album_repo::AlbumRepo;
 use db::asset_repo::AssetRepo;
 use sqlx::SqlitePool;
 use std::path::{Path, PathBuf};
@@ -14,7 +15,7 @@ impl TrashPurgerService {
     pub fn start(pool: SqlitePool, storage_root: PathBuf) {
         tokio::spawn(async move {
             info!("Storage background maintenance service initialized (Trash purge + Temp cleaner)");
-            
+
             // Runs once every 24 hours
             let mut ticker = interval(Duration::from_secs(24 * 3600));
 
@@ -24,7 +25,7 @@ impl TrashPurgerService {
             loop {
                 ticker.tick().await;
 
-                // 1. Purge expired trash from SQLite and disk
+                // 1. Purge expired trash media from SQLite and disk
                 match AssetRepo::fetch_and_purge_expired_trash(&pool, &storage_root).await {
                     Ok(count) if count > 0 => {
                         info!("Auto-purge completed: permanently purged {} expired assets", count);
@@ -35,7 +36,18 @@ impl TrashPurgerService {
                     }
                 }
 
-                // 2. Clean orphaned temporary uploads & chunk directories
+                // 2. Clean up trashed albums that are now empty or older than 30 days
+                match AlbumRepo::cleanup_all_expired_and_empty_trashed_albums(&pool).await {
+                    Ok(count) if count > 0 => {
+                        info!("Auto-purge completed: permanently removed {} empty/expired trashed albums", count);
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        error!("Auto-purge failed to clean trashed albums: {}", e);
+                    }
+                }
+
+                // 3. Clean orphaned temporary uploads & chunk directories
                 let temp_dirs = [
                     storage_root.join("temp"),
                     storage_root.join("temp_chunks"),
@@ -51,7 +63,7 @@ impl TrashPurgerService {
                     }
                 }
 
-                // 3. Clean orphaned assembly temporary files (*.tmp) inside library originals
+                // 4. Clean orphaned assembly temporary files (*.tmp) inside library originals
                 let users_dir = storage_root.join("users");
                 if let Err(e) = Self::cleanup_stale_library_tmp_files(&users_dir, temp_retention).await {
                     warn!(

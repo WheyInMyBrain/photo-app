@@ -135,8 +135,9 @@ impl AlbumRepo {
         .fetch_all(pool)
         .await?;
 
+        // Filter out soft-deleted albums
         let album_titles: Vec<String> = sqlx::query_scalar(
-            "SELECT title FROM albums WHERE user_id = ?1"
+            "SELECT title FROM albums WHERE user_id = ?1 AND deleted_at IS NULL"
         )
         .bind(user_id)
         .fetch_all(pool)
@@ -163,7 +164,7 @@ impl AlbumRepo {
                 a.filter_criteria,
                 a.created_at,
                 a.updated_at,
-                (SELECT COUNT(*) FROM album_assets aa WHERE aa.album_id = a.id) AS media_count,
+                (SELECT COUNT(*) FROM album_assets aa JOIN assets ast ON aa.asset_id = ast.id WHERE aa.album_id = a.id AND ast.deleted_at IS NULL) AS media_count,
                 COALESCE(
                     (SELECT thumb_path FROM assets WHERE id = a.cover_asset_id AND deleted_at IS NULL),
                     (
@@ -176,7 +177,7 @@ impl AlbumRepo {
                     )
                 ) AS cover_thumb
             FROM albums a
-            WHERE a.user_id = ?1
+            WHERE a.user_id = ?1 AND a.deleted_at IS NULL
             ORDER BY a.created_at DESC
             "#,
         )
@@ -222,7 +223,7 @@ impl AlbumRepo {
                 a.filter_criteria,
                 a.created_at,
                 a.updated_at,
-                (SELECT COUNT(*) FROM album_assets aa WHERE aa.album_id = a.id) AS media_count,
+                (SELECT COUNT(*) FROM album_assets aa JOIN assets ast ON aa.asset_id = ast.id WHERE aa.album_id = a.id AND ast.deleted_at IS NULL) AS media_count,
                 COALESCE(
                     (SELECT thumb_path FROM assets WHERE id = a.cover_asset_id AND deleted_at IS NULL),
                     (
@@ -235,7 +236,7 @@ impl AlbumRepo {
                     )
                 ) AS cover_thumb
             FROM albums a
-            WHERE a.id = ?1 AND a.user_id = ?2
+            WHERE a.id = ?1 AND a.user_id = ?2 AND a.deleted_at IS NULL
             LIMIT 1
             "#,
         )
@@ -650,8 +651,9 @@ impl AlbumRepo {
         Ok(())
     }
 
-    /// Delete an album.
-    /// If `delete_media` is true, moves all contained assets to trash (is_deleted = 1).
+    /// Delete an album:
+    /// - If `delete_media` is true: soft-deletes both assets and album container, keeping links intact for Trash.
+    /// - If `delete_media` is false: unlinks assets and permanently deletes the album container only.
     pub async fn delete_album(
         pool: &SqlitePool,
         user_id: &str,
@@ -673,35 +675,115 @@ impl AlbumRepo {
         }
 
         if delete_media {
-            // Mark all items in this album as deleted (moves them to trash)
+            // Soft-delete all non-deleted media belonging to this album
             sqlx::query(
                 r#"
                 UPDATE assets
-                SET is_deleted = 1, deleted_at = CURRENT_TIMESTAMP
-                WHERE user_id = ?1 AND id IN (
-                    SELECT asset_id FROM album_assets WHERE album_id = ?2
-                )
+                SET deleted_at = CURRENT_TIMESTAMP
+                WHERE user_id = ?1 
+                  AND deleted_at IS NULL
+                  AND id IN (SELECT asset_id FROM album_assets WHERE album_id = ?2)
                 "#,
             )
             .bind(user_id)
             .bind(album_id)
             .execute(&mut *tx)
             .await?;
-        }
 
-        // Delete linkages and album entry
-        sqlx::query("DELETE FROM album_assets WHERE album_id = ?1")
-            .bind(album_id)
-            .execute(&mut *tx)
-            .await?;
-
-        let res = sqlx::query("DELETE FROM albums WHERE id = ?1 AND user_id = ?2")
+            // Soft-delete the album container so it enters trash
+            let res = sqlx::query(
+                "UPDATE albums SET deleted_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP WHERE id = ?1 AND user_id = ?2"
+            )
             .bind(album_id)
             .bind(user_id)
             .execute(&mut *tx)
             .await?;
 
+            tx.commit().await?;
+            Ok(res.rows_affected() > 0)
+        } else {
+            // Delete album only: remove linkages and hard-delete album record
+            sqlx::query("DELETE FROM album_assets WHERE album_id = ?1")
+                .bind(album_id)
+                .execute(&mut *tx)
+                .await?;
+
+            let res = sqlx::query("DELETE FROM albums WHERE id = ?1 AND user_id = ?2")
+                .bind(album_id)
+                .bind(user_id)
+                .execute(&mut *tx)
+                .await?;
+
+            tx.commit().await?;
+            Ok(res.rows_affected() > 0)
+        }
+    }
+
+    /// Auto-purge trashed albums that no longer contain any assets
+    pub async fn cleanup_empty_trashed_albums(
+        pool: &SqlitePool,
+        user_id: &str,
+    ) -> Result<u64, sqlx::Error> {
+        let mut tx = pool.begin().await?;
+
+        // 1. Remove dead links where assets have been purged/hard-deleted
+        sqlx::query(
+            "DELETE FROM album_assets WHERE asset_id NOT IN (SELECT id FROM assets WHERE user_id = ?1)"
+        )
+        .bind(user_id)
+        .execute(&mut *tx)
+        .await?;
+
+        // 2. Remove trashed albums that have no remaining linked assets
+        let res = sqlx::query(
+            r#"
+            DELETE FROM albums
+            WHERE user_id = ?1
+              AND deleted_at IS NOT NULL
+              AND id NOT IN (SELECT DISTINCT album_id FROM album_assets)
+            "#,
+        )
+        .bind(user_id)
+        .execute(&mut *tx)
+        .await?;
+
         tx.commit().await?;
-        Ok(res.rows_affected() > 0)
+        Ok(res.rows_affected())
+    }
+
+    // Auto-purge trashed albums across all users that have either:
+    /// 1. No remaining assets (all items purged or detached)
+    /// 2. A deleted_at timestamp older than 30 days
+    pub async fn cleanup_all_expired_and_empty_trashed_albums(
+        pool: &SqlitePool,
+    ) -> Result<u64, sqlx::Error> {
+        let mut tx = pool.begin().await?;
+
+        // 1. Clean up dangling album_assets entries where the asset was permanently purged
+        sqlx::query(
+            r#"
+            DELETE FROM album_assets 
+            WHERE asset_id NOT IN (SELECT id FROM assets)
+            "#
+        )
+        .execute(&mut *tx)
+        .await?;
+
+        // 2. Remove trashed albums that have no remaining assets OR are older than 30 days
+        let res = sqlx::query(
+            r#"
+            DELETE FROM albums
+            WHERE deleted_at IS NOT NULL 
+              AND (
+                id NOT IN (SELECT DISTINCT album_id FROM album_assets)
+                OR deleted_at <= datetime('now', '-30 days')
+              )
+            "#
+        )
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+        Ok(res.rows_affected())
     }
 }
