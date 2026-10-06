@@ -8,8 +8,11 @@ use anyhow::{bail, Context, Result};
 use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, ACCEPT_LANGUAGE, USER_AGENT};
 use reqwest::Client;
 use serde_json::Value;
+use std::collections::HashSet;
 use std::future::Future;
 use std::pin::Pin;
+use std::time::Duration;
+use tracing::{debug, info, warn};
 
 pub struct RedditExtractor;
 
@@ -42,6 +45,170 @@ pub async fn extract_reddit(input_url: &str) -> Result<ExtractedMediaMetadata> {
         .default_headers(headers)
         .build()?;
 
+    // Check if URL is a user profile feed
+    if let Some(username) = extract_reddit_username(input_url) {
+        info!(username = %username, "Detected Reddit user profile link; starting full crawl");
+        return extract_reddit_user_profile(&client, &username).await;
+    }
+
+    // Default: Single post extraction
+    extract_reddit_single_post(&client, input_url).await
+}
+
+// -----------------------------------------------------------------------------
+// 1. User Profile Timeline Crawler
+// -----------------------------------------------------------------------------
+async fn extract_reddit_user_profile(
+    client: &Client,
+    username: &str,
+) -> Result<ExtractedMediaMetadata> {
+    let mut all_items: Vec<MediaItem> = Vec::new();
+    let mut discovered_urls: Vec<String> = Vec::new();
+    let mut seen_ids: HashSet<String> = HashSet::new();
+    let mut aggregated_tags: HashSet<String> = HashSet::new();
+    let mut latest_timestamp: Option<String> = None;
+
+    let mut after: Option<String> = None;
+    let mut page_count = 0;
+    const MAX_PAGES: usize = 100; // 100 pages * 100 = up to 10,000 submissions
+
+    loop {
+        page_count += 1;
+        let mut api_url = format!(
+            "https://www.reddit.com/user/{username}/submitted.json?raw_json=1&limit=100"
+        );
+        if let Some(ref cursor) = after {
+            api_url.push_str(&format!("&after={cursor}"));
+        }
+
+        debug!(page = page_count, url = %api_url, "Fetching user submission page");
+        let resp = client.get(&api_url).send().await?;
+        if !resp.status().is_success() {
+            if all_items.is_empty() {
+                bail!("Reddit user profile API returned HTTP {}", resp.status());
+            } else {
+                warn!(page = page_count, status = %resp.status(), "Pagination halted due to HTTP error");
+                break;
+            }
+        }
+
+        let body = resp.text().await?;
+        let payload: Value = serde_json::from_str(&body)?;
+
+        let data_node = match payload.get("data") {
+            Some(d) => d,
+            None => break,
+        };
+
+        let children = match data_node.get("children").and_then(|c| c.as_array()) {
+            Some(arr) if !arr.is_empty() => arr,
+            _ => break,
+        };
+
+        let mut new_on_page = 0;
+
+        for child in children {
+            let post = match child.get("data") {
+                Some(p) => p,
+                None => continue,
+            };
+
+            let post_id = post.get("name").and_then(|n| n.as_str()).unwrap_or("");
+            if !post_id.is_empty() && !seen_ids.insert(post_id.to_string()) {
+                continue;
+            }
+
+            let permalink = post
+                .get("permalink")
+                .and_then(|p| p.as_str())
+                .map(|p| format!("https://www.reddit.com{p}"))
+                .unwrap_or_default();
+
+            if !permalink.is_empty() {
+                discovered_urls.push(permalink.clone());
+            }
+
+            let post_title = post.get("title").and_then(|t| t.as_str()).unwrap_or("");
+            let post_time = post
+                .get("created_utc")
+                .and_then(|c| c.as_f64())
+                .map(|ts| ts as i64)
+                .and_then(format_epoch_timestamp);
+
+            if latest_timestamp.is_none() && post_time.is_some() {
+                latest_timestamp = post_time.clone();
+            }
+
+            if let Some(sub) = post.get("subreddit").and_then(|s| s.as_str()) {
+                aggregated_tags.insert(format!("r/{sub}"));
+            }
+
+            // Extract all media types for this submission
+            let mut post_media_items = extract_post_media_items(post, &permalink).await;
+
+            // Stamp submission metadata onto each item
+            for item in &mut post_media_items {
+                item.source_post_url = Some(permalink.clone());
+                if item.caption.is_none() && !post_title.is_empty() {
+                    item.caption = Some(post_title.to_string());
+                }
+                if item.published_at.is_none() {
+                    item.published_at = post_time.clone();
+                }
+            }
+
+            new_on_page += post_media_items.len();
+            all_items.extend(post_media_items);
+        }
+
+        info!(
+            username,
+            page = page_count,
+            items_found = new_on_page,
+            total_items = all_items.len(),
+            "Processed profile page"
+        );
+
+        let next_cursor = data_node
+            .get("after")
+            .and_then(|a| a.as_str())
+            .map(|s| s.to_string());
+
+        if next_cursor.is_none() || page_count >= MAX_PAGES {
+            break;
+        }
+
+        after = next_cursor;
+        // Moderate delay to respect Reddit's rate limits
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+
+    if all_items.is_empty() {
+        bail!("No media items found in submissions for u/{username}");
+    }
+
+    Ok(ExtractedMediaMetadata {
+        platform: "reddit".to_string(),
+        author: username.to_string(),
+        caption: format!("User profile feed for u/{username}"),
+        post_text: None,
+        published_at: latest_timestamp,
+        tags: aggregated_tags.into_iter().collect(),
+        items: all_items,
+        location: None,
+        next_page_url: None,
+        discovered_post_urls: discovered_urls,
+        embedded_player_urls: Vec::new(),
+    })
+}
+
+// -----------------------------------------------------------------------------
+// 2. Single Post Pipeline
+// -----------------------------------------------------------------------------
+async fn extract_reddit_single_post(
+    client: &Client,
+    input_url: &str,
+) -> Result<ExtractedMediaMetadata> {
     let resp = client.get(input_url).send().await.context("Failed to follow Reddit URL")?;
     let canonical_url = resp.url().to_string();
     let clean_url = canonical_url.split('?').next().unwrap_or(&canonical_url).trim_end_matches('/');
@@ -97,103 +264,16 @@ pub async fn extract_reddit(input_url: &str) -> Result<ExtractedMediaMetadata> {
         tags.push(format!("r/{sub}"));
     }
 
-    let mut items = Vec::new();
-
-    // 1. Native Reddit Video (v.redd.it)
-    let video_target = post_data
-        .get("secure_media")
-        .or_else(|| post_data.get("media"))
-        .and_then(|m| m.get("reddit_video"));
-
-    if let Some(vid) = video_target {
-        if let Some(item) = parse_reddit_video(vid, post_data, input_url).await {
-            items.push(item);
-            return Ok(ExtractedMediaMetadata {
-                platform: "reddit".to_string(),
-                author,
-                caption,
-                post_text,
-                published_at,
-                tags,
-                items,
-                location: None,
-                next_page_url: None,
-                discovered_post_urls: Vec::new(),
-                embedded_player_urls: Vec::new(),
-            });
-        }
-    }
-
-    // 2. Animated GIF / Video Preview (preview.reddit_video_preview or preview.images.variants)
-    if let Some(gif_item) = parse_reddit_gif_or_preview(post_data, input_url) {
-        items.push(gif_item);
-        return Ok(ExtractedMediaMetadata {
-            platform: "reddit".to_string(),
-            author,
-            caption,
-            post_text,
-            published_at,
-            tags,
-            items,
-            location: None,
-            next_page_url: None,
-            discovered_post_urls: Vec::new(),
-            embedded_player_urls: Vec::new(),
-        });
-    }
-
-    // 3. Galleries (media_metadata)
-    if let Some(gallery_items) = post_data
-        .get("gallery_data")
-        .and_then(|g| g.get("items"))
-        .and_then(|i| i.as_array())
-    {
-        if let Some(metadata) = post_data.get("media_metadata") {
-            for item in gallery_items {
-                if let Some(media_id) = item.get("media_id").and_then(|id| id.as_str()) {
-                    if let Some(media_obj) = metadata.get(media_id) {
-                        if let Some(media_item) = parse_reddit_gallery_node(media_obj, input_url) {
-                            items.push(media_item);
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // 4. Single Image (with full preview resolutions)
-    if items.is_empty() {
-        if let Some(single_img) = parse_reddit_single_image(post_data, input_url) {
-            items.push(single_img);
-        }
-    }
-
-    // 5. Fallback direct link (url_overridden_by_dest)
-    if items.is_empty() {
-        if let Some(url) = post_data.get("url_overridden_by_dest").and_then(|u| u.as_str()) {
-            let clean = clean_url_str(url);
-            let is_video = clean.ends_with(".mp4") || clean.ends_with(".webm");
-            let media_type = if is_video { MediaType::Video } else { MediaType::Image };
-            let mime = if is_video { "video/mp4" } else { "image/jpeg" };
-            let thumbnail_url = extract_preview_thumbnail(post_data).or_else(|| Some(clean.clone()));
-
-            items.push(MediaItem::new(
-                media_type,
-                mime,
-                None,
-                None,
-                clean.clone(),
-                thumbnail_url,
-                None,
-                None,
-                Some("https://www.reddit.com/".to_string()),
-                clean,
-            ));
-        }
-    }
-
+    let mut items = extract_post_media_items(post_data, input_url).await;
     if items.is_empty() {
         bail!("No media items found for this Reddit post.");
+    }
+
+    for item in &mut items {
+        item.source_post_url = Some(input_url.to_string());
+        item.caption = Some(caption.clone());
+        item.published_at = published_at.clone();
+        item.tags = tags.clone();
     }
 
     Ok(ExtractedMediaMetadata {
@@ -212,8 +292,110 @@ pub async fn extract_reddit(input_url: &str) -> Result<ExtractedMediaMetadata> {
 }
 
 // -----------------------------------------------------------------------------
-// Parsers
+// Unified Node Inspector: Handles Video, Previews, Galleries, & Direct URLs
 // -----------------------------------------------------------------------------
+async fn extract_post_media_items(post_data: &Value, page_url: &str) -> Vec<MediaItem> {
+    let mut items = Vec::new();
+
+    // 1. Native Reddit Video (v.redd.it)
+    let video_target = post_data
+        .get("secure_media")
+        .or_else(|| post_data.get("media"))
+        .and_then(|m| m.get("reddit_video"));
+
+    if let Some(vid) = video_target {
+        if let Some(item) = parse_reddit_video(vid, post_data, page_url).await {
+            items.push(item);
+            return items;
+        }
+    }
+
+    // 2. Animated GIF / Video Preview
+    if let Some(gif_item) = parse_reddit_gif_or_preview(post_data, page_url) {
+        items.push(gif_item);
+        return items;
+    }
+
+    // 3. Multi-image Galleries
+    if let Some(gallery_items) = post_data
+        .get("gallery_data")
+        .and_then(|g| g.get("items"))
+        .and_then(|i| i.as_array())
+    {
+        if let Some(metadata) = post_data.get("media_metadata") {
+            for item in gallery_items {
+                if let Some(media_id) = item.get("media_id").and_then(|id| id.as_str()) {
+                    if let Some(media_obj) = metadata.get(media_id) {
+                        if let Some(media_item) = parse_reddit_gallery_node(media_obj, page_url) {
+                            items.push(media_item);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // 4. Single Image (with full variant chain)
+    if items.is_empty() {
+        if let Some(single_img) = parse_reddit_single_image(post_data, page_url) {
+            items.push(single_img);
+        }
+    }
+
+    // 5. Fallback direct link
+    if items.is_empty() {
+        if let Some(url) = post_data.get("url_overridden_by_dest").and_then(|u| u.as_str()) {
+            let clean = clean_url_str(url);
+            let is_video = clean.ends_with(".mp4") || clean.ends_with(".webm");
+            let is_image = clean.ends_with(".jpg")
+                || clean.ends_with(".jpeg")
+                || clean.ends_with(".png")
+                || clean.ends_with(".webp");
+
+            if is_video || is_image {
+                let media_type = if is_video { MediaType::Video } else { MediaType::Image };
+                let mime = if is_video { "video/mp4" } else { "image/jpeg" };
+                let thumbnail_url = extract_preview_thumbnail(post_data).or_else(|| Some(clean.clone()));
+
+                items.push(MediaItem::new(
+                    media_type,
+                    mime,
+                    None,
+                    None,
+                    clean.clone(),
+                    thumbnail_url,
+                    None,
+                    None,
+                    Some("https://www.reddit.com/".to_string()),
+                    clean,
+                ));
+            }
+        }
+    }
+
+    items
+}
+
+// -----------------------------------------------------------------------------
+// Parsers & Helpers
+// -----------------------------------------------------------------------------
+
+fn extract_reddit_username(url: &str) -> Option<String> {
+    let clean = url.split('?').next().unwrap_or(url);
+    let parts: Vec<&str> = clean.trim_matches('/').split('/').collect();
+
+    // Matches: /user/<name>, /u/<name>
+    for (i, part) in parts.iter().enumerate() {
+        if (*part == "user" || *part == "u") && i + 1 < parts.len() {
+            let name = parts[i + 1].trim();
+            if !name.is_empty() {
+                return Some(name.to_string());
+            }
+        }
+    }
+
+    None
+}
 
 async fn parse_reddit_video(vid: &Value, post_data: &Value, page_url: &str) -> Option<MediaItem> {
     let fallback_url = clean_url_str(vid.get("fallback_url")?.as_str()?);
@@ -334,7 +516,6 @@ fn parse_reddit_single_image(post_data: &Value, _page_url: &str) -> Option<Media
         label: dims.as_ref().map(|d| format!("{}w", d.width)),
     });
 
-    // Pick the smallest resolution variant as thumbnail, falling back to high_res_url
     let thumbnail_url = variants.first().map(|v| v.url.clone()).or_else(|| Some(high_res_url.clone()));
 
     let mut media = MediaItem::new(
@@ -408,7 +589,6 @@ fn parse_reddit_gallery_node(media_obj: &Value, _page_url: &str) -> Option<Media
         let h = media_obj.pointer("/s/y").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
         let dims = if w > 0 && h > 0 { Some(MediaDimensions { width: w, height: h }) } else { None };
 
-        // `p` array contains the lower resolution variants in ascending order (smallest first)
         let thumbnail = variants.first().map(|v| v.url.clone()).or_else(|| Some(clean_img.clone()));
 
         variants.push(MediaVariant {
@@ -424,7 +604,7 @@ fn parse_reddit_gallery_node(media_obj: &Value, _page_url: &str) -> Option<Media
             dims,
             None,
             clean_img.clone(),
-            thumbnail, 
+            thumbnail,
             None,
             None,
             Some("https://www.reddit.com/".to_string()),
@@ -524,6 +704,5 @@ fn clean_url_str(raw: &str) -> String {
 }
 
 fn format_epoch_timestamp(epoch_secs: i64) -> Option<String> {
-    chrono::DateTime::from_timestamp(epoch_secs, 0)
-        .map(|dt| dt.to_rfc3339())
+    chrono::DateTime::from_timestamp(epoch_secs, 0).map(|dt| dt.to_rfc3339())
 }
