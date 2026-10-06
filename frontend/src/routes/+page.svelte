@@ -1,7 +1,7 @@
 <!-- photo-app/frontend/src/routes/+page.svelte -->
 <script lang="ts">
   import { onMount, onDestroy } from 'svelte';
-  import { fade, scale } from 'svelte/transition';
+  import { fade, slide } from 'svelte/transition';
 
   import { filterStore, filterQueryString, type ViewMode } from '$lib/stores/filterStore';
   import { albumStore } from '$lib/stores/albumStore';
@@ -42,7 +42,10 @@
   let showAddToAlbumModal = false;
   let showManageAlbumModal = false;
 
-  // Touch & Natural Edge-Swipe Engine
+  // Scroll compression state (contracts large albums shelf into sticky compact bar)
+  let isScrolledDown = false;
+
+  // Touch gesture & drag detection
   let touchStartX = 0;
   let touchStartY = 0;
   let isScrollDrag = false;
@@ -117,7 +120,7 @@
   })();
 
   $: scrubMarkers = (() => {
-    if ($filterStore.view_mode !== 'timeline') return [];
+    if ($filterStore.sort !== 'timeline') return [];
     const seen = new Set<string>();
     const markers: { label: string; year: string; index: number; count?: number }[] = [];
 
@@ -146,9 +149,8 @@
     return markers;
   })();
 
-  $: currentDensity = DENSITY_PRESETS[$gridDensity];
+  $: currentDensity = DENSITY_PRESETS[$gridDensity] ?? DENSITY_PRESETS[0];
 
-  // O(1) Reactive Set for smooth selection rendering
   $: selectedSet = (() => {
     void $selectedCount;
     void $isSelectionActive;
@@ -176,23 +178,11 @@
     }
   }
 
-  function handleModeChange(mode: ViewMode) {
-    filterStore.setViewMode(mode);
-    window.scrollTo({ top: 0, behavior: 'smooth' });
-  }
-
-  function handleReshuffle() {
-    filterStore.reshuffle();
-    window.scrollTo({ top: 0, behavior: 'smooth' });
-  }
-
-  // Edge Swipe Detection
   function handleTouchStart(e: TouchEvent) {
     if (e.touches.length === 1) {
       touchStartX = e.touches[0].clientX;
       touchStartY = e.touches[0].clientY;
       isScrollDrag = false;
-      // Start gesture if within 35px from left edge
       isEligibleEdgeSwipe = touchStartX < 35 && !showSidebar;
     }
   }
@@ -239,7 +229,7 @@
   }
 
   function navigateToAlbumSegment(seg: { name: string; path: string; albumId: string | null }) {
-    window.scrollTo({ top: 0, behavior: 'smooth' });
+    window.dispatchEvent(new CustomEvent('vault:scroll-top'));
     if (seg.albumId) {
       filterStore.setAlbumId(seg.albumId);
     } else {
@@ -248,12 +238,17 @@
   }
 
   function openChildAlbum(album: any) {
-    window.scrollTo({ top: 0, behavior: 'smooth' });
+    window.dispatchEvent(new CustomEvent('vault:scroll-top'));
     if (album.id) {
       filterStore.setAlbumId(album.id);
     } else {
       filterStore.setFolderPath(`${currentAlbumPath}/${album.directSubName}`);
     }
+  }
+
+  function selectRootAlbum(albumId: string) {
+    filterStore.setAlbumId(albumId);
+    window.dispatchEvent(new CustomEvent('vault:scroll-top'));
   }
 
   async function handleRemoveFromAlbum() {
@@ -324,6 +319,14 @@
     };
     window.addEventListener('vault:open-asset', handleOpenAsset);
 
+    // Track scroll inside the parent layout main container
+    const scrollParent = document.querySelector('main');
+    const handleScroll = () => {
+      if (!scrollParent) return;
+      isScrolledDown = scrollParent.scrollTop > 80;
+    };
+    scrollParent?.addEventListener('scroll', handleScroll, { passive: true });
+
     observer = new IntersectionObserver(
       (entries) => {
         if (entries[0].isIntersecting && $hasMore && !$isLoading) {
@@ -338,6 +341,7 @@
     return () => {
       window.removeEventListener('vault:refresh-timeline', handleRefresh);
       window.removeEventListener('vault:open-asset', handleOpenAsset);
+      scrollParent?.removeEventListener('scroll', handleScroll);
     };
   });
 
@@ -358,115 +362,96 @@
   on:wheel|nonpassive={pinchZoom.handleWheel}
 />
 
-<!-- Natural Swipe-out Filter Drawer -->
+<!-- Left Swipe Drawer -->
 <FilterSidebar
   isOpen={showSidebar}
   on:close={() => (showSidebar = false)}
 />
 
-<!-- FLOATING TOP LIQUID COMMAND BAR -->
-<header
-  class="fixed top-2 sm:top-3.5 inset-x-0 mx-auto z-40 max-w-lg px-3 pointer-events-none"
-  transition:fade={{ duration: 150 }}
->
-  <div class="liquid-header pointer-events-auto rounded-full px-2 py-1.5 flex items-center justify-between gap-1 shadow-2xl">
-    <!-- Left: Tap to open sidebar -->
-    <button
-      type="button"
-      on:click={() => (showSidebar = true)}
-      class="w-8 h-8 rounded-full flex items-center justify-center transition-all spring-tap cursor-pointer text-[var(--text-muted)] hover:text-[var(--text-main)] hover:bg-white/10"
-      title="Open Filters"
-      aria-label="Open Filters"
-    >
-      <svg xmlns="http://www.w3.org/2000/svg" class="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
-        <line x1="4" y1="21" x2="4" y2="14"></line>
-        <line x1="4" y1="10" x2="4" y2="3"></line>
-        <line x1="12" y1="21" x2="12" y2="12"></line>
-        <line x1="12" y1="8" x2="12" y2="3"></line>
-        <line x1="20" y1="21" x2="20" y2="16"></line>
-        <line x1="20" y1="12" x2="20" y2="3"></line>
-        <line x1="1" y1="14" x2="7" y2="14"></line>
-        <line x1="9" y1="8" x2="15" y2="8"></line>
-        <line x1="17" y1="16" x2="23" y2="16"></line>
-      </svg>
-    </button>
-
-    <!-- Center: Primary View Mode Switcher -->
-    <div class="flex items-center gap-1 p-0.5 rounded-full bg-black/25 backdrop-blur-md border border-white/10 text-xs">
-      <button
-        type="button"
-        on:click={() => handleModeChange('random')}
-        class="px-3 py-1 rounded-full font-medium transition-all spring-tap cursor-pointer {$filterStore.view_mode === 'random' ? 'bg-purple-600 text-white shadow font-semibold' : 'text-[var(--text-muted)] hover:text-[var(--text-main)]'}"
-      >
-        Shuffle
-      </button>
-
-      <button
-        type="button"
-        on:click={() => handleModeChange('timeline')}
-        class="px-3 py-1 rounded-full font-medium transition-all spring-tap cursor-pointer {$filterStore.view_mode === 'timeline' ? 'bg-purple-600 text-white shadow font-semibold' : 'text-[var(--text-muted)] hover:text-[var(--text-main)]'}"
-      >
-        Timeline
-      </button>
-
-      <button
-        type="button"
-        on:click={() => handleModeChange('albums')}
-        class="px-3 py-1 rounded-full font-medium transition-all spring-tap cursor-pointer {$filterStore.view_mode === 'albums' ? 'bg-purple-600 text-white shadow font-semibold' : 'text-[var(--text-muted)] hover:text-[var(--text-main)]'}"
-      >
-        Albums
-      </button>
-    </div>
-
-    <!-- Right: Context Action -->
-    <div class="flex items-center gap-1">
-      {#if $isSelectionActive}
-        <button
-          type="button"
-          on:click={() => selection.clearSelection()}
-          class="px-3 py-1 rounded-full bg-purple-600 text-white text-xs font-semibold shadow-md active:scale-95 cursor-pointer"
-        >
-          Done ({$selectedCount})
-        </button>
-      {:else if $filterStore.view_mode === 'random'}
-        <!-- Reshuffle Dice Button -->
-        <button
-          type="button"
-          on:click={handleReshuffle}
-          class="w-8 h-8 rounded-full flex items-center justify-center text-purple-400 hover:text-purple-300 hover:bg-white/10 transition-all spring-tap cursor-pointer"
-          title="Reshuffle Feed"
-          aria-label="Reshuffle Feed"
-        >
-          <svg xmlns="http://www.w3.org/2000/svg" class="w-4 h-4 active:rotate-180 transition-transform duration-300" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
-            <polyline points="16 3 21 3 21 8"></polyline>
-            <line x1="4" y1="20" x2="21" y2="3"></line>
-            <polyline points="21 16 21 21 16 21"></polyline>
-            <line x1="15" y1="15" x2="21" y2="21"></line>
-            <line x1="4" y1="4" x2="9" y2="9"></line>
-          </svg>
-        </button>
-      {:else}
-        <div class="w-8"></div>
-      {/if}
-    </div>
-  </div>
-</header>
-
-<!-- MAIN GALLERY BODY -->
+<!-- MAIN CONTAINER -->
 <div
   style="padding-bottom: max(3.5rem, calc(var(--sab) + 2.5rem));"
-  class="px-2 pt-16 sm:px-4 md:px-8 max-w-[1920px] mx-auto min-h-screen flex flex-col select-none relative transition-transform duration-300 ease-out {activeCoords !== null ? 'scale-[0.985] opacity-80 pointer-events-none' : 'scale-100 opacity-100'}"
+  class="px-2 pt-14 sm:px-4 md:px-8 max-w-[1920px] mx-auto min-h-screen flex flex-col select-none relative transition-transform duration-300 ease-out {activeCoords !== null ? 'scale-[0.985] opacity-80 pointer-events-none' : 'scale-100 opacity-100'}"
 >
-  <!-- SUB-HEADER / BREADCRUMBS -->
+  <!-- ========================================================================= -->
+  <!-- COLLAPSIBLE STICKY ALBUMS HEADER BAR (APPLE PHOTOS STYLE)                  -->
+  <!-- ========================================================================= -->
+  {#if $filterStore.view_mode === 'albums' && !currentAlbumPath && rootAlbums.length > 0}
+    <div
+      class="sticky top-2 z-30 mb-5 transition-all duration-300 {isScrolledDown ? 'album-bar-scrolled' : ''}"
+    >
+      <div class="liquid-album-shelf rounded-2xl p-2 backdrop-blur-2xl">
+        <div class="flex items-center justify-between px-2 pb-1.5 text-xs text-[var(--text-muted)]">
+          <div class="flex items-center gap-2">
+            <span class="font-bold tracking-tight text-[var(--text-main)] text-xs sm:text-sm">Albums</span>
+            <span class="font-mono text-[10px] opacity-70">({rootAlbums.length})</span>
+          </div>
+          {#if isScrolledDown}
+            <button
+              type="button"
+              on:click={() => window.dispatchEvent(new CustomEvent('vault:scroll-top'))}
+              class="text-[10px] text-purple-400 hover:text-purple-300 transition-colors cursor-pointer flex items-center gap-1 font-mono"
+            >
+              <span>Scroll to Top</span>
+              &uarr;
+            </button>
+          {/if}
+        </div>
+
+        <!-- Horizontal Scroll Shelf: Automatically shrinks into compact chips when scrolled -->
+        <div class="flex items-center gap-2.5 overflow-x-auto no-scrollbar py-1 px-0.5">
+          {#each rootAlbums as album (album.id)}
+            <button
+              type="button"
+              on:click={() => selectRootAlbum(album.id)}
+              class="group flex-shrink-0 flex items-center gap-2 rounded-xl transition-all spring-tap cursor-pointer border border-[var(--border-glass)] focus:outline-none {isScrolledDown ? 'bg-black/30 hover:bg-black/50 px-2.5 py-1.5' : 'bg-[var(--card-bg)] hover:border-purple-400/50 p-1.5 pr-3'}"
+            >
+              <!-- Thumbnail avatar -->
+              <div class="rounded-lg overflow-hidden flex-shrink-0 bg-black/40 {isScrolledDown ? 'w-6 h-6' : 'w-10 h-10 sm:w-12 sm:h-12'}">
+                {#if album.cover_thumb}
+                  <img
+                    src={album.cover_thumb.startsWith('/') ? album.cover_thumb : `/${album.cover_thumb}`}
+                    alt={album.rootName}
+                    loading="lazy"
+                    class="w-full h-full object-cover group-hover:scale-105 transition-transform duration-300"
+                  />
+                {:else}
+                  <div class="w-full h-full flex items-center justify-center opacity-30 text-[var(--text-muted)]">
+                    <svg xmlns="http://www.w3.org/2000/svg" class="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                      <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path>
+                    </svg>
+                  </div>
+                {/if}
+              </div>
+
+              <!-- Title & count -->
+              <div class="flex flex-col text-left truncate">
+                <span class="text-xs font-semibold text-[var(--text-main)] truncate max-w-[110px] sm:max-w-[140px]">
+                  {album.rootName}
+                </span>
+                {#if !isScrolledDown}
+                  <span class="text-[10px] font-mono text-[var(--text-muted)]">
+                    {album.media_count} {album.media_count === 1 ? 'item' : 'items'}
+                  </span>
+                {/if}
+              </div>
+            </button>
+          {/each}
+        </div>
+      </div>
+    </div>
+  {/if}
+
+  <!-- SUB-ALBUM BREADCRUMBS & MANAGE OPTIONS -->
   {#if currentAlbumPath || $filterStore.show_trash}
-    <div class="flex items-center justify-between gap-3 px-1 py-1 min-h-[38px] mb-3">
+    <div class="sticky top-2 z-30 flex items-center justify-between gap-3 px-1 py-1 min-h-[38px] mb-3">
       <div class="flex items-center gap-1.5 text-xs text-[var(--text-muted)] overflow-x-auto no-scrollbar py-0.5">
         {#if currentAlbumPath}
           <button
             type="button"
             on:click={() => {
               filterStore.clearAlbum();
-              window.scrollTo({ top: 0, behavior: 'smooth' });
+              window.dispatchEvent(new CustomEvent('vault:scroll-top'));
             }}
             class="w-7 h-7 rounded-full flex items-center justify-center transition-all spring-tap cursor-pointer bg-[var(--card-bg)] text-[var(--text-muted)] hover:text-[var(--text-main)] border border-[var(--border-glass)]"
             title="Back to all albums"
@@ -482,7 +467,7 @@
             {#if idx > 0}<span class="opacity-25 text-[10px]">/</span>{/if}
             {@const isLast = idx === breadcrumbSegments.length - 1}
 
-            <div class="inline-flex items-center gap-1.5 px-3 py-1 rounded-full liquid-breadcrumb text-[var(--text-main)] text-xs">
+            <div class="inline-flex items-center gap-1.5 px-3 py-1 rounded-full liquid-breadcrumb text-[var(--text-main)] text-xs shadow-sm">
               <button
                 type="button"
                 on:click={() => navigateToAlbumSegment(seg)}
@@ -519,83 +504,27 @@
     </div>
   {/if}
 
-  <!-- ALBUMS VIEW: Root Cards -->
-  {#if $filterStore.view_mode === 'albums' && !currentAlbumPath && rootAlbums.length > 0}
-    <div class="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6 gap-3.5 mb-8" in:fade={{ duration: 150 }}>
-      {#each rootAlbums as album (album.id)}
-        <button
-          type="button"
-          on:click={() => {
-            filterStore.setAlbumId(album.id);
-            window.scrollTo({ top: 0, behavior: 'smooth' });
-          }}
-          class="album-stack group text-left relative aspect-[4/5] rounded-2xl overflow-hidden cursor-pointer transition-all duration-300 spring-tap focus:outline-none focus:ring-2 focus:ring-purple-400"
-        >
-          <div class="stack-underlay"></div>
-          <div class="w-full h-full bg-[#121216] relative overflow-hidden rounded-2xl">
-            {#if album.cover_thumb}
-              <img
-                src={album.cover_thumb.startsWith('/') ? album.cover_thumb : `/${album.cover_thumb}`}
-                alt={album.title}
-                loading="lazy"
-                class="w-full h-full object-cover group-hover:scale-106 transition-transform duration-500 ease-out"
-              />
-            {:else}
-              <div class="w-full h-full flex items-center justify-center text-[var(--text-muted)] opacity-20">
-                <svg xmlns="http://www.w3.org/2000/svg" class="w-12 h-12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.2">
-                  <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path>
-                </svg>
-              </div>
-            {/if}
-            <div class="absolute inset-0 bg-gradient-to-t from-black/85 via-black/20 to-transparent pointer-events-none"></div>
-            <div class="absolute inset-x-0 bottom-0 p-3.5 flex flex-col gap-0.5 pointer-events-none">
-              <span class="text-xs sm:text-sm font-bold text-white tracking-tight drop-shadow-md truncate">
-                {album.rootName}
-              </span>
-              <span class="text-[11px] font-mono text-white/70 font-medium">
-                {album.media_count} {album.media_count === 1 ? 'item' : 'items'}
-              </span>
-            </div>
-          </div>
-        </button>
-      {/each}
-    </div>
-  {/if}
-
-  <!-- SUB-ALBUMS SHELF -->
+  <!-- SUB-ALBUMS SHELF (Within an open album directory) -->
   {#if currentAlbumPath && childAlbums.length > 0}
-    <div class="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6 gap-3.5 mb-8" in:fade={{ duration: 150 }}>
+    <div class="flex items-center gap-2.5 overflow-x-auto no-scrollbar mb-5 py-1">
       {#each childAlbums as subAlbum (subAlbum.id || subAlbum.directSubName)}
         <button
           type="button"
           on:click={() => openChildAlbum(subAlbum)}
-          class="album-stack group text-left relative aspect-[4/5] rounded-2xl overflow-hidden cursor-pointer transition-all duration-300 spring-tap focus:outline-none focus:ring-2 focus:ring-purple-400"
+          class="flex items-center gap-2 px-3 py-2 rounded-xl bg-[var(--card-bg)] border border-[var(--border-glass)] hover:border-purple-400/50 cursor-pointer spring-tap transition-all flex-shrink-0"
         >
-          <div class="stack-underlay"></div>
-          <div class="w-full h-full bg-[#121216] relative overflow-hidden rounded-2xl">
+          <div class="w-8 h-8 rounded-lg overflow-hidden bg-black/30 flex-shrink-0">
             {#if subAlbum.cover_thumb}
               <img
                 src={subAlbum.cover_thumb.startsWith('/') ? subAlbum.cover_thumb : `/${subAlbum.cover_thumb}`}
                 alt={subAlbum.displayTitle}
-                loading="lazy"
-                class="w-full h-full object-cover group-hover:scale-106 transition-transform duration-500 ease-out"
+                class="w-full h-full object-cover"
               />
-            {:else}
-              <div class="w-full h-full flex items-center justify-center text-[var(--text-muted)] opacity-20">
-                <svg xmlns="http://www.w3.org/2000/svg" class="w-12 h-12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.2">
-                  <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path>
-                </svg>
-              </div>
             {/if}
-            <div class="absolute inset-0 bg-gradient-to-t from-black/85 via-black/20 to-transparent pointer-events-none"></div>
-            <div class="absolute inset-x-0 bottom-0 p-3.5 flex flex-col gap-0.5 pointer-events-none">
-              <span class="text-xs sm:text-sm font-bold text-white tracking-tight drop-shadow-md truncate">
-                {subAlbum.displayTitle}
-              </span>
-              <span class="text-[11px] font-mono text-white/70 font-medium">
-                {subAlbum.media_count} {subAlbum.media_count === 1 ? 'item' : 'items'}
-              </span>
-            </div>
+          </div>
+          <div class="flex flex-col text-left">
+            <span class="text-xs font-semibold text-[var(--text-main)] truncate max-w-[120px]">{subAlbum.displayTitle}</span>
+            <span class="text-[10px] font-mono text-[var(--text-muted)]">{subAlbum.media_count} items</span>
           </div>
         </button>
       {/each}
@@ -624,8 +553,8 @@
     >
       {#each $sections as section, secIdx (section.id || section.title)}
         <section id="section-marker-{secIdx}" class="section-container">
-          <!-- Section header is rendered only in Timeline mode -->
-          {#if $filterStore.view_mode === 'timeline'}
+          <!-- Section title rendered when in Timeline sort -->
+          {#if $filterStore.sort === 'timeline'}
             <div class="pt-2 pb-1.5 px-0.5 flex items-baseline justify-between mb-1.5">
               <h2 class="text-xs sm:text-sm font-semibold tracking-tight text-[var(--text-main)]">
                 {section.title}
@@ -735,8 +664,8 @@
   </div>
 </div>
 
-<!-- TIMELINE SCRUBBER: ONLY RENDERED IN TIMELINE MODE -->
-{#if $filterStore.view_mode === 'timeline'}
+<!-- TIMELINE SCRUBBER: ONLY RENDERED IN TIMELINE SORT -->
+{#if $filterStore.sort === 'timeline'}
   <TimelineScrubber
     markers={scrubMarkers}
     on:jump={handleJump}
@@ -805,50 +734,37 @@
 {/if}
 
 <style>
-  .liquid-header {
-    background: var(--bg-surface-elevated, rgba(18, 18, 22, 0.85));
+  /* Sticky Collapsible Albums Bar */
+  .liquid-album-shelf {
+    background: var(--bg-surface-elevated, rgba(18, 18, 22, 0.88));
     border: 1px solid var(--border-glass, rgba(255, 255, 255, 0.12));
-    backdrop-filter: blur(28px) saturate(190%);
-    -webkit-backdrop-filter: blur(28px) saturate(190%);
+    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.35);
+    transition: all 0.25s cubic-bezier(0.16, 1, 0.3, 1);
+  }
+
+  .album-bar-scrolled .liquid-album-shelf {
+    box-shadow: 0 12px 36px rgba(0, 0, 0, 0.55);
+    border-color: rgba(168, 85, 247, 0.3);
+    padding: 0.35rem 0.5rem;
   }
 
   .liquid-breadcrumb {
-    background: var(--dock-bg, rgba(20, 20, 25, 0.7));
+    background: var(--dock-bg, rgba(20, 20, 25, 0.75));
     border: 1px solid var(--dock-border, rgba(255, 255, 255, 0.1));
     backdrop-filter: blur(20px) saturate(180%);
     box-shadow: 0 2px 8px var(--dock-shadow, rgba(0, 0, 0, 0.25));
   }
 
+  /* Safe containment */
   .section-container {
-    content-visibility: auto;
-    contain-intrinsic-size: auto 380px;
+    width: 100%;
+    contain: layout style;
   }
 
-  /* Album Stack Effect */
-  .album-stack {
-    border: 1px solid var(--border-glass, rgba(255, 255, 255, 0.1));
-    box-shadow: 0 4px 16px rgba(0, 0, 0, 0.25);
-  }
-
-  .stack-underlay {
-    position: absolute;
-    inset: -2px;
-    background: var(--card-bg, #1a1a20);
-    border-radius: 1rem;
-    z-index: -1;
-    transform: translateY(2px) scale(0.97);
-    opacity: 0.5;
-    border: 1px solid var(--border-glass, rgba(255, 255, 255, 0.08));
-  }
-
-  .album-stack:hover {
-    box-shadow: 0 12px 28px -6px rgba(0, 0, 0, 0.45);
-    border-color: rgba(168, 85, 247, 0.35);
-  }
-
-  /* Uniform Grid System */
+  /* Uniform Dynamic Grid - strictly controlled by gridDensityStore */
   .gallery-grid {
-    display: grid;
+    display: grid !important;
+    width: 100%;
     gap: 0.25rem;
     grid-template-columns: repeat(var(--grid-cols-mobile, 3), minmax(0, 1fr));
   }
@@ -863,14 +779,15 @@
   @media (min-width: 1024px) {
     .gallery-grid {
       gap: 0.5rem;
-      grid-template-columns: repeat(var(--grid-cols, 7), minmax(0, 1fr));
     }
   }
 
   .tile-card {
     position: relative;
     width: 100%;
-    contain: layout paint;
+    min-width: 0;
+    aspect-ratio: 1 / 1;
+    overflow: hidden;
     -webkit-touch-callout: none;
     background-color: var(--card-bg, #1e1e24);
   }
@@ -882,6 +799,9 @@
   }
 
   .tile-image {
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
     opacity: 1;
     transition: transform 0.2s cubic-bezier(0.16, 1, 0.3, 1);
   }

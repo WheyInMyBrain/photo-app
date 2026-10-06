@@ -7,7 +7,7 @@
   import { authStore } from '$lib/stores/authStore';
   import { modalStore } from '$lib/stores/modalStore';
   import { albumStore } from '$lib/stores/albumStore';
-  import { filterStore, filterQueryString, type ViewMode } from '$lib/stores/filterStore';
+  import { filterStore, filterQueryString } from '$lib/stores/filterStore';
   import { filterOptionsStore } from '$lib/stores/filterOptionsStore';
   import { createWindowFileDrop } from '$lib/utils/dragDrop';
   import { initMediaEvents } from '$lib/utils/mediaEvents';
@@ -52,8 +52,8 @@
     }
   }
 
-  function handleSwitchMode(mode: ViewMode) {
-    filterStore.setViewMode(mode);
+  function handleToggleAlbums() {
+    filterStore.toggleAlbums();
     handleScrollToTop();
   }
 
@@ -164,6 +164,25 @@
       on:openPeople={() => modalStore.openPeople()}
     />
 
+    <!-- Top Right Albums Toggle Button (Hides on Scroll Down, Shows on Scroll Up) -->
+    <div
+      style="top: max(0.85rem, var(--sat)); right: max(1rem, var(--sar));"
+      class="fixed z-40 transition-all duration-300 ease-out select-none {isNavHidden ? '-translate-y-16 opacity-0 pointer-events-none' : 'translate-y-0 opacity-100'}"
+    >
+      <button
+        type="button"
+        on:click={handleToggleAlbums}
+        class="liquid-btn px-3.5 py-1.5 rounded-full text-xs font-semibold tracking-tight transition-all spring-tap cursor-pointer flex items-center gap-2 shadow-lg {$filterStore.view_mode === 'albums' ? 'bg-purple-600 text-white border-purple-400' : 'text-[var(--text-muted)] hover:text-[var(--text-main)]'}"
+        title={$filterStore.view_mode === 'albums' ? 'Back to Photos' : 'View Albums'}
+        aria-label="Toggle Albums View"
+      >
+        <svg xmlns="http://www.w3.org/2000/svg" class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path>
+        </svg>
+        <span>{$filterStore.view_mode === 'albums' ? 'Photos' : 'Albums'}</span>
+      </button>
+    </div>
+
     <!-- Main Viewport -->
     <main
       bind:this={mainScrollContainer}
@@ -172,56 +191,12 @@
     >
       <slot />
 
-      <!-- Floating Bottom Navigation Dock -->
-      <div
-        style="bottom: max(1.25rem, calc(var(--sab) + 0.5rem));"
-        class="fixed left-1/2 -translate-x-1/2 z-30 pointer-events-auto select-none transition-all duration-500 cubic-bezier(0.16, 1, 0.3, 1) {isNavHidden ? 'translate-y-24 opacity-0 scale-95 pointer-events-none' : 'translate-y-0 opacity-100 scale-100'}"
-      >
-        <nav aria-label="View switcher" class="liquid-dock p-1 rounded-full flex items-center gap-1 backdrop-blur-2xl shadow-xl">
-          <!-- Shuffle / Random -->
-          <button
-            type="button"
-            on:click={() => handleSwitchMode('random')}
-            class="relative px-4 py-1.5 rounded-full text-xs font-medium tracking-tight transition-all duration-200 spring-tap cursor-pointer {$filterStore.view_mode === 'random' ? 'text-[var(--text-main)] font-semibold' : 'text-[var(--text-muted)] hover:text-[var(--text-main)]'}"
-          >
-            {#if $filterStore.view_mode === 'random'}
-              <div class="liquid-active-pill absolute inset-0 rounded-full -z-10"></div>
-            {/if}
-            Shuffle
-          </button>
-
-          <!-- Timeline -->
-          <button
-            type="button"
-            on:click={() => handleSwitchMode('timeline')}
-            class="relative px-4 py-1.5 rounded-full text-xs font-medium tracking-tight transition-all duration-200 spring-tap cursor-pointer {$filterStore.view_mode === 'timeline' ? 'text-[var(--text-main)] font-semibold' : 'text-[var(--text-muted)] hover:text-[var(--text-main)]'}"
-          >
-            {#if $filterStore.view_mode === 'timeline'}
-              <div class="liquid-active-pill absolute inset-0 rounded-full -z-10"></div>
-            {/if}
-            Timeline
-          </button>
-
-          <!-- Albums -->
-          <button
-            type="button"
-            on:click={() => handleSwitchMode('albums')}
-            class="relative px-4 py-1.5 rounded-full text-xs font-medium tracking-tight transition-all duration-200 spring-tap cursor-pointer {$filterStore.view_mode === 'albums' ? 'text-[var(--text-main)] font-semibold' : 'text-[var(--text-muted)] hover:text-[var(--text-main)]'}"
-          >
-            {#if $filterStore.view_mode === 'albums'}
-              <div class="liquid-active-pill absolute inset-0 rounded-full -z-10"></div>
-            {/if}
-            Albums
-          </button>
-        </nav>
-      </div>
-
-      <!-- Quick Upload Button -->
+      <!-- Quick Upload Button (Floating at bottom-right, hides on scroll down) -->
       <button
         type="button"
         on:click={() => modalStore.openUpload()}
         style="bottom: max(1.25rem, calc(var(--sab) + 0.5rem)); right: max(1.25rem, var(--sar));"
-        class="liquid-btn fixed z-30 w-10 h-10 rounded-full text-[var(--text-main)] flex items-center justify-center spring-tap cursor-pointer select-none transition-all duration-500 cubic-bezier(0.16, 1, 0.3, 1) backdrop-blur-2xl shadow-xl {isNavHidden ? 'translate-y-24 opacity-0 scale-90 pointer-events-none' : 'translate-y-0 opacity-100 scale-100'}"
+        class="liquid-btn fixed z-30 w-11 h-11 rounded-full text-[var(--text-main)] flex items-center justify-center spring-tap cursor-pointer select-none transition-all duration-500 cubic-bezier(0.16, 1, 0.3, 1) backdrop-blur-2xl shadow-xl {isNavHidden ? 'translate-y-24 opacity-0 scale-90 pointer-events-none' : 'translate-y-0 opacity-100 scale-100'}"
         title="Upload Media"
         aria-label="Upload Media"
       >
@@ -288,13 +263,5 @@
   .liquid-btn:hover {
     background: var(--dock-bg-hover);
     border-color: var(--dock-border-hover);
-  }
-
-  .liquid-active-pill {
-    background: var(--pill-bg);
-    border: 1px solid var(--pill-border);
-    box-shadow: 
-      0 2px 8px var(--dock-shadow),
-      inset 0 1px 0 var(--dock-highlight);
   }
 </style>

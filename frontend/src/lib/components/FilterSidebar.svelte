@@ -1,7 +1,7 @@
 <!-- photo-app/frontend/src/lib/components/FilterSidebar.svelte -->
 <script lang="ts">
   import { createEventDispatcher } from 'svelte';
-  import { filterStore } from '$lib/stores/filterStore';
+  import { filterStore, type SortMode } from '$lib/stores/filterStore';
   import { authStore } from '$lib/stores/authStore';
   import { filterOptionsStore } from '$lib/stores/filterOptionsStore';
   import { modalStore } from '$lib/stores/modalStore';
@@ -14,6 +14,15 @@
   }>();
 
   $: filters = $filterOptionsStore;
+
+  function handleSortSelect(mode: SortMode) {
+    if ($filterStore.sort === mode && mode === 'random') {
+      filterStore.reshuffle();
+    } else {
+      filterStore.setSort(mode);
+    }
+    window.dispatchEvent(new CustomEvent('vault:scroll-top'));
+  }
 
   // --- Dual-Range Slider State & Helpers ---
   function parseToTimestamp(dateStr?: string | null): number | null {
@@ -113,6 +122,57 @@
       </button>
     </div>
 
+    <!-- ORDER MODE SWITCHER (Random vs. Timeline) -->
+    <div class="space-y-1.5">
+      <div class="flex items-center justify-between pl-1 pr-0.5">
+        <span class="text-[9px] uppercase tracking-wider font-semibold text-[var(--text-muted)]">Order Mode</span>
+        {#if $filterStore.sort === 'random'}
+          <button
+            type="button"
+            on:click={() => handleSortSelect('random')}
+            class="text-[9px] text-purple-400 hover:text-purple-300 font-mono flex items-center gap-1 cursor-pointer transition-colors"
+          >
+            <svg xmlns="http://www.w3.org/2000/svg" class="w-2.5 h-2.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+              <polyline points="16 3 21 3 21 8"></polyline>
+              <line x1="4" y1="20" x2="21" y2="3"></line>
+            </svg>
+            Reshuffle
+          </button>
+        {/if}
+      </div>
+
+      <div class="liquid-segmented p-0.5 rounded-xl flex text-xs">
+        <button
+          type="button"
+          on:click={() => handleSortSelect('random')}
+          class="flex-1 py-1.5 rounded-lg text-center cursor-pointer transition-all spring-tap flex items-center justify-center gap-1.5 {$filterStore.sort === 'random' ? 'liquid-seg-active text-purple-400 font-semibold shadow-sm' : 'text-[var(--text-muted)] hover:text-[var(--text-main)]'}"
+        >
+          <svg xmlns="http://www.w3.org/2000/svg" class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+            <polyline points="16 3 21 3 21 8"></polyline>
+            <line x1="4" y1="20" x2="21" y2="3"></line>
+            <polyline points="21 16 21 21 16 21"></polyline>
+            <line x1="15" y1="15" x2="21" y2="21"></line>
+            <line x1="4" y1="4" x2="9" y2="9"></line>
+          </svg>
+          <span>Random</span>
+        </button>
+
+        <button
+          type="button"
+          on:click={() => handleSortSelect('timeline')}
+          class="flex-1 py-1.5 rounded-lg text-center cursor-pointer transition-all spring-tap flex items-center justify-center gap-1.5 {$filterStore.sort === 'timeline' ? 'liquid-seg-active text-purple-400 font-semibold shadow-sm' : 'text-[var(--text-muted)] hover:text-[var(--text-main)]'}"
+        >
+          <svg xmlns="http://www.w3.org/2000/svg" class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+            <rect x="3" y="4" width="18" height="18" rx="2" ry="2"></rect>
+            <line x1="16" y1="2" x2="16" y2="6"></line>
+            <line x1="8" y1="2" x2="8" y2="6"></line>
+            <line x1="3" y1="10" x2="21" y2="10"></line>
+          </svg>
+          <span>Timeline</span>
+        </button>
+      </div>
+    </div>
+
     <!-- Live Search Input -->
     <div class="relative">
       <div class="absolute left-3 top-1/2 -translate-y-1/2 text-[var(--text-muted)] opacity-60 pointer-events-none">
@@ -190,11 +250,11 @@
       <div class="space-y-2 pt-1">
         <div class="flex items-center justify-between pl-1 pr-0.5">
           <span class="text-[9px] uppercase tracking-wider font-semibold text-[var(--text-muted)]">Time Period</span>
-          {#if $filterStore.from ||$filterStore.to}
+          {#if $filterStore.from || $filterStore.to}
             <button
               type="button"
               on:click={resetDateRange}
-              class="text-[9px] text-purple-500 hover:text-purple-400 font-medium transition-colors cursor-pointer"
+              class="text-[9px] text-purple-400 hover:text-purple-300 font-medium transition-colors cursor-pointer"
             >
               Reset Span
             </button>
@@ -270,16 +330,16 @@
       </div>
     {/if}
 
-    <!-- Album / Folder Selector -->
+    <!-- Album / Directory Filter -->
     {#if filters.albums.length > 0}
       <div class="space-y-1.5 pt-1">
-        <span class="text-[9px] uppercase tracking-wider font-semibold text-[var(--text-muted)] block pl-1">Album / Directory</span>
+        <span class="text-[9px] uppercase tracking-wider font-semibold text-[var(--text-muted)] block pl-1">Directory Filter</span>
         <select
           value={$filterStore.folder_path}
           on:change={(e) => filterStore.setFolderPath(e.currentTarget.value)}
           class="liquid-select w-full rounded-xl p-2 text-xs text-[var(--text-main)] outline-none cursor-pointer"
         >
-          <option value="" class="theme-option">All Locations</option>
+          <option value="" class="theme-option">All Directories</option>
           {#each filters.albums as alb (alb.value)}
             <option value={alb.value} class="theme-option">{alb.label} ({alb.count})</option>
           {/each}
