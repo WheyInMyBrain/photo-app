@@ -1,7 +1,8 @@
+// photo-app/frontend/src/lib/stores/timelineStore.ts
 import { writable } from 'svelte/store';
 import { browser } from '$app/environment';
 import { authStore } from '$lib/stores/authStore';
-import type { SubAlbum, BreadcrumbSegment, MediaSection, MediaPageResponse } from '$lib/types/media';
+import type { SubAlbum, BreadcrumbSegment, MediaSection, MediaPageResponse, MediaItemSummary } from '$lib/types/media';
 
 /**
  * Merges incoming sections across pagination boundaries.
@@ -63,11 +64,28 @@ export function createTimelineStore() {
 
       const isTimeline = params.get('sort') === 'timeline';
 
+      // Ensure cursors are cleanly set or removed without empty string leaks
       if (isTimeline) {
-        if (nextCapturedAt) params.set('cursor_captured_at', nextCapturedAt);
-        if (nextId) params.set('cursor_id', nextId);
+        if (nextCapturedAt && nextCapturedAt.trim() !== '') {
+          params.set('cursor_captured_at', nextCapturedAt);
+        } else {
+          params.delete('cursor_captured_at');
+        }
+
+        if (nextId && nextId.trim() !== '') {
+          params.set('cursor_id', nextId);
+        } else {
+          params.delete('cursor_id');
+        }
       } else {
-        if (nextId) params.set('cursor_id', nextId);
+        // Random mode uses only cursor_id — strip timeline date cursor
+        params.delete('cursor_captured_at');
+
+        if (nextId && nextId.trim() !== '') {
+          params.set('cursor_id', nextId);
+        } else {
+          params.delete('cursor_id');
+        }
       }
 
       const res = await fetch(`/api/media?${params.toString()}`, { signal: pageAbortCtrl.signal });
@@ -150,7 +168,7 @@ export function createTimelineStore() {
     sections.update((curr) => {
       if (typeof coordsOrId === 'string') {
         for (const sec of curr) {
-          const item = sec.items.find((i) => i.id === coordsOrId);
+          const item = sec.items.find((i: MediaItemSummary) => i.id === coordsOrId);
           if (item) {
             item.is_favorite = isFav;
             break;

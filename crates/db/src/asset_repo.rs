@@ -357,35 +357,27 @@ impl AssetRepo {
 
         // --- PAGINATION & ORDERING ---
         if is_random {
-            // Polynomial hash with modulo 1000003 for stable seeded random ordering
             let seed_scalar: i64 = (random_seed % 100_000) + 1;
 
-            if let Some(ref cid) = q.cursor_id {
-                builder.push(
-                    " AND ( \
-                        abs(((unicode(substr(a.id, 1, 1)) * 31 + unicode(substr(a.id, 2, 1))) * 31 + unicode(substr(a.id, 3, 1))) * "
-                );
-                builder.push_bind(seed_scalar);
-                builder.push(") % 1000003 > abs(((unicode(substr(");
-                builder.push_bind(cid);
-                builder.push(", 1, 1)) * 31 + unicode(substr(");
-                builder.push_bind(cid);
-                builder.push(", 2, 1))) * 31 + unicode(substr(");
-                builder.push_bind(cid);
-                builder.push(", 3, 1))) * ");
-                builder.push_bind(seed_scalar);
-                builder.push(") % 1000003 OR ( \
+            // Compute cursor hash in Rust to eliminate duplicate dynamic binds in SQLite
+            if let Some(cid) = q.cursor_id.as_deref().filter(|s| !s.trim().is_empty()) {
+                let c_bytes = cid.as_bytes();
+                let c0 = c_bytes.first().copied().unwrap_or(0) as i64;
+                let c1 = c_bytes.get(1).copied().unwrap_or(0) as i64;
+                let c2 = c_bytes.get(2).copied().unwrap_or(0) as i64;
+                let cursor_hash = (((c0 * 31 + c1) * 31 + c2) * seed_scalar).abs() % 1_000_003;
+
+                builder.push(" AND ( \
                     abs(((unicode(substr(a.id, 1, 1)) * 31 + unicode(substr(a.id, 2, 1))) * 31 + unicode(substr(a.id, 3, 1))) * ");
                 builder.push_bind(seed_scalar);
-                builder.push(") % 1000003 = abs(((unicode(substr(");
-                builder.push_bind(cid);
-                builder.push(", 1, 1)) * 31 + unicode(substr(");
-                builder.push_bind(cid);
-                builder.push(", 2, 1))) * 31 + unicode(substr(");
-                builder.push_bind(cid);
-                builder.push(", 3, 1))) * ");
+                builder.push(") % 1000003 > ");
+                builder.push_bind(cursor_hash);
+                builder.push(" OR ( \
+                    abs(((unicode(substr(a.id, 1, 1)) * 31 + unicode(substr(a.id, 2, 1))) * 31 + unicode(substr(a.id, 3, 1))) * ");
                 builder.push_bind(seed_scalar);
-                builder.push(") % 1000003 AND a.id > ");
+                builder.push(") % 1000003 = ");
+                builder.push_bind(cursor_hash);
+                builder.push(" AND a.id > ");
                 builder.push_bind(cid);
                 builder.push(")) ");
             }
@@ -395,7 +387,7 @@ impl AssetRepo {
             builder.push(") % 1000003 ASC, a.id ASC LIMIT ");
             builder.push_bind(fetch_limit);
         } else {
-            // Standard Deterministic Keyset Pagination (Timeline)
+            // Deterministic Keyset Pagination (Timeline)
             if let (Some(cat), Some(cid)) = (&q.cursor_captured_at, &q.cursor_id) {
                 builder.push(" AND ( \
                     COALESCE(a.captured_at, '') < ");
@@ -440,7 +432,7 @@ impl AssetRepo {
 
         // 4. Group into sections:
         // - Random mode: 1 flat continuous section with title: None so frontend skips date headers.
-        // - Timeline mode: Cleanly daily-partitioned sections with pre-formatted title, month, year.
+        // - Timeline mode: Clean daily partitions with pre-formatted title, month, year.
         let sections = if is_random {
             if rows.is_empty() {
                 Vec::new()
