@@ -64,9 +64,13 @@ impl AssetRepo {
         let now = Utc::now();
 
         for r in rows {
-            let group_title = match &r.captured_at {
-                Some(dt) if dt.len() >= 7 => Self::fast_month_year(&dt[0..4], &dt[5..7]),
-                _ => "Undated".to_string(),
+            let (section_id, group_title) = match &r.captured_at {
+                Some(dt) if dt.len() >= 7 => {
+                    let y = &dt[0..4];
+                    let m = &dt[5..7];
+                    (format!("section-{y}-{m}"), Self::fast_month_year(y, m))
+                }
+                _ => ("section-undated".to_string(), "Undated".to_string()),
             };
 
             let days_remaining = r.deleted_at.as_deref().map(|d| {
@@ -94,13 +98,14 @@ impl AssetRepo {
             };
 
             if let Some(last_sec) = sections.last_mut() {
-                if last_sec.title == group_title {
+                if last_sec.id == section_id {
                     last_sec.items.push(item);
                     continue;
                 }
             }
 
             sections.push(MediaSection {
+                id: section_id,
                 title: group_title,
                 items: vec![item],
             });
@@ -130,7 +135,14 @@ impl AssetRepo {
         let fetch_limit = (limit + 1) as i64;
         let show_trash = q.show_trash.unwrap_or(false);
 
-        // 1. SELECT query
+        // Sort mode: defaults to "random" when not explicitly set
+        let sort_mode = q.sort.as_deref().unwrap_or("random");
+        let is_random = sort_mode == "random";
+
+        // Seed used for stable pagination in random mode
+        let random_seed = q.seed.unwrap_or(1337);
+
+        // 1. Base SELECT query
         let mut builder: QueryBuilder<Sqlite> = QueryBuilder::new(
             "SELECT \
                 a.id, a.file_name, a.thumb_path, a.preview_path, \
@@ -163,7 +175,7 @@ impl AssetRepo {
             builder.push_bind(expr);
         }
 
-        // --- ROBUST PHOTO vs VIDEO SEPARATION ---
+        // --- MEDIA TYPE FILTER ---
         if let Some(ref m_type) = q.media_type {
             match m_type.as_str() {
                 "photos" => {
@@ -182,7 +194,7 @@ impl AssetRepo {
             builder.push_bind(if fav { 1 } else { 0 });
         }
 
-        // --- VECTOR SEARCH CANDIDATE INJECTION ---
+        // --- VECTOR SEARCH CANDIDATES ---
         if let Some(ref cids) = q.candidate_ids {
             if cids.is_empty() {
                 builder.push(" AND 0 = 1 ");
@@ -291,30 +303,61 @@ impl AssetRepo {
             builder.push_bind(to_date);
         }
 
-        // --- DETERMINISTIC KEYSET PAGINATION (NULL-SAFE) ---
-        // Uses COALESCE to guarantee items without captured_at don't break pagination
-        if let (Some(cat), Some(cid)) = (&q.cursor_captured_at, &q.cursor_id) {
-            builder.push(" AND ( \
-                COALESCE(a.captured_at, '') < ");
-            builder.push_bind(cat);
-            builder.push(" OR ( \
-                COALESCE(a.captured_at, '') = ");
-            builder.push_bind(cat);
-            builder.push(" AND a.id < ");
-            builder.push_bind(cid);
-            builder.push(")) ");
-        }
+        // --- PAGINATION & ORDERING ---
+        if is_random {
+            // Stable seeded pseudo-random hash for deterministic infinite scrolling:
+            // ORDER BY substr(hex(a.id || seed), 1, 16) ASC, a.id ASC
+            let seed_str = random_seed.to_string();
 
-        // Deterministic ordering that strictly matches the keyset condition above
-        if fts_query.is_some() {
-            builder.push(" ORDER BY fts.rank ASC, COALESCE(a.captured_at, '') DESC, a.id DESC LIMIT ");
+            if let Some(ref cid) = q.cursor_id {
+                builder.push(
+                    " AND ( \
+                        substr(hex(a.id || "
+                );
+                builder.push_bind(&seed_str);
+                builder.push("), 1, 16) > substr(hex(");
+                builder.push_bind(cid);
+                builder.push(" || ");
+                builder.push_bind(&seed_str);
+                builder.push("), 1, 16) OR (substr(hex(a.id || ");
+                builder.push_bind(&seed_str);
+                builder.push("), 1, 16) = substr(hex(");
+                builder.push_bind(cid);
+                builder.push(" || ");
+                builder.push_bind(&seed_str);
+                builder.push(") AND a.id > ");
+                builder.push_bind(cid);
+                builder.push(")) ");
+            }
+
+            builder.push(" ORDER BY substr(hex(a.id || ");
+            builder.push_bind(&seed_str);
+            builder.push("), 1, 16) ASC, a.id ASC LIMIT ");
+            builder.push_bind(fetch_limit);
         } else {
-            builder.push(" ORDER BY COALESCE(a.captured_at, '') DESC, a.id DESC LIMIT ");
-        }
-        builder.push_bind(fetch_limit);
+            // Standard Deterministic Keyset Pagination (Timeline)
+            if let (Some(cat), Some(cid)) = (&q.cursor_captured_at, &q.cursor_id) {
+                builder.push(" AND ( \
+                    COALESCE(a.captured_at, '') < ");
+                builder.push_bind(cat);
+                builder.push(" OR ( \
+                    COALESCE(a.captured_at, '') = ");
+                builder.push_bind(cat);
+                builder.push(" AND a.id < ");
+                builder.push_bind(cid);
+                builder.push(")) ");
+            }
 
-        // Sub-album retrieval
-        let albums = if q.cursor_id.is_none() && !show_trash && q.album_id.is_none() {
+            if fts_query.is_some() {
+                builder.push(" ORDER BY fts.rank ASC, COALESCE(a.captured_at, '') DESC, a.id DESC LIMIT ");
+            } else {
+                builder.push(" ORDER BY COALESCE(a.captured_at, '') DESC, a.id DESC LIMIT ");
+            }
+            builder.push_bind(fetch_limit);
+        }
+
+        // Sub-album retrieval (Only in timeline root folder view, not in random feed)
+        let albums = if q.cursor_id.is_none() && !show_trash && q.album_id.is_none() && !is_random {
             let curr = q.folder_path.as_deref().unwrap_or("");
             Self::get_sub_albums(pool, user_id, curr, q.media_type.as_deref()).await.unwrap_or_default()
         } else {
@@ -332,8 +375,22 @@ impl AssetRepo {
         let next_cursor_captured_at = rows.last().map(|i| i.captured_at.clone().unwrap_or_default());
         let next_cursor_id = rows.last().map(|i| i.id.clone());
 
-        // 4. Pre-group into ready-to-render sections
-        let sections = Self::build_grouped_sections(rows);
+        // 4. Group into sections:
+        // In random mode, bundle into an "explore-feed" section without date splits.
+        // In timeline mode, group chronologically by month/year.
+        let sections = if is_random {
+            if rows.is_empty() {
+                Vec::new()
+            } else {
+                vec![MediaSection {
+                    id: "explore-feed".to_string(),
+                    title: "Explore".to_string(),
+                    items: rows.into_iter().map(MediaItemSummary::from).collect(),
+                }]
+            }
+        } else {
+            Self::build_grouped_sections(rows)
+        };
 
         Ok(MediaPageResponse {
             albums,

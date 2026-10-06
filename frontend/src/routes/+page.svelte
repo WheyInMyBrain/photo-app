@@ -1,9 +1,9 @@
 <!-- photo-app/frontend/src/routes/+page.svelte -->
 <script lang="ts">
   import { onMount, onDestroy } from 'svelte';
-  import { fade } from 'svelte/transition';
+  import { fade, scale } from 'svelte/transition';
 
-  import { filterStore, filterQueryString } from '$lib/stores/filterStore';
+  import { filterStore, filterQueryString, type ViewMode } from '$lib/stores/filterStore';
   import { albumStore } from '$lib/stores/albumStore';
   import { createMediaSelection } from '$lib/stores/mediaSelection';
   import { createTimelineStore } from '$lib/stores/timelineStore';
@@ -18,6 +18,7 @@
     type Coords
   } from '$lib/utils/coordinateNav';
 
+  import FilterSidebar from '$lib/components/FilterSidebar.svelte';
   import BatchActionBar from '$lib/components/BatchActionBar.svelte';
   import PhotoModal from '$lib/components/PhotoModal.svelte';
   import TimelineScrubber from '$lib/components/TimelineScrubber.svelte';
@@ -36,12 +37,16 @@
   let observer: IntersectionObserver | null = null;
   let filterDebounceTimer: ReturnType<typeof setTimeout> | null = null;
   let sseSubscription: { close: () => void } | null = null;
+
+  let showSidebar = false;
   let showAddToAlbumModal = false;
   let showManageAlbumModal = false;
 
+  // Touch & Natural Edge-Swipe Engine
   let touchStartX = 0;
   let touchStartY = 0;
   let isScrollDrag = false;
+  let isEligibleEdgeSwipe = false;
 
   $: selectedAsset = resolveAsset($sections, activeCoords);
   $: prevAsset = resolveAsset($sections, getPrevCoords($sections, activeCoords));
@@ -112,6 +117,7 @@
   })();
 
   $: scrubMarkers = (() => {
+    if ($filterStore.view_mode !== 'timeline') return [];
     const seen = new Set<string>();
     const markers: { label: string; year: string; index: number; count?: number }[] = [];
 
@@ -142,22 +148,16 @@
 
   $: currentDensity = DENSITY_PRESETS[$gridDensity];
 
-  // Explicitly depend on $selectedCount and $isSelectionActive to guarantee
-  // that Svelte re-evaluates the selection set on every single click/toggle
+  // O(1) Reactive Set for smooth selection rendering
   $: selectedSet = (() => {
     void $selectedCount;
     void $isSelectionActive;
-
     const raw =
       (selection as any).selectedIds ??
       (typeof (selection as any).getSelectedIds === 'function'
         ? (selection as any).getSelectedIds()
         : []);
-
-    if (raw instanceof Set) {
-      return new Set<string>(raw);
-    }
-    return new Set<string>(Array.from(raw || []));
+    return raw instanceof Set ? new Set<string>(raw) : new Set<string>(Array.from(raw || []));
   })();
 
   $: selectedAssetIds = Array.from(selectedSet);
@@ -171,24 +171,44 @@
   function scrollToSection(index: number) {
     const el = document.getElementById(`section-marker-${index}`);
     if (el) {
-      const topOffset = el.getBoundingClientRect().top + window.scrollY - 30;
+      const topOffset = el.getBoundingClientRect().top + window.scrollY - 75;
       window.scrollTo({ top: topOffset, behavior: 'smooth' });
     }
   }
 
+  function handleModeChange(mode: ViewMode) {
+    filterStore.setViewMode(mode);
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+  }
+
+  function handleReshuffle() {
+    filterStore.reshuffle();
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+  }
+
+  // Edge Swipe Detection
   function handleTouchStart(e: TouchEvent) {
     if (e.touches.length === 1) {
       touchStartX = e.touches[0].clientX;
       touchStartY = e.touches[0].clientY;
       isScrollDrag = false;
+      // Start gesture if within 35px from left edge
+      isEligibleEdgeSwipe = touchStartX < 35 && !showSidebar;
     }
   }
 
   function handleTouchMove(e: TouchEvent) {
     if (e.touches.length === 1) {
-      const dx = Math.abs(e.touches[0].clientX - touchStartX);
+      const dx = e.touches[0].clientX - touchStartX;
       const dy = Math.abs(e.touches[0].clientY - touchStartY);
-      if (dx > 8 || dy > 8) {
+
+      if (isEligibleEdgeSwipe && dx > 45 && dy < 30) {
+        showSidebar = true;
+        isEligibleEdgeSwipe = false;
+        return;
+      }
+
+      if (Math.abs(dx) > 8 || dy > 8) {
         isScrollDrag = true;
       }
     }
@@ -219,6 +239,7 @@
   }
 
   function navigateToAlbumSegment(seg: { name: string; path: string; albumId: string | null }) {
+    window.scrollTo({ top: 0, behavior: 'smooth' });
     if (seg.albumId) {
       filterStore.setAlbumId(seg.albumId);
     } else {
@@ -227,11 +248,11 @@
   }
 
   function openChildAlbum(album: any) {
+    window.scrollTo({ top: 0, behavior: 'smooth' });
     if (album.id) {
       filterStore.setAlbumId(album.id);
     } else {
-      const targetPath = `${currentAlbumPath}/${album.directSubName}`;
-      filterStore.setFolderPath(targetPath);
+      filterStore.setFolderPath(`${currentAlbumPath}/${album.directSubName}`);
     }
   }
 
@@ -329,101 +350,188 @@
 </script>
 
 <svelte:window
+  on:touchstart={handleTouchStart}
+  on:touchmove={handleTouchMove}
   on:touchstart={pinchZoom.handleTouchStart}
   on:touchmove={pinchZoom.handleTouchMove}
   on:touchend={pinchZoom.handleTouchEnd}
   on:wheel|nonpassive={pinchZoom.handleWheel}
 />
 
-<div
-  style="padding-bottom: max(3.5rem, calc(var(--sab) + 2.5rem));"
-  class="px-2 pt-14 sm:px-4 md:px-8 max-w-[1920px] mx-auto min-h-screen flex flex-col select-none relative transition-transform duration-300 ease-out {activeCoords !== null ? 'scale-[0.985] opacity-80 pointer-events-none' : 'scale-100 opacity-100'}"
+<!-- Natural Swipe-out Filter Drawer -->
+<FilterSidebar
+  isOpen={showSidebar}
+  on:close={() => (showSidebar = false)}
+/>
+
+<!-- FLOATING TOP LIQUID COMMAND BAR -->
+<header
+  class="fixed top-2 sm:top-3.5 inset-x-0 mx-auto z-40 max-w-lg px-3 pointer-events-none"
+  transition:fade={{ duration: 150 }}
 >
-  <!-- Minimal Clean Header Strip -->
-  <div class="flex items-center justify-between gap-3 px-1 py-1 min-h-[38px] mb-3">
-    <div class="flex items-center gap-1.5 text-xs text-[var(--text-muted)] overflow-x-auto no-scrollbar py-0.5">
-      {#if currentAlbumPath}
-        <button
-          type="button"
-          on:click={() => {
-            filterStore.clearAlbum();
-            filterStore.setFolderPath('');
-          }}
-          class="w-7 h-7 rounded-full flex items-center justify-center transition-all spring-tap cursor-pointer bg-[var(--card-bg)] text-[var(--text-muted)] hover:text-[var(--text-main)] border border-[var(--border-glass)]"
-          title="Back to all"
-          aria-label="Back to all"
-        >
-          <svg xmlns="http://www.w3.org/2000/svg" class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
-            <polyline points="15 18 9 12 15 6"></polyline>
-          </svg>
-        </button>
-      {/if}
+  <div class="liquid-header pointer-events-auto rounded-full px-2 py-1.5 flex items-center justify-between gap-1 shadow-2xl">
+    <!-- Left: Tap to open sidebar -->
+    <button
+      type="button"
+      on:click={() => (showSidebar = true)}
+      class="w-8 h-8 rounded-full flex items-center justify-center transition-all spring-tap cursor-pointer text-[var(--text-muted)] hover:text-[var(--text-main)] hover:bg-white/10"
+      title="Open Filters"
+      aria-label="Open Filters"
+    >
+      <svg xmlns="http://www.w3.org/2000/svg" class="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+        <line x1="4" y1="21" x2="4" y2="14"></line>
+        <line x1="4" y1="10" x2="4" y2="3"></line>
+        <line x1="12" y1="21" x2="12" y2="12"></line>
+        <line x1="12" y1="8" x2="12" y2="3"></line>
+        <line x1="20" y1="21" x2="20" y2="16"></line>
+        <line x1="20" y1="12" x2="20" y2="3"></line>
+        <line x1="1" y1="14" x2="7" y2="14"></line>
+        <line x1="9" y1="8" x2="15" y2="8"></line>
+        <line x1="17" y1="16" x2="23" y2="16"></line>
+      </svg>
+    </button>
 
-      {#if breadcrumbSegments.length > 0}
-        {#each breadcrumbSegments as seg, idx (seg.path)}
-          {#if idx > 0}<span class="opacity-25 text-[10px]">/</span>{/if}
-          {@const isLast = idx === breadcrumbSegments.length - 1}
+    <!-- Center: Primary View Mode Switcher -->
+    <div class="flex items-center gap-1 p-0.5 rounded-full bg-black/25 backdrop-blur-md border border-white/10 text-xs">
+      <button
+        type="button"
+        on:click={() => handleModeChange('random')}
+        class="px-3 py-1 rounded-full font-medium transition-all spring-tap cursor-pointer {$filterStore.view_mode === 'random' ? 'bg-purple-600 text-white shadow font-semibold' : 'text-[var(--text-muted)] hover:text-[var(--text-main)]'}"
+      >
+        Shuffle
+      </button>
 
-          <div class="inline-flex items-center gap-1.5 px-3 py-1 rounded-full liquid-breadcrumb text-[var(--text-main)] text-xs">
-            <button
-              type="button"
-              on:click={() => navigateToAlbumSegment(seg)}
-              class="font-medium truncate max-w-[140px] sm:max-w-[220px] transition-colors cursor-pointer {isLast ? 'font-semibold text-purple-600 dark:text-purple-300' : 'text-[var(--text-muted)] hover:text-[var(--text-main)]'}"
-            >
-              {seg.name}
-            </button>
+      <button
+        type="button"
+        on:click={() => handleModeChange('timeline')}
+        class="px-3 py-1 rounded-full font-medium transition-all spring-tap cursor-pointer {$filterStore.view_mode === 'timeline' ? 'bg-purple-600 text-white shadow font-semibold' : 'text-[var(--text-muted)] hover:text-[var(--text-main)]'}"
+      >
+        Timeline
+      </button>
 
-            {#if isLast}
-              <button
-                type="button"
-                on:click={() => (showManageAlbumModal = true)}
-                class="text-[var(--text-muted)] hover:text-[var(--text-main)] p-0.5 cursor-pointer transition-colors"
-                title="Album Options"
-              >
-                <svg xmlns="http://www.w3.org/2000/svg" class="w-3 h-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2">
-                  <circle cx="12" cy="12" r="1"></circle>
-                  <circle cx="19" cy="12" r="1"></circle>
-                  <circle cx="5" cy="12" r="1"></circle>
-                </svg>
-              </button>
-            {/if}
-          </div>
-        {/each}
-      {/if}
+      <button
+        type="button"
+        on:click={() => handleModeChange('albums')}
+        class="px-3 py-1 rounded-full font-medium transition-all spring-tap cursor-pointer {$filterStore.view_mode === 'albums' ? 'bg-purple-600 text-white shadow font-semibold' : 'text-[var(--text-muted)] hover:text-[var(--text-main)]'}"
+      >
+        Albums
+      </button>
     </div>
 
-    <!-- Right Mode Indicator / Selection Action Pill -->
-    <div class="flex items-center gap-2">
+    <!-- Right: Context Action -->
+    <div class="flex items-center gap-1">
       {#if $isSelectionActive}
         <button
           type="button"
           on:click={() => selection.clearSelection()}
-          class="px-3 py-1 rounded-full bg-purple-600 border border-purple-400 text-xs font-semibold text-white hover:bg-purple-500 transition-all cursor-pointer shadow-md active:scale-95"
+          class="px-3 py-1 rounded-full bg-purple-600 text-white text-xs font-semibold shadow-md active:scale-95 cursor-pointer"
         >
           Done ({$selectedCount})
         </button>
+      {:else if $filterStore.view_mode === 'random'}
+        <!-- Reshuffle Dice Button -->
+        <button
+          type="button"
+          on:click={handleReshuffle}
+          class="w-8 h-8 rounded-full flex items-center justify-center text-purple-400 hover:text-purple-300 hover:bg-white/10 transition-all spring-tap cursor-pointer"
+          title="Reshuffle Feed"
+          aria-label="Reshuffle Feed"
+        >
+          <svg xmlns="http://www.w3.org/2000/svg" class="w-4 h-4 active:rotate-180 transition-transform duration-300" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+            <polyline points="16 3 21 3 21 8"></polyline>
+            <line x1="4" y1="20" x2="21" y2="3"></line>
+            <polyline points="21 16 21 21 16 21"></polyline>
+            <line x1="15" y1="15" x2="21" y2="21"></line>
+            <line x1="4" y1="4" x2="9" y2="9"></line>
+          </svg>
+        </button>
+      {:else}
+        <div class="w-8"></div>
       {/if}
+    </div>
+  </div>
+</header>
+
+<!-- MAIN GALLERY BODY -->
+<div
+  style="padding-bottom: max(3.5rem, calc(var(--sab) + 2.5rem));"
+  class="px-2 pt-16 sm:px-4 md:px-8 max-w-[1920px] mx-auto min-h-screen flex flex-col select-none relative transition-transform duration-300 ease-out {activeCoords !== null ? 'scale-[0.985] opacity-80 pointer-events-none' : 'scale-100 opacity-100'}"
+>
+  <!-- SUB-HEADER / BREADCRUMBS -->
+  {#if currentAlbumPath || $filterStore.show_trash}
+    <div class="flex items-center justify-between gap-3 px-1 py-1 min-h-[38px] mb-3">
+      <div class="flex items-center gap-1.5 text-xs text-[var(--text-muted)] overflow-x-auto no-scrollbar py-0.5">
+        {#if currentAlbumPath}
+          <button
+            type="button"
+            on:click={() => {
+              filterStore.clearAlbum();
+              window.scrollTo({ top: 0, behavior: 'smooth' });
+            }}
+            class="w-7 h-7 rounded-full flex items-center justify-center transition-all spring-tap cursor-pointer bg-[var(--card-bg)] text-[var(--text-muted)] hover:text-[var(--text-main)] border border-[var(--border-glass)]"
+            title="Back to all albums"
+          >
+            <svg xmlns="http://www.w3.org/2000/svg" class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+              <polyline points="15 18 9 12 15 6"></polyline>
+            </svg>
+          </button>
+        {/if}
+
+        {#if breadcrumbSegments.length > 0}
+          {#each breadcrumbSegments as seg, idx (seg.path)}
+            {#if idx > 0}<span class="opacity-25 text-[10px]">/</span>{/if}
+            {@const isLast = idx === breadcrumbSegments.length - 1}
+
+            <div class="inline-flex items-center gap-1.5 px-3 py-1 rounded-full liquid-breadcrumb text-[var(--text-main)] text-xs">
+              <button
+                type="button"
+                on:click={() => navigateToAlbumSegment(seg)}
+                class="font-medium truncate max-w-[140px] sm:max-w-[220px] transition-colors cursor-pointer {isLast ? 'font-semibold text-purple-400' : 'text-[var(--text-muted)] hover:text-[var(--text-main)]'}"
+              >
+                {seg.name}
+              </button>
+
+              {#if isLast}
+                <button
+                  type="button"
+                  on:click={() => (showManageAlbumModal = true)}
+                  class="text-[var(--text-muted)] hover:text-[var(--text-main)] p-0.5 cursor-pointer"
+                  title="Album Options"
+                >
+                  <svg xmlns="http://www.w3.org/2000/svg" class="w-3 h-3" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2">
+                    <circle cx="12" cy="12" r="1"></circle>
+                    <circle cx="19" cy="12" r="1"></circle>
+                    <circle cx="5" cy="12" r="1"></circle>
+                  </svg>
+                </button>
+              {/if}
+            </div>
+          {/each}
+        {/if}
+      </div>
 
       {#if $filterStore.show_trash}
-        <div class="px-2.5 py-1 rounded-full bg-rose-500/15 border border-rose-500/30 text-rose-600 dark:text-rose-300 text-[10px] font-mono flex items-center gap-1.5 shadow-sm">
+        <div class="px-2.5 py-1 rounded-full bg-rose-500/15 border border-rose-500/30 text-rose-500 text-[10px] font-mono flex items-center gap-1.5 shadow-sm">
           <span class="w-1.5 h-1.5 rounded-full bg-rose-500 animate-pulse"></span>
           <span>TRASH</span>
         </div>
       {/if}
     </div>
-  </div>
+  {/if}
 
-  <!-- ROOT ALBUMS (Cinematic Stacked Cards) -->
+  <!-- ALBUMS VIEW: Root Cards -->
   {#if $filterStore.view_mode === 'albums' && !currentAlbumPath && rootAlbums.length > 0}
     <div class="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5 xl:grid-cols-6 gap-3.5 mb-8" in:fade={{ duration: 150 }}>
       {#each rootAlbums as album (album.id)}
         <button
           type="button"
-          on:click={() => filterStore.setAlbumId(album.id)}
+          on:click={() => {
+            filterStore.setAlbumId(album.id);
+            window.scrollTo({ top: 0, behavior: 'smooth' });
+          }}
           class="album-stack group text-left relative aspect-[4/5] rounded-2xl overflow-hidden cursor-pointer transition-all duration-300 spring-tap focus:outline-none focus:ring-2 focus:ring-purple-400"
         >
           <div class="stack-underlay"></div>
-
           <div class="w-full h-full bg-[#121216] relative overflow-hidden rounded-2xl">
             {#if album.cover_thumb}
               <img
@@ -433,15 +541,13 @@
                 class="w-full h-full object-cover group-hover:scale-106 transition-transform duration-500 ease-out"
               />
             {:else}
-              <div class="w-full h-full flex items-center justify-center text-[var(--text-muted)] opacity-20 bg-gradient-to-br from-white/5 to-white/0">
+              <div class="w-full h-full flex items-center justify-center text-[var(--text-muted)] opacity-20">
                 <svg xmlns="http://www.w3.org/2000/svg" class="w-12 h-12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.2">
                   <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path>
                 </svg>
               </div>
             {/if}
-
             <div class="absolute inset-0 bg-gradient-to-t from-black/85 via-black/20 to-transparent pointer-events-none"></div>
-
             <div class="absolute inset-x-0 bottom-0 p-3.5 flex flex-col gap-0.5 pointer-events-none">
               <span class="text-xs sm:text-sm font-bold text-white tracking-tight drop-shadow-md truncate">
                 {album.rootName}
@@ -466,7 +572,6 @@
           class="album-stack group text-left relative aspect-[4/5] rounded-2xl overflow-hidden cursor-pointer transition-all duration-300 spring-tap focus:outline-none focus:ring-2 focus:ring-purple-400"
         >
           <div class="stack-underlay"></div>
-
           <div class="w-full h-full bg-[#121216] relative overflow-hidden rounded-2xl">
             {#if subAlbum.cover_thumb}
               <img
@@ -476,15 +581,13 @@
                 class="w-full h-full object-cover group-hover:scale-106 transition-transform duration-500 ease-out"
               />
             {:else}
-              <div class="w-full h-full flex items-center justify-center text-[var(--text-muted)] opacity-20 bg-gradient-to-br from-white/5 to-white/0">
+              <div class="w-full h-full flex items-center justify-center text-[var(--text-muted)] opacity-20">
                 <svg xmlns="http://www.w3.org/2000/svg" class="w-12 h-12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.2">
                   <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path>
                 </svg>
               </div>
             {/if}
-
             <div class="absolute inset-0 bg-gradient-to-t from-black/85 via-black/20 to-transparent pointer-events-none"></div>
-
             <div class="absolute inset-x-0 bottom-0 p-3.5 flex flex-col gap-0.5 pointer-events-none">
               <span class="text-xs sm:text-sm font-bold text-white tracking-tight drop-shadow-md truncate">
                 {subAlbum.displayTitle}
@@ -499,7 +602,7 @@
     </div>
   {/if}
 
-  <!-- MAIN GALLERY TIMELINE -->
+  <!-- MAIN PHOTO GRID -->
   {#if $sections.length === 0 && !$isLoading}
     <div in:fade={{ duration: 180 }} class="flex-1 flex flex-col items-center justify-center text-center py-28 text-[var(--text-muted)]">
       <div class="w-12 h-12 opacity-30 mb-3">
@@ -510,7 +613,7 @@
         </svg>
       </div>
       <p class="text-sm font-semibold tracking-tight text-[var(--text-main)]">No Media Found</p>
-      <p class="text-xs text-[var(--text-muted)] mt-1">Try clearing filters or uploading new photos</p>
+      <p class="text-xs text-[var(--text-muted)] mt-1">Try clearing filters or shuffling</p>
     </div>
   {:else}
     <div
@@ -518,21 +621,22 @@
       aria-label="Media grid"
       class="space-y-6 md:space-y-7 select-none touch-pan-y"
       style="--grid-cols: {currentDensity.cols}; --grid-cols-mobile: {currentDensity.colsMobile};"
-      on:touchstart={handleTouchStart}
-      on:touchmove={handleTouchMove}
     >
       {#each $sections as section, secIdx (section.id || section.title)}
         <section id="section-marker-{secIdx}" class="section-container">
-          <div class="pt-2 pb-1.5 px-0.5 flex items-baseline justify-between mb-1.5">
-            <h2 class="text-xs sm:text-sm font-semibold tracking-tight text-[var(--text-main)]">
-              {section.title}
-            </h2>
-            <span class="text-[10px] font-mono text-[var(--text-muted)] opacity-60">
-              {section.items.length}
-            </span>
-          </div>
+          <!-- Section header is rendered only in Timeline mode -->
+          {#if $filterStore.view_mode === 'timeline'}
+            <div class="pt-2 pb-1.5 px-0.5 flex items-baseline justify-between mb-1.5">
+              <h2 class="text-xs sm:text-sm font-semibold tracking-tight text-[var(--text-main)]">
+                {section.title}
+              </h2>
+              <span class="text-[10px] font-mono text-[var(--text-muted)] opacity-60">
+                {section.items.length}
+              </span>
+            </div>
+          {/if}
 
-          <!-- Seamless Photo Grid -->
+          <!-- High-Performance Uniform Grid -->
           <div class="gallery-grid">
             {#each section.items as asset, itemIdx (asset.id)}
               {@const isPriority = secIdx === 0 && itemIdx < 20}
@@ -554,7 +658,7 @@
                 }}
                 class="tile-card group relative aspect-square rounded-lg overflow-hidden cursor-pointer focus:outline-none transition-transform duration-200 {isSelected ? 'scale-[0.92]' : 'hover:scale-[1.01]'}"
               >
-                <!-- Thumbnail Image (Stays visible, never resets opacity) -->
+                <!-- Thumbnail -->
                 <img
                   src={asset.thumb_path.startsWith('/') ? asset.thumb_path : `/${asset.thumb_path}`}
                   alt={asset.file_name}
@@ -565,12 +669,12 @@
                   class="tile-image w-full h-full object-cover pointer-events-none rounded-lg"
                 />
 
-                <!-- Selection Border Ring & Subtle Highlight (Does NOT block or darken the photo) -->
+                <!-- Selection Inset Ring -->
                 {#if isSelected}
                   <div class="pointer-events-none absolute inset-0 z-10 rounded-lg ring-3 ring-purple-500 ring-inset bg-purple-500/10"></div>
                 {/if}
 
-                <!-- Selection Circle Badge -->
+                <!-- Checkmark Badge -->
                 <button
                   type="button"
                   data-select-btn
@@ -631,11 +735,15 @@
   </div>
 </div>
 
-<TimelineScrubber
-  markers={scrubMarkers}
-  on:jump={handleJump}
-/>
+<!-- TIMELINE SCRUBBER: ONLY RENDERED IN TIMELINE MODE -->
+{#if $filterStore.view_mode === 'timeline'}
+  <TimelineScrubber
+    markers={scrubMarkers}
+    on:jump={handleJump}
+  />
+{/if}
 
+<!-- BATCH ACTION BAR -->
 <BatchActionBar
   count={$selectedCount}
   isActionLoading={$isActionLoading}
@@ -697,11 +805,18 @@
 {/if}
 
 <style>
+  .liquid-header {
+    background: var(--bg-surface-elevated, rgba(18, 18, 22, 0.85));
+    border: 1px solid var(--border-glass, rgba(255, 255, 255, 0.12));
+    backdrop-filter: blur(28px) saturate(190%);
+    -webkit-backdrop-filter: blur(28px) saturate(190%);
+  }
+
   .liquid-breadcrumb {
-    background: var(--dock-bg);
-    border: 1px solid var(--dock-border);
+    background: var(--dock-bg, rgba(20, 20, 25, 0.7));
+    border: 1px solid var(--dock-border, rgba(255, 255, 255, 0.1));
     backdrop-filter: blur(20px) saturate(180%);
-    box-shadow: 0 2px 8px var(--dock-shadow), inset 0 1px 0 var(--dock-highlight);
+    box-shadow: 0 2px 8px var(--dock-shadow, rgba(0, 0, 0, 0.25));
   }
 
   .section-container {
@@ -731,7 +846,7 @@
     border-color: rgba(168, 85, 247, 0.35);
   }
 
-  /* Uniform Gallery Grid */
+  /* Uniform Grid System */
   .gallery-grid {
     display: grid;
     gap: 0.25rem;

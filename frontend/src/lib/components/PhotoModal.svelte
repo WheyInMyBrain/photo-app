@@ -1,7 +1,6 @@
 <!-- photo-app/frontend/src/lib/components/PhotoModal.svelte -->
 <script lang="ts">
   import { onMount, onDestroy, createEventDispatcher } from 'svelte';
-  import { filterStore } from '$lib/stores/filterStore';
   import { deleteFace } from '$lib/api/people';
   import {
     fetchAssetPoses,
@@ -67,7 +66,7 @@
   let detailAbortCtrl: AbortController | null = null;
 
   // =========================================================================
-  // Reactive Transform & Mobile Gesture Engine
+  // Native-Feeling Kinetic Gesture & Swipe Engine
   // =========================================================================
   let scale = 1.0;
   let translateX = 0;
@@ -90,7 +89,7 @@
   const MIN_SCALE = 1.0;
   const MAX_SCALE = 5.0;
 
-  function resetZoom(animated = true) {
+  function resetZoom(_animated = true) {
     scale = 1.0;
     translateX = 0;
     translateY = 0;
@@ -138,7 +137,6 @@
     }
   }
 
-  // Pointer / Mouse / Touch Drag Events
   function onPointerDown(e: PointerEvent) {
     if (e.button !== 0) return;
     isDragging = true;
@@ -161,31 +159,32 @@
     const deltaY = e.clientY - dragStartY;
 
     if (scale > 1.05) {
-      // Zoomed-in pan
+      // Freeform pan when zoomed in
       translateX = startTranslateX + deltaX;
       translateY = startTranslateY + deltaY;
       clampPan();
     } else {
-      // 1. Lock in the gesture direction after small deadband (8px)
+      // 1. Directional locking threshold (10px)
       if (gestureMode === 'none') {
-        if (Math.abs(deltaY) > Math.abs(deltaX) && Math.abs(deltaY) > 8) {
+        if (Math.abs(deltaY) > Math.abs(deltaX) && Math.abs(deltaY) > 10) {
           if (deltaY > 0) gestureMode = 'dismiss';
-        } else if (Math.abs(deltaX) > Math.abs(deltaY) && Math.abs(deltaX) > 8) {
+        } else if (Math.abs(deltaX) > Math.abs(deltaY) && Math.abs(deltaX) > 10) {
           gestureMode = 'swipe';
         }
       }
 
-      // 2. Execute locked gesture
+      // 2. Continuous gesture execution
       if (gestureMode === 'dismiss') {
         dismissOffsetY = Math.max(0, deltaY);
-        dismissProgress = Math.min(1.0, dismissOffsetY / 400);
+        dismissProgress = Math.min(1.0, dismissOffsetY / 380);
         horizontalSwipeOffset = 0;
       } else if (gestureMode === 'swipe') {
         dismissOffsetY = 0;
         dismissProgress = 0;
-        // Apply rubber-band friction if swiping past queue edges
+
+        // Fluid rubber-banding if swiping beyond boundaries
         if ((deltaX > 0 && !hasPrev) || (deltaX < 0 && !hasNext)) {
-          horizontalSwipeOffset = deltaX * 0.28;
+          horizontalSwipeOffset = deltaX * 0.22;
         } else {
           horizontalSwipeOffset = deltaX;
         }
@@ -199,45 +198,46 @@
 
     const deltaX = e.clientX - dragStartX;
     const deltaY = e.clientY - dragStartY;
-    const duration = Date.now() - dragStartTime;
+    const duration = Math.max(1, Date.now() - dragStartTime);
+    const velocityX = Math.abs(deltaX) / duration; // px per ms
 
-    // A. Tap detection (< 12px motion within 300ms)
-    if (Math.abs(deltaX) < 12 && Math.abs(deltaY) < 12 && duration < 300) {
+    // A. Clean tap detection (< 10px drift within 250ms)
+    if (Math.abs(deltaX) < 10 && Math.abs(deltaY) < 10 && duration < 250) {
       dismissOffsetY = 0;
       dismissProgress = 0;
       horizontalSwipeOffset = 0;
       gestureMode = 'none';
 
       const screenW = window.innerWidth;
-      // Tap left 22% of screen -> Prev
-      if (e.clientX < screenW * 0.22 && hasPrev) {
+      // Tap left 20% of screen -> Prev
+      if (e.clientX < screenW * 0.20 && hasPrev) {
         dispatch('prev');
         return;
       }
-      // Tap right 22% of screen -> Next
-      else if (e.clientX > screenW * 0.78 && hasNext) {
+      // Tap right 20% of screen -> Next
+      else if (e.clientX > screenW * 0.80 && hasNext) {
         dispatch('next');
         return;
       }
       return;
     }
 
-    // B. Dismiss swipe threshold
-    if (dismissOffsetY > 130) {
+    // B. Dismiss swipe threshold (> 120px)
+    if (gestureMode === 'dismiss' && dismissOffsetY > 120) {
       dispatch('close');
       return;
     }
 
-    // C. Horizontal swipe threshold (> 50px)
-    if (gestureMode === 'swipe' || (Math.abs(deltaX) > 50 && Math.abs(deltaY) < 80)) {
-      if (deltaX > 50 && hasPrev) {
+    // C. Natural swipe threshold: distance > 60px OR fast flick (velocity > 0.45 px/ms)
+    if (gestureMode === 'swipe' || Math.abs(deltaX) > 60) {
+      if ((deltaX > 60 || (deltaX > 25 && velocityX > 0.45)) && hasPrev) {
         dispatch('prev');
-      } else if (deltaX < -50 && hasNext) {
+      } else if ((deltaX < -60 || (deltaX < -25 && velocityX > 0.45)) && hasNext) {
         dispatch('next');
       }
     }
 
-    // Reset offsets
+    // Reset offsets smoothly
     dismissOffsetY = 0;
     dismissProgress = 0;
     horizontalSwipeOffset = 0;
@@ -266,9 +266,6 @@
     clampPan();
   }
 
-  // =========================================================================
-  // COCO 17 Keypoints Anatomical Color Palette
-  // =========================================================================
   const KEYPOINT_COLORS: Record<number, string> = {
     0: '#f59e0b', 1: '#fbbf24', 2: '#fbbf24', 3: '#fde68a', 4: '#fde68a',
     5: '#06b6d4', 6: '#3b82f6', 7: '#22d3ee', 8: '#60a5fa', 9: '#67e8f9',
@@ -466,6 +463,21 @@
     }
   }
 
+  function handleThumbLoad(e: Event) {
+    const img = e.currentTarget as HTMLImageElement;
+    if (!naturalW) {
+      naturalW = img.naturalWidth;
+      naturalH = img.naturalHeight;
+    }
+  }
+
+  function handleHighResLoad(e: Event) {
+    const img = e.currentTarget as HTMLImageElement;
+    isHighResLoaded = true;
+    naturalW = img.naturalWidth;
+    naturalH = img.naturalHeight;
+  }
+
   $: heroStyle = (() => {
     if (isMorphing && initialRect) {
       const scaleX = initialRect.width / window.innerWidth;
@@ -479,7 +491,9 @@
       return `transform: translate3d(0, ${dismissOffsetY}px, 0) scale(${scaleDown}); border-radius: ${dismissProgress * 24}px;`;
     }
     if (scale <= 1.05 && horizontalSwipeOffset !== 0) {
-      return `transform: translate3d(${horizontalSwipeOffset}px, 0, 0);`;
+      // Fluid swipe translation with subtle tilt/scale for native momentum feel
+      const tilt = (horizontalSwipeOffset / window.innerWidth) * 4;
+      return `transform: translate3d(${horizontalSwipeOffset}px, 0, 0) rotate(${tilt}deg);`;
     }
     return `transform: translate3d(${translateX}px, ${translateY}px, 0) scale(${scale}); cursor: ${scale > 1.05 ? (isDragging ? 'grabbing' : 'grab') : 'default'};`;
   })();
@@ -515,7 +529,7 @@
           <button
             type="button"
             on:click={() => resetZoom()}
-            class="liquid-btn text-xs px-3 py-1.5 rounded-full text-amber-500 dark:text-amber-400 font-mono cursor-pointer font-medium hover:bg-amber-500/10 transition-colors"
+            class="liquid-btn text-xs px-3 py-1.5 rounded-full text-amber-400 font-mono cursor-pointer font-medium hover:bg-amber-500/10 transition-colors"
             title="Reset Zoom (0)"
             aria-label="Reset zoom to 100%"
           >
@@ -602,7 +616,7 @@
 
       <!-- Media Canvas -->
       <div
-        class="w-full h-full flex items-center justify-center {isMorphing || (!isDragging && (scale > 1.0 || horizontalSwipeOffset === 0)) ? 'transition-transform duration-200 ease-out' : ''}"
+        class="w-full h-full flex items-center justify-center {isMorphing || (!isDragging && (scale > 1.0 || horizontalSwipeOffset === 0)) ? 'transition-transform duration-250 cubic-bezier(0.16, 1, 0.3, 1)' : ''}"
         style={heroStyle}
       >
         {#if isMotionMedia}
@@ -629,13 +643,7 @@
               src={resolveUrl(asset.thumb_path)}
               alt=""
               aria-hidden="true"
-              on:load={(e) => {
-                const img = e.currentTarget as HTMLImageElement;
-                if (!naturalW) {
-                  naturalW = img.naturalWidth;
-                  naturalH = img.naturalHeight;
-                }
-              }}
+              on:load={handleThumbLoad}
               class="w-full h-full object-contain block select-none pointer-events-none"
             />
 
@@ -644,12 +652,7 @@
               src="/api/assets/{asset.id}/stream"
               alt={asset.file_name}
               decoding="async"
-              on:load={(e) => {
-                const img = e.currentTarget as HTMLImageElement;
-                isHighResLoaded = true;
-                naturalW = img.naturalWidth;
-                naturalH = img.naturalHeight;
-              }}
+              on:load={handleHighResLoad}
               class="absolute inset-0 w-full h-full object-contain select-none pointer-events-none transition-opacity duration-300 ease-out {isHighResLoaded ? 'opacity-100' : 'opacity-0'}"
             />
 
@@ -721,26 +724,6 @@
           </div>
         {/if}
       </div>
-
-      <!-- Quick Geo HUD Badge -->
-      {#if asset.latitude && asset.longitude && scale <= 1.05}
-        <div class="absolute bottom-6 left-6 z-30 pointer-events-auto">
-          <a
-            href="https://www.google.com/maps?q={asset.latitude},{asset.longitude}"
-            target="_blank"
-            rel="noopener noreferrer"
-            class="liquid-btn text-xs px-3 py-1.5 rounded-full flex items-center gap-1.5 text-[var(--text-muted)] hover:text-[var(--text-main)] transition-colors shadow-lg"
-            title="Open location in Google Maps"
-            aria-label="View coordinates {asset.latitude.toFixed(4)}, {asset.longitude.toFixed(4)} on Google Maps"
-          >
-            <svg xmlns="http://www.w3.org/2000/svg" class="w-3.5 h-3.5 text-rose-500" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-              <path d="M21 10c0 7-9 13-9 13s-9-6-9-13a9 9 0 0 1 18 0z"></path>
-              <circle cx="12" cy="10" r="3"></circle>
-            </svg>
-            <span>{asset.latitude.toFixed(4)}°, {asset.longitude.toFixed(4)}°</span>
-          </a>
-        </div>
-      {/if}
     </div>
 
     <!-- Metadata Details Sheet / Sidebar -->

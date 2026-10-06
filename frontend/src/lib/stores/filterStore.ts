@@ -1,6 +1,6 @@
 import { writable, derived } from 'svelte/store';
 
-export type ViewMode = 'timeline' | 'albums';
+export type ViewMode = 'random' | 'timeline' | 'albums';
 
 export interface FilterState {
   is_private: boolean;
@@ -9,7 +9,9 @@ export interface FilterState {
   media_type: 'all' | 'photos' | 'videos';
   is_favorite: boolean;
   album_id: string;
-  view_mode: ViewMode; 
+  view_mode: ViewMode;
+  sort: 'random' | 'timeline';
+  seed: number;
   folder_path: string;
   from: string;
   to: string;
@@ -26,7 +28,9 @@ const initial: FilterState = {
   media_type: 'all',
   is_favorite: false,
   album_id: '',
-  view_mode: 'timeline', 
+  view_mode: 'random',
+  sort: 'random',
+  seed: Math.floor(Math.random() * 1000000),
   folder_path: '',
   from: '',
   to: '',
@@ -42,21 +46,39 @@ function createFilterStore() {
   return {
     subscribe,
 
-    // --- VIEW MODE CONTROLS ---
+    // --- VIEW MODE & RANDOM SORT CONTROLS ---
     setViewMode: (view_mode: ViewMode) =>
       update((s) => ({
         ...s,
         view_mode,
-        // Reset specific album selection if returning to full timeline
-        album_id: view_mode === 'timeline' ? '' : s.album_id
+        sort: view_mode === 'timeline' ? 'timeline' : 'random',
+        // Clear album/folder constraints when navigating back to global feed views
+        album_id: view_mode === 'albums' ? s.album_id : '',
+        folder_path: view_mode === 'albums' ? s.folder_path : ''
       })),
+
+    // Generates a new random seed to re-roll the shuffle view without changing filters
+    reshuffle: () =>
+      update((s) => ({
+        ...s,
+        view_mode: 'random',
+        sort: 'random',
+        seed: Math.floor(Math.random() * 1000000)
+      })),
+
     toggleViewMode: () =>
       update((s) => {
-        const nextMode: ViewMode = s.view_mode === 'timeline' ? 'albums' : 'timeline';
+        let nextMode: ViewMode;
+        if (s.view_mode === 'random') nextMode = 'timeline';
+        else if (s.view_mode === 'timeline') nextMode = 'albums';
+        else nextMode = 'random';
+
         return {
           ...s,
           view_mode: nextMode,
-          album_id: nextMode === 'timeline' ? '' : s.album_id
+          sort: nextMode === 'timeline' ? 'timeline' : 'random',
+          album_id: nextMode === 'albums' ? s.album_id : '',
+          folder_path: nextMode === 'albums' ? s.folder_path : ''
         };
       }),
 
@@ -66,66 +88,82 @@ function createFilterStore() {
         is_private: !s.is_private,
         show_trash: false,
         person_ids: new Set(),
-        tags: new Set()
+        tags: new Set(),
+        seed: Math.floor(Math.random() * 1000000)
       })),
+
     lockVault: () =>
       update(() => ({
         ...initial,
         is_private: false,
         show_trash: false,
         person_ids: new Set(),
-        tags: new Set()
+        tags: new Set(),
+        seed: Math.floor(Math.random() * 1000000)
       })),
+
     toggleTrash: () =>
       update((s) => ({
         ...s,
         show_trash: !s.show_trash
       })),
+
     setQ: (q: string) => update((s) => ({ ...s, q })),
     setMediaType: (media_type: 'all' | 'photos' | 'videos') =>
       update((s) => ({ ...s, media_type })),
     toggleFavorite: () => update((s) => ({ ...s, is_favorite: !s.is_favorite })),
 
-    // Custom album selector (clears folder_path to avoid conflicting directory seeks)
+    // Custom album selector (sets view_mode to albums and clears folder_path)
     setAlbumId: (album_id: string) =>
       update((s) => ({
         ...s,
         album_id,
+        folder_path: '',
+        view_mode: 'albums'
+      })),
+    clearAlbum: () =>
+      update((s) => ({
+        ...s,
+        album_id: '',
         folder_path: ''
       })),
-    clearAlbum: () => update((s) => ({ ...s, album_id: '' })),
 
     // Folder navigation (clears album_id)
     setFolderPath: (folder_path: string) =>
       update((s) => ({
         ...s,
         folder_path,
-        album_id: ''
+        album_id: '',
+        view_mode: 'albums'
       })),
 
     setFrom: (from: string) => update((s) => ({ ...s, from })),
     setTo: (to: string) => update((s) => ({ ...s, to })),
     setCity: (city: string) => update((s) => ({ ...s, city })),
     setCamera: (camera_model: string) => update((s) => ({ ...s, camera_model })),
+
     togglePerson: (id: string) =>
       update((s) => {
         const p = new Set(s.person_ids);
         p.has(id) ? p.delete(id) : p.add(id);
         return { ...s, person_ids: p };
       }),
+
     toggleTag: (tag: string) =>
       update((s) => {
         const t = new Set(s.tags);
         t.has(tag) ? t.delete(tag) : t.add(tag);
         return { ...s, tags: t };
       }),
+
     reset: () =>
       update((s) => ({
         ...initial,
         is_private: s.is_private,
         show_trash: false,
         person_ids: new Set(),
-        tags: new Set()
+        tags: new Set(),
+        seed: Math.floor(Math.random() * 1000000)
       }))
   };
 }
@@ -134,6 +172,12 @@ export const filterStore = createFilterStore();
 
 export const filterQueryString = derived(filterStore, ($s) => {
   const params = new URLSearchParams();
+
+  // Forward sort mode and seed to the backend query_media endpoint
+  params.set('sort', $s.sort);
+  if ($s.sort === 'random') {
+    params.set('seed', $s.seed.toString());
+  }
 
   if ($s.is_private) params.set('is_private', 'true');
   if ($s.show_trash) params.set('show_trash', 'true');

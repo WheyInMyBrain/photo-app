@@ -45,8 +45,41 @@ pub struct MediaItemSummary {
 /// Ready-to-render DOM section mapping 1:1 to frontend template loops
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct MediaSection {
+    pub id: String,
     pub title: String, // e.g. "September 2026", "August 2026", "Undated"
     pub items: Vec<MediaItemSummary>,
+}
+
+impl From<RawMediaRow> for MediaItemSummary {
+    fn from(r: RawMediaRow) -> Self {
+        let days_remaining = r.deleted_at.as_deref().and_then(|d| {
+            chrono::DateTime::parse_from_rfc3339(d)
+                .or_else(|_| {
+                    chrono::NaiveDateTime::parse_from_str(d, "%Y-%m-%d %H:%M:%S")
+                        .map(|ndt| ndt.and_utc().fixed_offset())
+                })
+                .ok()
+                .map(|del_time| {
+                    let passed = (chrono::Utc::now() - del_time.with_timezone(&chrono::Utc)).num_days();
+                    (30 - passed).max(0)
+                })
+        });
+
+        Self {
+            id: r.id,
+            file_name: r.file_name,
+            thumb_path: r.thumb_path,
+            preview_path: r.preview_path,
+            aspect_ratio: r.aspect_ratio.unwrap_or(1.0),
+            duration_seconds: r.duration_seconds,
+            mime_type: r.mime_type,
+            captured_at: r.captured_at,
+            is_favorite: r.is_favorite == 1,
+            days_remaining,
+            latitude: r.latitude,
+            longitude: r.longitude,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -90,6 +123,8 @@ pub struct NewAssetRecord {
 #[derive(Deserialize, Debug, Default, Clone)]
 pub struct MediaQuery {
     pub album_id: Option<String>,
+    pub sort: Option<String>,
+    pub seed: Option<i64>,
     pub q: Option<String>,
     pub media_type: Option<String>,
     pub is_favorite: Option<bool>,
