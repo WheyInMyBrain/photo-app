@@ -39,7 +39,7 @@ function getDayKey(asset: AssetRecord): string {
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
 }
 
-/** Regroups arbitrary sections or flat assets into strict day-by-day sections */
+/** Regroups arbitrary sections or flat assets into strict day-by-day sections (TIMELINE ONLY) */
 function repartitionIntoDailySections(incomingSections: MediaSection[]): DailyMediaSection[] {
   const result: DailyMediaSection[] = [];
   const map = new Map<string, DailyMediaSection>();
@@ -81,15 +81,20 @@ function repartitionIntoDailySections(incomingSections: MediaSection[]): DailyMe
   return result;
 }
 
-/** Merges incoming daily sections into existing sections across pagination boundaries */
-function appendDailySections(current: DailyMediaSection[], incoming: DailyMediaSection[]): DailyMediaSection[] {
+/** Merges incoming sections into existing sections across pagination boundaries */
+function appendSections(current: DailyMediaSection[], incoming: DailyMediaSection[], isTimeline: boolean): DailyMediaSection[] {
   if (incoming.length === 0) return current;
   const cloned = [...current];
 
+  if (!isTimeline) {
+    // In random mode: simply append new chunked sections directly
+    return [...cloned, ...incoming];
+  }
+
+  // In timeline mode: merge matching day boundaries
   for (const inc of incoming) {
     if (cloned.length > 0) {
       const last = cloned[cloned.length - 1];
-      // If the incoming slice shares the same date, merge items
       if ((last.id && inc.id && last.id === inc.id) || last.title === inc.title) {
         last.items = [...last.items, ...inc.items];
         continue;
@@ -110,8 +115,6 @@ export function createTimelineStore() {
   let nextCapturedAt: string | null = null;
   let nextId: string | null = null;
   let pageAbortCtrl: AbortController | null = null;
-
-  // Monotonic sequence token preventing race conditions between resets & pagination
   let currentRequestId = 0;
 
   async function fetchMedia(queryString = '', reset = false) {
@@ -124,7 +127,6 @@ export function createTimelineStore() {
       nextCapturedAt = null;
       nextId = null;
       hasMore.set(true);
-      // STALE-WHILE-REVALIDATE: Don't wipe sections.set([]) here to prevent UI flash
     }
 
     pageAbortCtrl = new AbortController();
@@ -133,9 +135,20 @@ export function createTimelineStore() {
     try {
       const params = new URLSearchParams(queryString.replace(/^\?/, ''));
       params.set('limit', '60');
-      if (nextCapturedAt && nextId) {
-        params.set('cursor_captured_at', nextCapturedAt);
-        params.set('cursor_id', nextId);
+
+      const isTimeline = params.get('sort') === 'timeline';
+
+      // Pass the appropriate cursors based on mode
+      if (isTimeline) {
+        if (nextCapturedAt && nextId) {
+          params.set('cursor_captured_at', nextCapturedAt);
+          params.set('cursor_id', nextId);
+        }
+      } else {
+        // Random mode only needs cursor_id
+        if (nextId) {
+          params.set('cursor_id', nextId);
+        }
       }
 
       const res = await fetch(`/api/media?${params.toString()}`, { signal: pageAbortCtrl.signal });
@@ -151,13 +164,17 @@ export function createTimelineStore() {
       const data: MediaPageResponse = await res.json();
       if (requestId !== currentRequestId) return;
 
-      const dailySections = repartitionIntoDailySections(data.sections ?? []);
+      // In timeline mode: re-group into calendar days.
+      // In random mode: KEEP THE EXACT BACKEND RANDOM ORDER!
+      const processedSections: DailyMediaSection[] = isTimeline
+        ? repartitionIntoDailySections(data.sections ?? [])
+        : (data.sections ?? []);
 
       if (reset) {
         albums.set(data.albums ?? []);
-        sections.set(dailySections);
+        sections.set(processedSections);
       } else {
-        sections.update((curr) => appendDailySections(curr, dailySections));
+        sections.update((curr) => appendSections(curr, processedSections, isTimeline));
       }
 
       nextCapturedAt = data.next_cursor_captured_at;
@@ -174,9 +191,6 @@ export function createTimelineStore() {
     }
   }
 
-  /**
-   * Jumps the timeline cursor directly to a historical date milestone (e.g. from scrubber or filter)
-   */
   async function jumpToDate(capturedAtIso: string, queryString = '') {
     if (!browser) return;
     const requestId = ++currentRequestId;

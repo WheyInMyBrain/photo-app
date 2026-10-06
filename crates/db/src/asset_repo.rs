@@ -140,7 +140,7 @@ impl AssetRepo {
         let is_random = sort_mode == "random";
 
         // Seed used for stable pagination in random mode
-        let random_seed = q.seed.unwrap_or(1337);
+        let random_seed = q.seed.unwrap_or(1337).abs();
 
         // 1. Base SELECT query
         let mut builder: QueryBuilder<Sqlite> = QueryBuilder::new(
@@ -305,34 +305,44 @@ impl AssetRepo {
 
         // --- PAGINATION & ORDERING ---
         if is_random {
-            // Stable seeded pseudo-random hash for deterministic infinite scrolling:
-            // ORDER BY substr(hex(a.id || seed), 1, 16) ASC, a.id ASC
-            let seed_str = random_seed.to_string();
+            // Safe, universal integer hash using valid SQLite operators:
+            // Hash formula computes over first 4 characters of a.id with seed multiplier.
+            // Formula: abs(((unicode(substr(id,1,1))*31 + unicode(substr(id,2,1)))*31 + unicode(substr(id,3,1))) * seed) % 1000003
+            let seed_scalar: i64 = (random_seed % 100_000) + 1;
 
             if let Some(ref cid) = q.cursor_id {
                 builder.push(
                     " AND ( \
-                        substr(hex(a.id || "
+                        abs(((unicode(substr(a.id, 1, 1)) * 31 + unicode(substr(a.id, 2, 1))) * 31 + unicode(substr(a.id, 3, 1))) * "
                 );
-                builder.push_bind(&seed_str);
-                builder.push("), 1, 16) > substr(hex(");
+                builder.push_bind(seed_scalar);
+                builder.push(") % 1000003 > abs(((unicode(substr(");
                 builder.push_bind(cid);
-                builder.push(" || ");
-                builder.push_bind(&seed_str);
-                builder.push("), 1, 16) OR (substr(hex(a.id || ");
-                builder.push_bind(&seed_str);
-                builder.push("), 1, 16) = substr(hex(");
+                builder.push(", 1, 1)) * 31 + unicode(substr(");
                 builder.push_bind(cid);
-                builder.push(" || ");
-                builder.push_bind(&seed_str);
-                builder.push(") AND a.id > ");
+                builder.push(", 2, 1))) * 31 + unicode(substr(");
+                builder.push_bind(cid);
+                builder.push(", 3, 1))) * ");
+                builder.push_bind(seed_scalar);
+                builder.push(") % 1000003 OR ( \
+                    abs(((unicode(substr(a.id, 1, 1)) * 31 + unicode(substr(a.id, 2, 1))) * 31 + unicode(substr(a.id, 3, 1))) * ");
+                builder.push_bind(seed_scalar);
+                builder.push(") % 1000003 = abs(((unicode(substr(");
+                builder.push_bind(cid);
+                builder.push(", 1, 1)) * 31 + unicode(substr(");
+                builder.push_bind(cid);
+                builder.push(", 2, 1))) * 31 + unicode(substr(");
+                builder.push_bind(cid);
+                builder.push(", 3, 1))) * ");
+                builder.push_bind(seed_scalar);
+                builder.push(") % 1000003 AND a.id > ");
                 builder.push_bind(cid);
                 builder.push(")) ");
             }
 
-            builder.push(" ORDER BY substr(hex(a.id || ");
-            builder.push_bind(&seed_str);
-            builder.push("), 1, 16) ASC, a.id ASC LIMIT ");
+            builder.push(" ORDER BY abs(((unicode(substr(a.id, 1, 1)) * 31 + unicode(substr(a.id, 2, 1))) * 31 + unicode(substr(a.id, 3, 1))) * ");
+            builder.push_bind(seed_scalar);
+            builder.push(") % 1000003 ASC, a.id ASC LIMIT ");
             builder.push_bind(fetch_limit);
         } else {
             // Standard Deterministic Keyset Pagination (Timeline)
@@ -376,17 +386,20 @@ impl AssetRepo {
         let next_cursor_id = rows.last().map(|i| i.id.clone());
 
         // 4. Group into sections:
-        // In random mode, bundle into an "explore-feed" section without date splits.
-        // In timeline mode, group chronologically by month/year.
         let sections = if is_random {
             if rows.is_empty() {
                 Vec::new()
             } else {
-                vec![MediaSection {
-                    id: "explore-feed".to_string(),
-                    title: "Explore".to_string(),
-                    items: rows.into_iter().map(MediaItemSummary::from).collect(),
-                }]
+                let items: Vec<MediaItemSummary> = rows.into_iter().map(MediaItemSummary::from).collect();
+                items
+                    .chunks(30)
+                    .enumerate()
+                    .map(|(idx, chunk)| MediaSection {
+                        id: format!("explore-chunk-{idx}"),
+                        title: "Explore".to_string(),
+                        items: chunk.to_vec(),
+                    })
+                    .collect()
             }
         } else {
             Self::build_grouped_sections(rows)

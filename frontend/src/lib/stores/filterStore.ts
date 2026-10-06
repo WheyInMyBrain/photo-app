@@ -22,6 +22,10 @@ export interface FilterState {
   camera_model: string;
 }
 
+function generateSeed(): number {
+  return Math.floor(Math.random() * 900000) + 100000; // Guaranteed 6-digit integer
+}
+
 const initial: FilterState = {
   is_private: false,
   show_trash: false,
@@ -31,7 +35,7 @@ const initial: FilterState = {
   album_id: '',
   view_mode: 'photos',
   sort: 'random',
-  seed: Math.floor(Math.random() * 1000000),
+  seed: generateSeed(),
   folder_path: '',
   from: '',
   to: '',
@@ -47,29 +51,29 @@ function createFilterStore() {
   return {
     subscribe,
 
-    // Independent sort controls: operates in both photos feed and album views
+    // When switching to 'random', ALWAYS generate a fresh seed
     setSort: (sort: SortMode) =>
       update((s) => ({
         ...s,
-        sort
+        sort,
+        seed: sort === 'random' ? generateSeed() : s.seed
       })),
 
-    // Re-rolls random seed without resetting active filters or destination
+    // Force a fresh seed roll
     reshuffle: () =>
       update((s) => ({
         ...s,
         sort: 'random',
-        seed: Math.floor(Math.random() * 1000000)
+        seed: generateSeed()
       })),
 
-    // Top-level screen mode (Photos vs Albums)
     setViewMode: (view_mode: ViewMode) =>
       update((s) => ({
         ...s,
         view_mode,
-        // Reset specific album selection when returning to full library photos
         album_id: view_mode === 'photos' ? '' : s.album_id,
-        folder_path: view_mode === 'photos' ? '' : s.folder_path
+        folder_path: view_mode === 'photos' ? '' : s.folder_path,
+        seed: s.sort === 'random' ? generateSeed() : s.seed
       })),
 
     toggleAlbums: () =>
@@ -79,33 +83,35 @@ function createFilterStore() {
           ...s,
           view_mode: nextMode,
           album_id: nextMode === 'photos' ? '' : s.album_id,
-          folder_path: nextMode === 'photos' ? '' : s.folder_path
+          folder_path: nextMode === 'photos' ? '' : s.folder_path,
+          seed: s.sort === 'random' ? generateSeed() : s.seed
         };
       }),
 
-    // Custom album selector (switches to album view and clears folder path)
     setAlbumId: (album_id: string) =>
       update((s) => ({
         ...s,
         album_id,
         folder_path: '',
-        view_mode: 'albums'
+        view_mode: 'albums',
+        seed: s.sort === 'random' ? generateSeed() : s.seed
       })),
 
     clearAlbum: () =>
       update((s) => ({
         ...s,
         album_id: '',
-        folder_path: ''
+        folder_path: '',
+        seed: s.sort === 'random' ? generateSeed() : s.seed
       })),
 
-    // Directory navigation (clears album_id)
     setFolderPath: (folder_path: string) =>
       update((s) => ({
         ...s,
         folder_path,
         album_id: '',
-        view_mode: 'albums'
+        view_mode: 'albums',
+        seed: s.sort === 'random' ? generateSeed() : s.seed
       })),
 
     toggleVaultMode: () =>
@@ -115,7 +121,7 @@ function createFilterStore() {
         show_trash: false,
         person_ids: new Set(),
         tags: new Set(),
-        seed: Math.floor(Math.random() * 1000000)
+        seed: generateSeed()
       })),
 
     lockVault: () =>
@@ -125,7 +131,7 @@ function createFilterStore() {
         show_trash: false,
         person_ids: new Set(),
         tags: new Set(),
-        seed: Math.floor(Math.random() * 1000000)
+        seed: generateSeed()
       })),
 
     toggleTrash: () =>
@@ -164,7 +170,7 @@ function createFilterStore() {
         show_trash: false,
         person_ids: new Set(),
         tags: new Set(),
-        seed: Math.floor(Math.random() * 1000000)
+        seed: generateSeed()
       }))
   };
 }
@@ -174,18 +180,15 @@ export const filterStore = createFilterStore();
 export const filterQueryString = derived(filterStore, ($s) => {
   const params = new URLSearchParams();
 
-  // Forward sort mode and seed to backend query_media endpoint
   params.set('sort', $s.sort);
   if ($s.sort === 'random') {
-    params.set('seed', $s.seed.toString());
+    params.set('seed', String(Math.floor($s.seed)));
   }
 
   if ($s.is_private) params.set('is_private', 'true');
   if ($s.show_trash) params.set('show_trash', 'true');
-
   if ($s.album_id) params.set('album_id',$s.album_id);
   if ($s.folder_path) params.set('folder_path',$s.folder_path);
-
   if ($s.q) params.set('q',$s.q);
   if ($s.media_type !== 'all') params.set('media_type',$s.media_type);
   if ($s.is_favorite) params.set('is_favorite', 'true');

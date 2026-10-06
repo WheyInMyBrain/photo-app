@@ -28,6 +28,11 @@
   let isNavHidden = false;
   const scrollThreshold = 10;
 
+  // Touch Edge-Swipe State for Sidebar
+  let touchStartX = 0;
+  let touchStartY = 0;
+  let isEligibleEdgeSwipe = false;
+
   let sseSubscription: { close: () => void } | null = null;
 
   function handleMainScroll() {
@@ -55,6 +60,27 @@
   function handleToggleAlbums() {
     filterStore.toggleAlbums();
     handleScrollToTop();
+  }
+
+  function handleTouchStart(e: TouchEvent) {
+    if (e.touches.length === 1) {
+      touchStartX = e.touches[0].clientX;
+      touchStartY = e.touches[0].clientY;
+      // Triggers if swipe starts within 35px from left edge
+      isEligibleEdgeSwipe = touchStartX < 35 && !isSidebarOpen;
+    }
+  }
+
+  function handleTouchMove(e: TouchEvent) {
+    if (e.touches.length === 1 && isEligibleEdgeSwipe) {
+      const dx = e.touches[0].clientX - touchStartX;
+      const dy = Math.abs(e.touches[0].clientY - touchStartY);
+
+      if (dx > 45 && dy < 30) {
+        isSidebarOpen = true;
+        isEligibleEdgeSwipe = false;
+      }
+    }
   }
 
   const dragDropHandler = createWindowFileDrop((files: File[]) => {
@@ -142,6 +168,8 @@
 </script>
 
 <svelte:window
+  on:touchstart={handleTouchStart}
+  on:touchmove={handleTouchMove}
   on:dragenter={handleDragEnter}
   on:dragover={handleDragOver}
   on:dragleave={handleDragLeave}
@@ -164,7 +192,33 @@
       on:openPeople={() => modalStore.openPeople()}
     />
 
-    <!-- Top Right Albums Toggle Button (Hides on Scroll Down, Shows on Scroll Up) -->
+    <!-- Top Left Sidebar Trigger Button (Hides on Scroll Down) -->
+    <div
+      style="top: max(0.85rem, var(--sat)); left: max(1rem, var(--sal));"
+      class="fixed z-40 transition-all duration-300 ease-out select-none {isNavHidden ? '-translate-y-16 opacity-0 pointer-events-none' : 'translate-y-0 opacity-100'}"
+    >
+      <button
+        type="button"
+        on:click={() => (isSidebarOpen = true)}
+        class="liquid-btn w-9 h-9 rounded-full flex items-center justify-center text-[var(--text-muted)] hover:text-[var(--text-main)] spring-tap cursor-pointer shadow-lg"
+        title="Open Filters"
+        aria-label="Open Filters"
+      >
+        <svg xmlns="http://www.w3.org/2000/svg" class="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+          <line x1="4" y1="21" x2="4" y2="14"></line>
+          <line x1="4" y1="10" x2="4" y2="3"></line>
+          <line x1="12" y1="21" x2="12" y2="12"></line>
+          <line x1="12" y1="8" x2="12" y2="3"></line>
+          <line x1="20" y1="21" x2="20" y2="16"></line>
+          <line x1="20" y1="12" x2="20" y2="3"></line>
+          <line x1="1" y1="14" x2="7" y2="14"></line>
+          <line x1="9" y1="8" x2="15" y2="8"></line>
+          <line x1="17" y1="16" x2="23" y2="16"></line>
+        </svg>
+      </button>
+    </div>
+
+    <!-- Top Right Albums Toggle Button (Hides on Scroll Down) -->
     <div
       style="top: max(0.85rem, var(--sat)); right: max(1rem, var(--sar));"
       class="fixed z-40 transition-all duration-300 ease-out select-none {isNavHidden ? '-translate-y-16 opacity-0 pointer-events-none' : 'translate-y-0 opacity-100'}"
@@ -179,7 +233,7 @@
         <svg xmlns="http://www.w3.org/2000/svg" class="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
           <path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path>
         </svg>
-        <span>{$filterStore.view_mode === 'albums' ? 'Photos' : 'Albums'}</span>
+        <span>{$filterStore.view_mode === 'albums' ? 'Exit Albums' : 'Albums'}</span>
       </button>
     </div>
 
