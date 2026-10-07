@@ -254,6 +254,7 @@ impl QueueService {
             let ai_tx = state.channels.ai_tx.clone();
             let thumb_sem = Arc::new(Semaphore::new(concurrency.max(1)));
             let mut pause_rx = pause_rx.clone();
+            let ai_enabled = state.config.ai.enabled;
 
             tokio::spawn(async move {
                 while let Some(job) = thumb_rx.recv().await {
@@ -273,7 +274,6 @@ impl QueueService {
                     let ai_tx = ai_tx.clone();
 
                     tokio::spawn(async move {
-                        let _guard = permit;
                         let job_id = job.id.clone();
                         let asset_id = job.asset_id.clone();
                         let user_id = job.user_id.clone();
@@ -282,6 +282,7 @@ impl QueueService {
                         if let Err(e) = tokio::fs::create_dir_all(&user_thumbs_dir).await {
                             error!("Failed creating thumbs dir for {}: {}", user_id, e);
                             let _ = JobRepo::mark_failed(&pool, &job_id, &e.to_string()).await;
+                            drop(permit);
                             return;
                         }
 
@@ -308,6 +309,7 @@ impl QueueService {
                                     asset_id,
                                     error: err_msg,
                                 });
+                                drop(permit);
                                 return;
                             }
                             Err(join_err) => {
@@ -318,6 +320,7 @@ impl QueueService {
                                     asset_id,
                                     error: err_msg,
                                 });
+                                drop(permit);
                                 return;
                             }
                         };
@@ -349,31 +352,44 @@ impl QueueService {
                                     asset_id,
                                     error: e,
                                 });
+                                drop(permit);
                                 return;
                             }
                         };
 
-                        // Push directly into Stage 2 (Background AI channel)
-                        let ai_job = DbJob {
-                            id: uuid::Uuid::new_v4().to_string(),
-                            user_id: job.user_id,
-                            asset_id: job.asset_id,
-                            file_name: job.file_name,
-                            rel_path: job.rel_path,
-                            folder_path: job.folder_path,
-                            disk_path: job.disk_path,
-                            sha256: job.sha256,
-                            job_type: "ai_enrichment".to_string(),
-                            file_size_bytes: job.file_size_bytes,
-                            payload: job.payload,
-                            ai_faces_done: 0,
-                            ai_clip_done: 0,
-                            ai_tags_done: 0,
-                            ai_poses_done: 0,
-                        };
+                        // Release the thumbnail concurrency permit immediately so
+                        // subsequent thumbnail jobs can start decoding without waiting on downstream AI
+                        drop(permit);
 
-                        let _ = JobRepo::enqueue(&pool, &ai_job).await;
-                        let _ = ai_tx.send(ai_job).await;
+                        // Stage 2: Hand off to AI Enrichment ONLY if AI is enabled globally
+                        if ai_enabled {
+                            let ai_job = DbJob {
+                                id: uuid::Uuid::new_v4().to_string(),
+                                user_id: job.user_id,
+                                asset_id: job.asset_id,
+                                file_name: job.file_name,
+                                rel_path: job.rel_path,
+                                folder_path: job.folder_path,
+                                disk_path: job.disk_path,
+                                sha256: job.sha256,
+                                job_type: "ai_enrichment".to_string(),
+                                file_size_bytes: job.file_size_bytes,
+                                payload: job.payload,
+                                ai_faces_done: 0,
+                                ai_clip_done: 0,
+                                ai_tags_done: 0,
+                                ai_poses_done: 0,
+                            };
+
+                            let _ = JobRepo::enqueue(&pool, &ai_job).await;
+
+                            // Send with a 5-second timeout safeguard to prevent deadlock if ai_rx is congested
+                            let _ = tokio::time::timeout(
+                                std::time::Duration::from_secs(5),
+                                ai_tx.send(ai_job),
+                            )
+                            .await;
+                        }
                     });
                 }
             });

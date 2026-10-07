@@ -166,31 +166,52 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // 4. WAL Startup Recovery: Refill channels from SQLite
     // =========================================================================
     {
-        let pool = pool.clone();
+        // 1. Assemble jobs
+        let pool_a = pool.clone();
         let a_tx = assemble_tx.clone();
-        let t_tx = thumb_tx.clone();
-        let ai_tx_init = ai_tx.clone();
-
         tokio::spawn(async move {
-            if let Ok(jobs) = db::JobRepo::recover_uncompleted_jobs(&pool, "assemble").await {
+            if let Ok(jobs) = db::JobRepo::recover_uncompleted_jobs(&pool_a, "assemble").await {
                 info!("WAL Startup Recovery: Refilling {} assemble jobs", jobs.len());
                 for job in jobs {
-                    let _ = a_tx.send(job).await;
-                }
-            }
-            if let Ok(jobs) = db::JobRepo::recover_uncompleted_jobs(&pool, "thumbnail").await {
-                info!("WAL Startup Recovery: Refilling {} thumbnail jobs", jobs.len());
-                for job in jobs {
-                    let _ = t_tx.send(job).await;
-                }
-            }
-            if let Ok(jobs) = db::JobRepo::recover_uncompleted_jobs(&pool, "ai_enrichment").await {
-                info!("WAL Startup Recovery: Refilling {} AI jobs", jobs.len());
-                for job in jobs {
-                    let _ = ai_tx_init.send(job).await;
+                    if a_tx.send(job).await.is_err() {
+                        tracing::warn!("assemble channel closed during recovery");
+                        break;
+                    }
                 }
             }
         });
+
+        // 2. Thumbnail jobs
+        let pool_t = pool.clone();
+        let t_tx = thumb_tx.clone();
+        tokio::spawn(async move {
+            if let Ok(jobs) = db::JobRepo::recover_uncompleted_jobs(&pool_t, "thumbnail").await {
+                info!("WAL Startup Recovery: Refilling {} thumbnail jobs", jobs.len());
+                for job in jobs {
+                    if t_tx.send(job).await.is_err() {
+                        tracing::warn!("thumbnail channel closed during recovery");
+                        break;
+                    }
+                }
+            }
+        });
+
+        // 3. AI Enrichment jobs (Only refill when AI is enabled)
+        if state.config.ai.enabled {
+            let pool_ai = pool.clone();
+            let ai_tx_init = ai_tx.clone();
+            tokio::spawn(async move {
+                if let Ok(jobs) = db::JobRepo::recover_uncompleted_jobs(&pool_ai, "ai_enrichment").await {
+                    info!("WAL Startup Recovery: Refilling {} AI jobs", jobs.len());
+                    for job in jobs {
+                        if ai_tx_init.send(job).await.is_err() {
+                            tracing::warn!("AI channel closed during recovery");
+                            break;
+                        }
+                    }
+                }
+            });
+        }
     }
 
     // Serves /users/<user_id>/thumbs/<shard>/<file> from <storage_root>/users/
