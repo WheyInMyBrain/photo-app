@@ -250,9 +250,6 @@ impl QueueService {
         // =========================================================================
         // WORKER 1: Thumbnails & Derivatives (Parallelized Concurrency: 2 - 4)
         // =========================================================================
-        // =========================================================================
-        // WORKER 1: Thumbnails & Derivatives (2-Tier Sharded Storage)
-        // =========================================================================
         {
             let pool = pool.clone();
             let storage_root = storage_root.clone();

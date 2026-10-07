@@ -62,7 +62,7 @@ impl MediaEngine {
     pub fn process_derivatives_sync(
         disk_path: &Path,
         asset_id: &str,
-        thumbs_root: &Path,
+        thumbs_root: &Path, // This is already users/<id>/thumbs/cd/28
     ) -> Result<DerivativeResult, Box<dyn std::error::Error + Send + Sync>> {
         let ext = disk_path
             .extension()
@@ -70,14 +70,12 @@ impl MediaEngine {
             .unwrap_or("")
             .to_lowercase();
 
-        let shard = if asset_id.len() >= 2 { &asset_id[0..2] } else { "misc" };
-        let shard_dir = thumbs_root.join(shard);
-        std::fs::create_dir_all(&shard_dir)?;
+        std::fs::create_dir_all(thumbs_root)?;
 
         if video_processor::VideoProcessor::is_video_or_anim(&ext) {
-            Self::generate_video_derivatives(disk_path, asset_id, &shard_dir, &ext)
+            Self::generate_video_derivatives(disk_path, asset_id, thumbs_root, &ext)
         } else {
-            Self::generate_image_derivatives(disk_path, asset_id, &shard_dir, &ext)
+            Self::generate_image_derivatives(disk_path, asset_id, thumbs_root, &ext)
         }
     }
 
