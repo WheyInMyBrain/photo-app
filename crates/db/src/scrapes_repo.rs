@@ -259,7 +259,7 @@ impl ScrapesRepo {
             qb.build().execute(&mut *tx).await?;
         }
 
-        // 3. Insert items with their individual metadata overrides
+        // 3. Upsert items on (scraped_post_id, item_index) and return the persistent ID
         for (idx, item) in items.iter().enumerate() {
             let item_tags_json = if !item.tags.is_empty() {
                 Some(serde_json::to_string(&item.tags).unwrap_or_else(|_| "[]".to_string()))
@@ -267,14 +267,14 @@ impl ScrapesRepo {
                 None
             };
 
-            sqlx::query(
+            let resolved_item_id: String = sqlx::query_scalar(
                 r#"
                 INSERT INTO scraped_media_items (
                     id, scraped_post_id, item_index, media_type, cdn_url,
                     audio_url, thumbnail_url, suggested_filename, width, height, status,
                     caption, published_at, location_name, latitude, longitude, tags, source_url
                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'pending', ?11, ?12, ?13, ?14, ?15, ?16, ?17)
-                ON CONFLICT(id) DO UPDATE SET
+                ON CONFLICT(scraped_post_id, item_index) DO UPDATE SET
                     cdn_url = excluded.cdn_url,
                     audio_url = excluded.audio_url,
                     thumbnail_url = excluded.thumbnail_url,
@@ -288,6 +288,7 @@ impl ScrapesRepo {
                     longitude = excluded.longitude,
                     tags = excluded.tags,
                     source_url = excluded.source_url
+                RETURNING id
                 "#,
             )
             .bind(&item.id)
@@ -307,17 +308,17 @@ impl ScrapesRepo {
             .bind(item.longitude)
             .bind(item_tags_json)
             .bind(&item.source_url)
-            .execute(&mut *tx)
+            .fetch_one(&mut *tx)
             .await?;
 
-            // 4. Batch insert alternate variants for this media item
+            // 4. Batch insert alternate variants using the resolved persistent item ID
             if !item.variants.is_empty() {
                 let mut v_qb: QueryBuilder<Sqlite> = QueryBuilder::new(
                     "INSERT INTO scraped_media_variants (media_item_id, url, width, height, label, file_size_bytes, is_master) ",
                 );
 
                 v_qb.push_values(&item.variants, |mut b, v| {
-                    b.push_bind(&item.id)
+                    b.push_bind(&resolved_item_id)
                         .push_bind(&v.url)
                         .push_bind(v.width)
                         .push_bind(v.height)
