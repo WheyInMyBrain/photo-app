@@ -1,10 +1,13 @@
+// photo-app/backend/src/routes/people.rs
+
 use axum::{
     extract::{Path as AxumPath, Query, State},
     response::Json,
 };
 use serde::Deserialize;
+use uuid::Uuid;
 
-use db::{AssetRepo, PersonRepo};
+use db::PersonRepo;
 use db::domain::{AssetFaceDetail, PersonCard};
 use crate::error::AppError;
 use crate::middleware::auth::AuthUser;
@@ -12,7 +15,7 @@ use crate::AppState;
 
 #[derive(Deserialize)]
 pub struct PeopleOverviewQuery {
-    pub album_id: Option<String>,
+    pub album_id: Option<Uuid>,
 }
 
 /// GET /api/smart-albums/people?album_id=...
@@ -23,8 +26,8 @@ pub async fn get_people_overview(
 ) -> Result<Json<Vec<PersonCard>>, AppError> {
     let people = PersonRepo::get_overview(
         &state.db,
-        &auth_user.id,
-        query.album_id.as_deref(),
+        auth_user.id,
+        query.album_id,
     )
     .await
     .map_err(|e| AppError::Internal(e.to_string()))?;
@@ -36,9 +39,9 @@ pub async fn get_people_overview(
 pub async fn get_asset_faces(
     State(state): State<AppState>,
     auth_user: AuthUser,
-    AxumPath(asset_id): AxumPath<String>,
+    AxumPath(asset_id): AxumPath<Uuid>,
 ) -> Result<Json<Vec<AssetFaceDetail>>, AppError> {
-    let faces = PersonRepo::get_faces_by_asset(&state.db, &auth_user.id, &asset_id)
+    let faces = PersonRepo::get_faces_by_asset(&state.db, auth_user.id, asset_id)
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?;
 
@@ -54,7 +57,7 @@ pub struct NamePersonPayload {
 pub async fn name_person(
     State(state): State<AppState>,
     auth_user: AuthUser,
-    AxumPath(person_id): AxumPath<String>,
+    AxumPath(person_id): AxumPath<Uuid>,
     Json(payload): Json<NamePersonPayload>,
 ) -> Result<Json<bool>, AppError> {
     let trimmed = payload.name.trim();
@@ -62,13 +65,12 @@ pub async fn name_person(
         return Err(AppError::BadRequest("Name cannot be empty".into()));
     }
 
-    let affected_assets = PersonRepo::rename_person(&state.db, &auth_user.id, &person_id, trimmed)
+    PersonRepo::rename_person(&state.db, auth_user.id, person_id, trimmed)
         .await
-        .map_err(|e| AppError::Internal(e.to_string()))?;
-
-    for aid in affected_assets {
-        let _ = AssetRepo::sync_search_index(&state.db, &auth_user.id, &aid).await;
-    }
+        .map_err(|e| match e {
+            sqlx::Error::RowNotFound => AppError::NotFound("Person not found".into()),
+            _ => AppError::Internal(e.to_string()),
+        })?;
 
     Ok(Json(true))
 }
@@ -77,44 +79,41 @@ pub async fn name_person(
 pub async fn delete_person(
     State(state): State<AppState>,
     auth_user: AuthUser,
-    AxumPath(person_id): AxumPath<String>,
+    AxumPath(person_id): AxumPath<Uuid>,
 ) -> Result<Json<bool>, AppError> {
-    let affected_assets = PersonRepo::delete_person(&state.db, &auth_user.id, &person_id)
+    PersonRepo::delete_person(&state.db, auth_user.id, person_id)
         .await
         .map_err(|e| match e {
             sqlx::Error::RowNotFound => AppError::NotFound("Person not found".into()),
             _ => AppError::Internal(e.to_string()),
         })?;
 
-    for aid in affected_assets {
-        let _ = AssetRepo::sync_search_index(&state.db, &auth_user.id, &aid).await;
-    }
-
     Ok(Json(true))
 }
 
 #[derive(Deserialize)]
 pub struct ReassignFacePayload {
-    pub target_person_id: String,
+    pub target_person_id: Uuid,
 }
 
 /// POST /api/faces/{face_id}/reassign
 pub async fn reassign_face(
     State(state): State<AppState>,
     auth_user: AuthUser,
-    AxumPath(face_id): AxumPath<String>,
+    AxumPath(face_id): AxumPath<Uuid>,
     Json(payload): Json<ReassignFacePayload>,
 ) -> Result<Json<bool>, AppError> {
-    let affected_asset_id = PersonRepo::reassign_face(
+    PersonRepo::reassign_face(
         &state.db,
-        &auth_user.id,
-        &face_id,
-        &payload.target_person_id,
+        auth_user.id,
+        face_id,
+        payload.target_person_id,
     )
     .await
-    .map_err(|e| AppError::Internal(e.to_string()))?;
-
-    let _ = AssetRepo::sync_search_index(&state.db, &auth_user.id, &affected_asset_id).await;
+    .map_err(|e| match e {
+        sqlx::Error::RowNotFound => AppError::NotFound("Face or target person not found".into()),
+        _ => AppError::Internal(e.to_string()),
+    })?;
 
     Ok(Json(true))
 }
@@ -123,11 +122,14 @@ pub async fn reassign_face(
 pub async fn verify_face(
     State(state): State<AppState>,
     auth_user: AuthUser,
-    AxumPath(face_id): AxumPath<String>,
+    AxumPath(face_id): AxumPath<Uuid>,
 ) -> Result<Json<bool>, AppError> {
-    PersonRepo::verify_face(&state.db, &auth_user.id, &face_id)
+    PersonRepo::verify_face(&state.db, auth_user.id, face_id)
         .await
-        .map_err(|e| AppError::Internal(e.to_string()))?;
+        .map_err(|e| match e {
+            sqlx::Error::RowNotFound => AppError::NotFound("Face not found".into()),
+            _ => AppError::Internal(e.to_string()),
+        })?;
 
     Ok(Json(true))
 }
@@ -137,16 +139,14 @@ pub async fn verify_face(
 pub async fn delete_face(
     State(state): State<AppState>,
     auth_user: AuthUser,
-    AxumPath(face_id): AxumPath<String>,
+    AxumPath(face_id): AxumPath<Uuid>,
 ) -> Result<Json<bool>, AppError> {
-    let (asset_id, _) = PersonRepo::delete_face(&state.db, &auth_user.id, &face_id)
+    PersonRepo::delete_face(&state.db, auth_user.id, face_id)
         .await
         .map_err(|e| match e {
             sqlx::Error::RowNotFound => AppError::NotFound("Face not found".into()),
             _ => AppError::Internal(e.to_string()),
         })?;
-
-    let _ = AssetRepo::sync_search_index(&state.db, &auth_user.id, &asset_id).await;
 
     Ok(Json(true))
 }
@@ -156,24 +156,22 @@ pub async fn delete_face(
 pub async fn unlink_face(
     State(state): State<AppState>,
     auth_user: AuthUser,
-    AxumPath(face_id): AxumPath<String>,
+    AxumPath(face_id): AxumPath<Uuid>,
 ) -> Result<Json<bool>, AppError> {
-    let (asset_id, _) = PersonRepo::unlink_face(&state.db, &auth_user.id, &face_id)
+    PersonRepo::unlink_face(&state.db, auth_user.id, face_id)
         .await
         .map_err(|e| match e {
             sqlx::Error::RowNotFound => AppError::NotFound("Face not found".into()),
             _ => AppError::Internal(e.to_string()),
         })?;
 
-    let _ = AssetRepo::sync_search_index(&state.db, &auth_user.id, &asset_id).await;
-
     Ok(Json(true))
 }
 
 #[derive(Deserialize)]
 pub struct MergeRequest {
-    pub source_person_id: String,
-    pub target_person_id: String,
+    pub source_person_id: Uuid,
+    pub target_person_id: Uuid,
 }
 
 /// POST /api/persons/merge
@@ -186,18 +184,17 @@ pub async fn merge_persons(
         return Err(AppError::BadRequest("Cannot merge a person into themselves".into()));
     }
 
-    let affected_assets = PersonRepo::merge_persons(
+    PersonRepo::merge_persons(
         &state.db,
-        &auth_user.id,
-        &payload.source_person_id,
-        &payload.target_person_id,
+        auth_user.id,
+        payload.source_person_id,
+        payload.target_person_id,
     )
     .await
-    .map_err(|e| AppError::Internal(e.to_string()))?;
-
-    for aid in affected_assets {
-        let _ = AssetRepo::sync_search_index(&state.db, &auth_user.id, &aid).await;
-    }
+    .map_err(|e| match e {
+        sqlx::Error::RowNotFound => AppError::NotFound("One or both persons not found".into()),
+        _ => AppError::Internal(e.to_string()),
+    })?;
 
     Ok(Json(true))
 }
@@ -207,7 +204,7 @@ pub async fn get_names_directory(
     State(state): State<AppState>,
     auth_user: AuthUser,
 ) -> Result<Json<Vec<PersonCard>>, AppError> {
-    let names = PersonRepo::get_name_directory(&state.db, &auth_user.id)
+    let names = PersonRepo::get_name_directory(&state.db, auth_user.id)
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?;
     Ok(Json(names))
@@ -217,16 +214,14 @@ pub async fn get_names_directory(
 pub async fn split_face_to_new_person(
     State(state): State<AppState>,
     auth_user: AuthUser,
-    AxumPath(face_id): AxumPath<String>,
+    AxumPath(face_id): AxumPath<Uuid>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let (asset_id, new_person_id) = PersonRepo::split_face_to_new_person(&state.db, &auth_user.id, &face_id)
+    let (_, new_person_id) = PersonRepo::split_face_to_new_person(&state.db, auth_user.id, face_id)
         .await
         .map_err(|e| match e {
             sqlx::Error::RowNotFound => AppError::NotFound("Face not found".into()),
             _ => AppError::Internal(e.to_string()),
         })?;
-
-    let _ = AssetRepo::sync_search_index(&state.db, &auth_user.id, &asset_id).await;
 
     Ok(Json(serde_json::json!({
         "status": "success",

@@ -24,6 +24,7 @@ use tower_http::{
 };
 use tracing::info;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+use uuid::Uuid;
 
 // Use mimalloc globally to guarantee OS pages are reclaimed on drop
 #[global_allocator]
@@ -38,30 +39,30 @@ use services::trash_purger::TrashPurgerService;
 pub enum WsMediaEvent {
     #[serde(rename = "asset_ready")]
     AssetReady {
-        asset_id: String,
+        asset_id: Uuid,
         thumb_path: String,
         folder_path: String,
     },
     #[serde(rename = "asset_failed")]
     AssetFailed {
-        asset_id: String,
+        asset_id: Uuid,
         error: String,
     },
     #[serde(rename = "album_updated")]
     AlbumUpdated {
-        album_id: Option<String>,
+        album_id: Option<Uuid>,
         folder_path: String,
-        asset_id: String,
+        asset_id: Uuid,
     },
     #[serde(rename = "people_updated")]
     PeopleUpdated {
-        user_id: String,
+        user_id: Uuid,
         new_people_count: usize,
-        affected_person_ids: Vec<String>,
+        affected_person_ids: Vec<Uuid>,
     },
     #[serde(rename = "ai_completed")]
     AiCompleted {
-        asset_id: String,
+        asset_id: Uuid,
         faces_detected: usize,
         tags_count: usize,
     },
@@ -69,7 +70,7 @@ pub enum WsMediaEvent {
 
 #[derive(Clone)]
 pub struct AppState {
-    pub db: sqlx::SqlitePool,
+    pub db: sqlx::PgPool,
     pub config: Config,
     pub tx_events: broadcast::Sender<WsMediaEvent>,
     pub coordinator: EngineCoordinator,
@@ -106,19 +107,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .with(tracing_subscriber::fmt::layer())
         .init();
 
-    // Initialize required user storage directories
-    tokio::fs::create_dir_all(&config.storage_root.join("db")).await?;
+    // Initialize required storage directories
     tokio::fs::create_dir_all(&config.storage_root.join("users")).await?;
     tokio::fs::create_dir_all(&config.storage_root.join("temp_chunks")).await?;
     tokio::fs::create_dir_all(&config.storage_root.join("models")).await?;
 
-    let pool = db::init_db_pool(&config.db_url).await?;
+    // Initialize isolated PostgreSQL connection pools (HTTP + Worker)
+    let pools = db::init_db_pools(&config.db_url).await?;
+    let http_pool = pools.http;
+    let worker_pool = pools.worker;
 
-    TrashPurgerService::start(pool.clone(), config.storage_root.clone());
+    // Start background background cleaner
+    TrashPurgerService::start(worker_pool.clone(), config.storage_root.clone());
 
     // 1. Initialize coordinator (Zero ONNX models and zero vector caches loaded at boot)
     let models_dir = config.storage_root.join("models");
-    let coordinator = EngineCoordinator::new(pool.clone(), models_dir, config.clone());
+    let coordinator = EngineCoordinator::new(worker_pool.clone(), models_dir, config.clone());
     let (tx_events, _) = broadcast::channel::<WsMediaEvent>(100);
 
     // =========================================================================
@@ -138,7 +142,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let state = AppState {
-        db: pool.clone(),
+        db: http_pool.clone(),
         config: config.clone(),
         tx_events: tx_events.clone(),
         coordinator: coordinator.clone(),
@@ -149,7 +153,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // =========================================================================
-    // 3. Start Event-Driven Workers
+    // 3. Start Event-Driven Pipeline Workers
     // =========================================================================
     QueueService::start_pipeline(
         state.clone(),
@@ -163,15 +167,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     // =========================================================================
-    // 4. WAL Startup Recovery: Refill channels from SQLite
+    // 4. PostgreSQL Startup Recovery: Reclaim stalled jobs & refill channels
     // =========================================================================
     {
+        let pool_rec = worker_pool.clone();
+        if let Ok(reclaimed) = db::JobRepo::reclaim_stalled_jobs(&pool_rec, 15).await {
+            if reclaimed > 0 {
+                info!("Startup recovery: Reclaimed {} stalled background jobs", reclaimed);
+            }
+        }
+
         // 1. Assemble jobs
-        let pool_a = pool.clone();
+        let pool_a = worker_pool.clone();
         let a_tx = assemble_tx.clone();
         tokio::spawn(async move {
             if let Ok(jobs) = db::JobRepo::recover_uncompleted_jobs(&pool_a, "assemble").await {
-                info!("WAL Startup Recovery: Refilling {} assemble jobs", jobs.len());
+                info!("Startup recovery: Refilling {} assemble jobs", jobs.len());
                 for job in jobs {
                     if a_tx.send(job).await.is_err() {
                         tracing::warn!("assemble channel closed during recovery");
@@ -182,11 +193,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         });
 
         // 2. Thumbnail jobs
-        let pool_t = pool.clone();
+        let pool_t = worker_pool.clone();
         let t_tx = thumb_tx.clone();
         tokio::spawn(async move {
             if let Ok(jobs) = db::JobRepo::recover_uncompleted_jobs(&pool_t, "thumbnail").await {
-                info!("WAL Startup Recovery: Refilling {} thumbnail jobs", jobs.len());
+                info!("Startup recovery: Refilling {} thumbnail jobs", jobs.len());
                 for job in jobs {
                     if t_tx.send(job).await.is_err() {
                         tracing::warn!("thumbnail channel closed during recovery");
@@ -196,13 +207,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         });
 
-        // 3. AI Enrichment jobs (Only refill when AI is enabled)
+        // 3. AI Enrichment jobs
         if state.config.ai.enabled {
-            let pool_ai = pool.clone();
+            let pool_ai = worker_pool.clone();
             let ai_tx_init = ai_tx.clone();
             tokio::spawn(async move {
                 if let Ok(jobs) = db::JobRepo::recover_uncompleted_jobs(&pool_ai, "ai_enrichment").await {
-                    info!("WAL Startup Recovery: Refilling {} AI jobs", jobs.len());
+                    info!("Startup recovery: Refilling {} AI enrichment jobs", jobs.len());
                     for job in jobs {
                         if ai_tx_init.send(job).await.is_err() {
                             tracing::warn!("AI channel closed during recovery");
@@ -316,7 +327,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Router::new()
                 .route("/albums", get(routes::albums::get_folder_suggestions)),
         )
-        .layer(Extension(pool.clone()))
+        .layer(Extension(http_pool.clone()))
         .layer(DefaultBodyLimit::max(100 * 1024 * 1024))
         .layer(TraceLayer::new_for_http())
         .with_state(state);
@@ -331,7 +342,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("------------------------------------------------------------");
 
     services::backup::BackupService::start_scheduler(
-        pool.clone(),
+        worker_pool.clone(),
         config.storage_root.clone(),
         config.b2.clone(),
     );

@@ -4,6 +4,7 @@ use axum::{
 };
 use serde::Deserialize;
 use std::collections::BTreeSet;
+use uuid::Uuid;
 
 use crate::error::AppError;
 use crate::middleware::auth::AuthUser;
@@ -35,17 +36,17 @@ pub struct UpdateAlbumRequest {
 
 #[derive(Deserialize)]
 pub struct AlbumAssetActionRequest {
-    pub asset_ids: Vec<String>,
+    pub asset_ids: Vec<Uuid>,
 }
 
 #[derive(Deserialize)]
 pub struct ReorderAssetsRequest {
-    pub asset_ids: Vec<String>,
+    pub asset_ids: Vec<Uuid>,
 }
 
 #[derive(Deserialize)]
 pub struct SetCoverRequest {
-    pub asset_id: Option<String>,
+    pub asset_id: Option<Uuid>,
 }
 
 #[derive(Deserialize)]
@@ -65,7 +66,7 @@ pub async fn get_folder_suggestions(
 ) -> Result<Json<Vec<String>>, AppError> {
     let filter = params.query.unwrap_or_default().trim().to_lowercase();
 
-    let raw_paths = AlbumRepo::get_all_folder_paths(&state.db, &auth_user.id)
+    let raw_paths = AlbumRepo::get_all_folder_paths(&state.db, auth_user.id)
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?;
 
@@ -108,7 +109,7 @@ pub async fn list_albums(
     State(state): State<AppState>,
     auth_user: AuthUser,
 ) -> Result<Json<Vec<AlbumRecord>>, AppError> {
-    let albums = AlbumRepo::list_custom_albums(&state.db, &auth_user.id)
+    let albums = AlbumRepo::list_custom_albums(&state.db, auth_user.id)
         .await
         .map_err(|e| {
             tracing::error!("Error fetching custom albums: {e}");
@@ -122,9 +123,9 @@ pub async fn list_albums(
 pub async fn get_album(
     State(state): State<AppState>,
     auth_user: AuthUser,
-    Path(album_id): Path<String>,
+    Path(album_id): Path<Uuid>,
 ) -> Result<Json<AlbumRecord>, AppError> {
-    let album = AlbumRepo::get_album_by_id(&state.db, &album_id, &auth_user.id)
+    let album = AlbumRepo::get_album_by_id(&state.db, album_id, auth_user.id)
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?
         .ok_or_else(|| AppError::NotFound("Album not found".into()))?;
@@ -144,15 +145,14 @@ pub async fn create_album(
     }
 
     let album_type = payload.album_type.unwrap_or_else(|| "MANUAL".to_string());
-    let filter_criteria_str = payload.filter_criteria.map(|v| v.to_string());
 
     let album_id = AlbumRepo::create_album(
         &state.db,
-        &auth_user.id,
+        auth_user.id,
         title,
         payload.description.as_deref(),
         &album_type,
-        filter_criteria_str.as_deref(),
+        payload.filter_criteria,
     )
     .await
     .map_err(|e| AppError::Internal(e.to_string()))?;
@@ -167,7 +167,7 @@ pub async fn create_album(
 pub async fn update_album(
     State(state): State<AppState>,
     auth_user: AuthUser,
-    Path(album_id): Path<String>,
+    Path(album_id): Path<Uuid>,
     Json(payload): Json<UpdateAlbumRequest>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let title = payload.title.trim();
@@ -177,8 +177,8 @@ pub async fn update_album(
 
     let updated = AlbumRepo::update_album(
         &state.db,
-        &auth_user.id,
-        &album_id,
+        auth_user.id,
+        album_id,
         title,
         payload.description.as_deref(),
     )
@@ -196,14 +196,14 @@ pub async fn update_album(
 pub async fn add_assets_to_album(
     State(state): State<AppState>,
     auth_user: AuthUser,
-    Path(album_id): Path<String>,
+    Path(album_id): Path<Uuid>,
     Json(payload): Json<AlbumAssetActionRequest>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     if payload.asset_ids.is_empty() {
         return Err(AppError::BadRequest("No assets specified".into()));
     }
 
-    let added = AlbumRepo::add_assets(&state.db, &album_id, &auth_user.id, &payload.asset_ids)
+    let added = AlbumRepo::add_assets(&state.db, album_id, auth_user.id, &payload.asset_ids)
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?;
 
@@ -217,17 +217,17 @@ pub async fn add_assets_to_album(
 pub async fn remove_assets_from_album(
     State(state): State<AppState>,
     auth_user: AuthUser,
-    Path(album_id): Path<String>,
+    Path(album_id): Path<Uuid>,
     Json(payload): Json<AlbumAssetActionRequest>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     if payload.asset_ids.is_empty() {
         return Err(AppError::BadRequest("No assets specified".into()));
     }
 
-    let removed = AlbumRepo::remove_assets_from_album(
+    let removed = AlbumRepo::remove_assets(
         &state.db,
-        &auth_user.id,
-        &album_id,
+        auth_user.id,
+        album_id,
         &payload.asset_ids,
     )
     .await
@@ -243,13 +243,13 @@ pub async fn remove_assets_from_album(
 pub async fn reorder_album_assets(
     State(state): State<AppState>,
     auth_user: AuthUser,
-    Path(album_id): Path<String>,
+    Path(album_id): Path<Uuid>,
     Json(payload): Json<ReorderAssetsRequest>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     AlbumRepo::reorder_album_assets(
         &state.db,
-        &auth_user.id,
-        &album_id,
+        auth_user.id,
+        album_id,
         &payload.asset_ids,
     )
     .await
@@ -262,21 +262,17 @@ pub async fn reorder_album_assets(
 pub async fn set_album_cover(
     State(state): State<AppState>,
     auth_user: AuthUser,
-    Path(album_id): Path<String>,
+    Path(album_id): Path<Uuid>,
     Json(payload): Json<SetCoverRequest>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let updated = match payload.asset_id.as_deref() {
-        Some(aid) => {
-            AlbumRepo::set_cover_asset(&state.db, &auth_user.id, &album_id, aid)
-                .await
-                .map_err(|e| AppError::Internal(e.to_string()))?
-        }
-        None => {
-            AlbumRepo::set_cover(&state.db, &album_id, &auth_user.id, None)
-                .await
-                .map_err(|e| AppError::Internal(e.to_string()))?
-        }
-    };
+    let updated = AlbumRepo::set_cover_asset(
+        &state.db,
+        auth_user.id,
+        album_id,
+        payload.asset_id, // payload.asset_id is already Option<Uuid>
+    )
+    .await
+    .map_err(|e| AppError::Internal(e.to_string()))?;
 
     if !updated {
         return Err(AppError::NotFound("Album not found".into()));
@@ -289,12 +285,12 @@ pub async fn set_album_cover(
 pub async fn delete_album(
     State(state): State<AppState>,
     auth_user: AuthUser,
-    Path(album_id): Path<String>,
+    Path(album_id): Path<Uuid>,
     Query(params): Query<DeleteAlbumQuery>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     let delete_media = params.delete_media.unwrap_or(false);
 
-    let deleted = AlbumRepo::delete_album(&state.db, &auth_user.id, &album_id, delete_media)
+    let deleted = AlbumRepo::delete_album(&state.db, auth_user.id, album_id, delete_media)
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?;
 

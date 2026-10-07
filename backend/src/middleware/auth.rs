@@ -1,16 +1,19 @@
+// backend/src/middleware/auth.rs
+
 use axum::{
     extract::FromRequestParts,
     http::{header, request::Parts, HeaderMap},
 };
-use sqlx::SqlitePool;
+use sqlx::PgPool;
+use uuid::Uuid;
 
-use db::AuthRepo;
 use crate::error::AppError;
+use db::AuthRepo;
 
 /// Local Axum extractor for authenticated user identity
 #[derive(Clone, Debug)]
 pub struct AuthUser {
-    pub id: String,
+    pub id: Uuid,
     pub username: String,
 }
 
@@ -60,7 +63,7 @@ where
     async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
         let pool = parts
             .extensions
-            .get::<SqlitePool>()
+            .get::<PgPool>()
             .ok_or_else(|| AppError::Internal("DB pool extension missing".into()))?;
 
         // 1. API Key check
@@ -78,16 +81,18 @@ where
         }
 
         // 2. Cookie session check
-        if let Some(session_id) = extract_cookie_value(&parts.headers, "app_session") {
-            let record = AuthRepo::find_by_id(pool, session_id)
-                .await
-                .map_err(|e| AppError::Internal(format!("Database lookup failure: {e}")))?;
+        if let Some(session_str) = extract_cookie_value(&parts.headers, "app_session") {
+            if let Ok(session_id) = Uuid::parse_str(session_str) {
+                let record = AuthRepo::find_by_id(pool, session_id)
+                    .await
+                    .map_err(|e| AppError::Internal(format!("Database lookup failure: {e}")))?;
 
-            if let Some(u) = record {
-                return Ok(AuthUser {
-                    id: u.id,
-                    username: u.username,
-                });
+                if let Some(u) = record {
+                    return Ok(AuthUser {
+                        id: u.id,
+                        username: u.username,
+                    });
+                }
             }
         }
 

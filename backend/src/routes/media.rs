@@ -5,12 +5,13 @@ use axum::{
 };
 use tower_http::services::ServeFile;
 use tracing::error;
+use uuid::Uuid;
 
 use db::AssetRepo;
 use db::domain::{
-    BatchActionRequest, BatchActionResponse, DynamicFiltersResponse, FavoriteToggleResponse,
-    MediaPageResponse, MediaQuery, SimilarMediaItem, SoftDeleteResponse, MapLocationPoint, 
-    MapLocationsQuery, AssetPoseDetail
+    AssetPoseDetail, BatchActionRequest, BatchActionResponse, DynamicFiltersResponse,
+    FavoriteToggleResponse, MapLocationPoint, MapLocationsQuery, MediaPageResponse,
+    MediaQuery, SimilarMediaItem, SoftDeleteResponse,
 };
 use crate::error::AppError;
 use crate::middleware::auth::AuthUser;
@@ -25,7 +26,6 @@ pub async fn list_media(
     let is_timeline = params.sort.as_deref() == Some("timeline");
 
     // In timeline mode, keyset pagination requires both cursors to preserve total order.
-    // In random mode, only cursor_id is needed.
     if is_timeline && (params.cursor_captured_at.is_some() ^ params.cursor_id.is_some()) {
         return Err(AppError::BadRequest(
             "Both cursor_captured_at and cursor_id must be supplied together for timeline pagination".into(),
@@ -33,9 +33,9 @@ pub async fn list_media(
     }
 
     // Resolve Hybrid Search (person names + SIMD CLIP text search scoped to user)
-    resolve_hybrid_query(&state, &auth_user.id, &mut params).await;
+    resolve_hybrid_query(&state, auth_user.id, &mut params).await;
 
-    let page = AssetRepo::query_media(&state.db, &auth_user.id, &params)
+    let page = AssetRepo::query_media(&state.db, auth_user.id, &params)
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?;
 
@@ -46,9 +46,9 @@ pub async fn list_media(
 pub async fn toggle_favorite(
     State(state): State<AppState>,
     auth_user: AuthUser,
-    AxumPath(asset_id): AxumPath<String>,
+    AxumPath(asset_id): AxumPath<Uuid>,
 ) -> Result<Json<FavoriteToggleResponse>, AppError> {
-    let is_favorite = AssetRepo::toggle_favorite(&state.db, &auth_user.id, &asset_id)
+    let is_favorite = AssetRepo::toggle_favorite(&state.db, auth_user.id, asset_id)
         .await
         .map_err(|e| match e {
             sqlx::Error::RowNotFound => AppError::NotFound(format!("Asset {} not found", asset_id)),
@@ -65,36 +65,32 @@ pub async fn toggle_favorite(
 pub async fn stream_asset(
     State(state): State<AppState>,
     auth_user: AuthUser,
-    AxumPath(asset_id): AxumPath<String>,
+    AxumPath(asset_id): AxumPath<Uuid>,
     req: Request,
 ) -> Result<Response, AppError> {
-    let info = AssetRepo::get_storage_info(&state.db, &auth_user.id, &asset_id)
+    let info = AssetRepo::get_storage_info(&state.db, auth_user.id, asset_id)
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?
         .ok_or_else(|| AppError::NotFound(format!("Asset {} not found", asset_id)))?;
 
+    let user_storage = state
+        .config
+        .storage_root
+        .join("users")
+        .join(auth_user.id.to_string());
+
     let file_to_serve = if info.is_video {
-        state
-            .config
-            .storage_root
-            .join("users")
-            .join(&auth_user.id)
-            .join("originals")
-            .join(&info.rel_path)
+        // Full original video stream (or route to preview proxy if requested)
+        user_storage.join("originals").join(&info.rel_path)
     } else {
-        // info.preview_path is stored as "users/<user_id>/thumbs/<shard>/<id>_preview.webp"
-        let preview = state.config.storage_root.join(&info.preview_path);
+        // Properly scoped: storage_root/users/<user_id>/thumbs/a1/b2/<asset_id>_preview.webp
+        let preview = user_storage.join("thumbs").join(&info.preview_path);
 
         if preview.exists() {
             preview
         } else {
-            state
-                .config
-                .storage_root
-                .join("users")
-                .join(&auth_user.id)
-                .join("originals")
-                .join(&info.rel_path)
+            // Fallback to original if preview hasn't been generated yet
+            user_storage.join("originals").join(&info.rel_path)
         }
     };
 
@@ -127,9 +123,9 @@ pub async fn get_available_filters(
     auth_user: AuthUser,
     Query(mut params): Query<MediaQuery>,
 ) -> Result<Json<DynamicFiltersResponse>, AppError> {
-    resolve_hybrid_query(&state, &auth_user.id, &mut params).await;
+    resolve_hybrid_query(&state, auth_user.id, &mut params).await;
 
-    let filters = AssetRepo::get_dynamic_filters(&state.db, &auth_user.id, &params)
+    let filters = AssetRepo::get_dynamic_filters(&state.db, auth_user.id, &params)
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?;
 
@@ -140,9 +136,9 @@ pub async fn get_available_filters(
 pub async fn toggle_soft_delete(
     State(state): State<AppState>,
     auth_user: AuthUser,
-    AxumPath(id): AxumPath<String>,
+    AxumPath(id): AxumPath<Uuid>,
 ) -> Result<Json<SoftDeleteResponse>, AppError> {
-    let deleted_at = AssetRepo::toggle_soft_delete(&state.db, &auth_user.id, &id)
+    let deleted_at = AssetRepo::toggle_soft_delete(&state.db, auth_user.id, id)
         .await
         .map_err(|e| match e {
             sqlx::Error::RowNotFound => AppError::NotFound(format!("Asset {} not found", id)),
@@ -160,19 +156,14 @@ pub async fn toggle_soft_delete(
 pub async fn hard_delete_asset(
     State(state): State<AppState>,
     auth_user: AuthUser,
-    AxumPath(id): AxumPath<String>,
+    AxumPath(id): AxumPath<Uuid>,
 ) -> Result<StatusCode, AppError> {
-    let found = AssetRepo::purge_asset(&state.db, &auth_user.id, &id, &state.config.storage_root)
+    let found = AssetRepo::purge_asset(&state.db, auth_user.id, id, &state.config.storage_root)
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?;
 
     if !found {
         return Err(AppError::NotFound(format!("Asset {} not found", id)));
-    }
-
-    // Also remove from in-memory SIMD cache if present
-    if let Ok(clip_cache) = state.coordinator.ensure_clip_cache().await {
-        clip_cache.remove(&auth_user.id, &id).await;
     }
 
     Ok(StatusCode::NO_CONTENT)
@@ -188,7 +179,7 @@ pub async fn batch_toggle_soft_delete(
         return Ok(Json(BatchActionResponse { affected_count: 0 }));
     }
 
-    let affected_count = AssetRepo::batch_toggle_soft_delete(&state.db, &auth_user.id, &payload.ids)
+    let affected_count = AssetRepo::batch_toggle_soft_delete(&state.db, auth_user.id, &payload.ids)
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?;
 
@@ -205,16 +196,14 @@ pub async fn batch_purge_assets(
         return Ok(Json(BatchActionResponse { affected_count: 0 }));
     }
 
-    let affected_count = AssetRepo::batch_purge(&state.db, &auth_user.id, &payload.ids, &state.config.storage_root)
-        .await
-        .map_err(|e| AppError::Internal(e.to_string()))?;
-
-    // Evict all purged items from SIMD vector cache
-    if let Ok(clip_cache) = state.coordinator.ensure_clip_cache().await {
-        for id in &payload.ids {
-            clip_cache.remove(&auth_user.id, id).await;
-        }
-    }
+    let affected_count = AssetRepo::batch_purge(
+        &state.db,
+        auth_user.id,
+        &payload.ids,
+        &state.config.storage_root,
+    )
+    .await
+    .map_err(|e| AppError::Internal(e.to_string()))?;
 
     Ok(Json(BatchActionResponse { affected_count }))
 }
@@ -223,21 +212,19 @@ pub async fn batch_purge_assets(
 pub async fn get_similar_assets(
     State(state): State<AppState>,
     auth_user: AuthUser,
-    AxumPath(id): AxumPath<String>,
+    AxumPath(id): AxumPath<Uuid>,
 ) -> Result<Json<Vec<SimilarMediaItem>>, AppError> {
-    let clip_cache = state
-        .coordinator
-        .ensure_clip_cache()
-        .await
-        .map_err(AppError::Internal)?;
+    let rows = db::CacheRepo::search_similar_by_asset_id(
+        &state.db,
+        auth_user.id,
+        id,
+        0.55,
+        12,
+    )
+    .await
+    .map_err(|e| AppError::Internal(e.to_string()))?;
 
-    // Hardware SIMD search via media_processing crate
-    let search_results = clip_cache
-        .find_similar_for_user(&auth_user.id, &id, 0.55, 12)
-        .await;
-
-    // Zero-overhead field projection into API model
-    let response: Vec<SimilarMediaItem> = search_results
+    let response: Vec<SimilarMediaItem> = rows
         .into_iter()
         .map(|item| SimilarMediaItem {
             id: item.id,
@@ -250,7 +237,7 @@ pub async fn get_similar_assets(
     Ok(Json(response))
 }
 
-async fn resolve_hybrid_query(state: &AppState, user_id: &str, q: &mut MediaQuery) {
+async fn resolve_hybrid_query(state: &AppState, user_id: Uuid, q: &mut MediaQuery) {
     let raw_q = match q.q.as_deref().map(str::trim) {
         Some(s) if !s.is_empty() => s,
         _ => return,
@@ -258,9 +245,9 @@ async fn resolve_hybrid_query(state: &AppState, user_id: &str, q: &mut MediaQuer
 
     let mut words: Vec<String> = raw_q.split_whitespace().map(String::from).collect();
 
-    // 1. Resolve matching person identities for this user
-    let named_persons: Vec<(String, String)> = sqlx::query_as(
-        "SELECT id, name FROM persons WHERE user_id = ? AND name IS NOT NULL"
+    // 1. Resolve matching person identities for this user in PostgreSQL ($1)
+    let named_persons: Vec<(Uuid, String)> = sqlx::query_as(
+        "SELECT id, name FROM persons WHERE user_id = $1 AND name IS NOT NULL"
     )
     .bind(user_id)
     .fetch_all(&state.db)
@@ -270,9 +257,10 @@ async fn resolve_hybrid_query(state: &AppState, user_id: &str, q: &mut MediaQuer
     for (pid, name) in named_persons {
         let name_lower = name.to_lowercase();
         if let Some(pos) = words.iter().position(|w| w.to_lowercase() == name_lower) {
+            let pid_str = pid.to_string();
             q.person_id = match q.person_id.take() {
-                Some(existing) => Some(format!("{},{}", existing, pid)),
-                None => Some(pid),
+                Some(existing) => Some(format!("{},{}", existing, pid_str)),
+                None => Some(pid_str),
             };
             words.remove(pos);
             break;
@@ -281,7 +269,7 @@ async fn resolve_hybrid_query(state: &AppState, user_id: &str, q: &mut MediaQuer
 
     let visual_prompt = words.join(" ");
 
-    // 2. Run hardware SIMD search if tokens remain
+    // 2. Text embedding generation via ONNX + pgvector HNSW query in PostgreSQL
     if !visual_prompt.is_empty() {
         let clip_engine = match state.coordinator.ensure_search_engine().await {
             Ok(engine) => engine,
@@ -291,32 +279,29 @@ async fn resolve_hybrid_query(state: &AppState, user_id: &str, q: &mut MediaQuer
             }
         };
 
-        let clip_cache = match state.coordinator.ensure_clip_cache().await {
-            Ok(cache) => cache,
-            Err(e) => {
-                error!("Failed to acquire CLIP cache: {}", e);
-                return;
-            }
-        };
-
         if let Ok(text_vector) = clip_engine.extract_text_embedding(&visual_prompt) {
-            let matches = clip_cache.search_by_vector(user_id, &text_vector, 0.24, 200).await;
-            let matched_ids: Vec<String> = matches.into_iter().map(|(id, _)| id).collect();
-
-            q.candidate_ids = Some(matched_ids);
-            q.q = None;
+            match db::CacheRepo::search_by_vector(&state.db, user_id, &text_vector, 0.24, 200).await {
+                Ok(matched_ids) => {
+                    q.candidate_ids = Some(matched_ids);
+                    q.q = None;
+                }
+                Err(e) => {
+                    error!("pgvector search error: {}", e);
+                }
+            }
         }
     } else {
         q.q = None;
     }
 }
 
+/// GET /api/media/locations
 pub async fn get_media_locations(
     State(state): State<AppState>,
     user: AuthUser,
     Query(query): Query<MapLocationsQuery>,
 ) -> Result<Json<Vec<MapLocationPoint>>, (StatusCode, String)> {
-    match AssetRepo::query_locations(&state.db, &user.id, &query).await {
+    match AssetRepo::query_locations(&state.db, user.id, &query).await {
         Ok(points) => Ok(Json(points)),
         Err(e) => {
             error!(
@@ -336,9 +321,9 @@ pub async fn get_media_locations(
 pub async fn get_asset_poses(
     State(state): State<AppState>,
     auth_user: AuthUser,
-    AxumPath(asset_id): AxumPath<String>,
+    AxumPath(asset_id): AxumPath<Uuid>,
 ) -> Result<Json<Vec<AssetPoseDetail>>, AppError> {
-    let poses = AssetRepo::get_asset_poses(&state.db, &auth_user.id, &asset_id)
+    let poses = AssetRepo::get_asset_poses(&state.db, auth_user.id, asset_id)
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?;
 

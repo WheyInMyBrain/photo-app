@@ -1,14 +1,15 @@
 // photo-app/crates/db/src/tag_repo.rs
 
 use crate::domain::tag::AssetTagItem;
-use sqlx::{QueryBuilder, Row, Sqlite, SqlitePool, Transaction};
+use sqlx::{PgConnection, PgPool, Row};
 use std::collections::HashMap;
+use uuid::Uuid;
 
 #[derive(Debug, Clone)]
 pub struct IngestionTagInput {
     pub name: String,
     pub confidence: f32,
-    pub category: i32, // 0 = General/ML, 1 = Hashtag, 2 = Author/Creator
+    pub category: i32,  // 0 = General/ML, 1 = Hashtag, 2 = Author/Creator
     pub source: String, // "model", "manual", "scraped"
 }
 
@@ -46,8 +47,8 @@ pub struct TagRepo;
 impl TagRepo {
     /// Fetch all tags attached to a specific asset
     pub async fn get_by_asset(
-        pool: &SqlitePool,
-        asset_id: &str,
+        pool: &PgPool,
+        asset_id: Uuid,
     ) -> Result<Vec<AssetTagItem>, sqlx::Error> {
         let rows = sqlx::query(
             r#"
@@ -58,7 +59,7 @@ impl TagRepo {
                 at.source
             FROM asset_tags at
             JOIN tags t ON at.tag_id = t.id
-            WHERE at.asset_id = ?1
+            WHERE at.asset_id = $1
             ORDER BY at.confidence DESC
             "#,
         )
@@ -68,32 +69,31 @@ impl TagRepo {
 
         let tags = rows
             .into_iter()
-            .filter_map(|r| {
-                Some(AssetTagItem {
-                    tag_id: r.try_get("tag_id").ok()?,
-                    name: r.try_get("name").ok()?,
-                    confidence: r.try_get("confidence").unwrap_or(0.0),
-                    source: r.try_get("source").unwrap_or_else(|_| "AI".to_string()),
-                })
+            .map(|r| AssetTagItem {
+                tag_id: r.get("tag_id"),
+                name: r.get("name"),
+                confidence: r.get("confidence"),
+                source: r.get("source"),
             })
             .collect();
 
         Ok(tags)
     }
 
-    /// Flexible transactional batch insert for AI tags, hashtags, and authors
+    /// High-throughput atomic upsert and linkage using a single CTE statement.
+    /// Eliminates Rust-side ID lookups and avoids multiple database roundtrips.
     pub async fn save_asset_tags_tx(
-        tx: &mut Transaction<'_, Sqlite>,
-        user_id: &str,
-        asset_id: &str,
+        conn: &mut PgConnection,
+        user_id: Uuid,
+        asset_id: Uuid,
         tags: &[IngestionTagInput],
     ) -> Result<(), sqlx::Error> {
         if tags.is_empty() {
             return Ok(());
         }
 
-        // Deduplicate input by lowercased name, prioritizing higher confidence
-        let mut deduped: HashMap<String, IngestionTagInput> = HashMap::new();
+        // Deduplicate input by lowercased name, preserving the highest confidence entry
+        let mut deduped: HashMap<String, IngestionTagInput> = HashMap::with_capacity(tags.len());
         for tag in tags {
             let lower = tag.name.trim().to_lowercase();
             if lower.is_empty() {
@@ -113,115 +113,85 @@ impl TagRepo {
             }
         }
 
-        let clean_tags: Vec<IngestionTagInput> = deduped.into_values().collect();
-        if clean_tags.is_empty() {
+        if deduped.is_empty() {
             return Ok(());
         }
 
-        // 1. Batch upsert unique tags per user, bumping usage count on conflict
-        let mut tag_qb: QueryBuilder<Sqlite> = QueryBuilder::new(
-            "INSERT INTO tags (user_id, name, category, usage_count, source) ",
-        );
+        let mut names = Vec::with_capacity(deduped.len());
+        let mut categories = Vec::with_capacity(deduped.len());
+        let mut confidences = Vec::with_capacity(deduped.len());
+        let mut sources = Vec::with_capacity(deduped.len());
+        let mut link_sources = Vec::with_capacity(deduped.len());
 
-        tag_qb.push_values(&clean_tags, |mut b, t| {
-            b.push_bind(user_id)
-                .push_bind(&t.name)
-                .push_bind(t.category)
-                .push_bind(1i64)
-                .push_bind(&t.source);
-        });
-
-        tag_qb.push(
-            " ON CONFLICT(user_id, name COLLATE NOCASE) DO UPDATE SET \
-             usage_count = tags.usage_count + 1",
-        );
-        tag_qb.build().execute(&mut **tx).await?;
-
-        // 2. Fetch tag IDs for linking
-        let mut fetch_qb: QueryBuilder<Sqlite> =
-            QueryBuilder::new("SELECT id, name FROM tags WHERE user_id = ");
-        fetch_qb.push_bind(user_id);
-        fetch_qb.push(" AND name IN (");
-
-        let mut separated = fetch_qb.separated(", ");
-        for t in &clean_tags {
-            separated.push_bind(&t.name);
-        }
-        separated.push_unseparated(")");
-
-        let tag_rows = fetch_qb.build().fetch_all(&mut **tx).await?;
-
-        let tag_map: HashMap<String, i64> = tag_rows
-            .into_iter()
-            .filter_map(|r| {
-                let id: i64 = r.try_get("id").ok()?;
-                let name: String = r.try_get("name").ok()?;
-                Some((name.to_lowercase(), id))
-            })
-            .collect();
-
-        // 3. Link tags into asset_tags
-        let valid_links: Vec<(i64, f64, String)> = clean_tags
-            .iter()
-            .filter_map(|t| {
-                let tag_id = *tag_map.get(&t.name)?;
-                let link_source = match t.source.as_str() {
-                    "scraped" => "SCRAPE",
-                    "manual" => "USER",
-                    _ => "AI",
-                };
-                Some((tag_id, t.confidence as f64, link_source.to_string()))
-            })
-            .collect();
-
-        if !valid_links.is_empty() {
-            let mut link_qb: QueryBuilder<Sqlite> = QueryBuilder::new(
-                "INSERT INTO asset_tags (asset_id, tag_id, confidence, source) ",
-            );
-
-            link_qb.push_values(valid_links, |mut b, (tag_id, conf, src)| {
-                b.push_bind(asset_id)
-                    .push_bind(tag_id)
-                    .push_bind(conf)
-                    .push_bind(src);
-            });
-
-            link_qb.push(
-                " ON CONFLICT(asset_id, tag_id) DO UPDATE SET \
-                 confidence = MAX(excluded.confidence, asset_tags.confidence)",
-            );
-            link_qb.build().execute(&mut **tx).await?;
+        for t in deduped.into_values() {
+            let link_src = match t.source.as_str() {
+                "scraped" => "SCRAPE",
+                "manual" => "USER",
+                _ => "AI",
+            };
+            names.push(t.name);
+            categories.push(t.category);
+            confidences.push(t.confidence);
+            sources.push(t.source);
+            link_sources.push(link_src.to_string());
         }
 
-        // 4. Update FTS5 search index (Delete then insert because FTS5 doesn't support UPSERT)
-        sqlx::query("DELETE FROM asset_search_index WHERE asset_id = ?1")
-            .bind(asset_id)
-            .execute(&mut **tx)
-            .await?;
-
-        let tag_terms: Vec<String> = clean_tags.iter().map(|t| t.name.clone()).collect();
-        let space_separated = tag_terms.join(" ");
-
+        // Single roundtrip: Upserts tags into the catalog and links them into asset_tags directly
         sqlx::query(
             r#"
-            INSERT INTO asset_search_index (asset_id, user_id, tags)
-            VALUES (?1, ?2, ?3)
+            WITH input_data AS (
+                SELECT * FROM UNNEST(
+                    $3::text[], 
+                    $4::int[], 
+                    $5::real[], 
+                    $6::text[], 
+                    $7::text[]
+                ) AS u(name, category, confidence, source, link_source)
+            ),
+            upserted_tags AS (
+                INSERT INTO tags (user_id, name, category, usage_count, source)
+                SELECT 
+                    $1, 
+                    inp.name, 
+                    inp.category, 
+                    1, 
+                    inp.source
+                FROM input_data inp
+                ON CONFLICT (user_id, name) DO UPDATE SET 
+                    usage_count = tags.usage_count + 1
+                RETURNING id, name
+            )
+            INSERT INTO asset_tags (user_id, asset_id, tag_id, confidence, source)
+            SELECT 
+                $1, 
+                $2, 
+                ut.id, 
+                inp.confidence, 
+                inp.link_source
+            FROM input_data inp
+            JOIN upserted_tags ut ON ut.name = inp.name
+            ON CONFLICT (asset_id, tag_id) DO UPDATE SET 
+                confidence = GREATEST(EXCLUDED.confidence, asset_tags.confidence);
             "#,
         )
-        .bind(asset_id)
         .bind(user_id)
-        .bind(space_separated)
-        .execute(&mut **tx)
+        .bind(asset_id)
+        .bind(&names)
+        .bind(&categories)
+        .bind(&confidences)
+        .bind(&sources)
+        .bind(&link_sources)
+        .execute(&mut *conn)
         .await?;
 
         Ok(())
     }
 
-    /// Convenience wrapper for AI tags tuples `(name, confidence)`
+    /// Convenience wrapper for AI tag tuples `(name, confidence)`
     pub async fn save_model_tags_tx(
-        tx: &mut Transaction<'_, Sqlite>,
-        user_id: &str,
-        asset_id: &str,
+        conn: &mut PgConnection,
+        user_id: Uuid,
+        asset_id: Uuid,
         tags: &[(String, f32)],
     ) -> Result<(), sqlx::Error> {
         let inputs: Vec<IngestionTagInput> = tags
@@ -229,6 +199,6 @@ impl TagRepo {
             .map(|(name, conf)| IngestionTagInput::new_ai(name.clone(), *conf))
             .collect();
 
-        Self::save_asset_tags_tx(tx, user_id, asset_id, &inputs).await
+        Self::save_asset_tags_tx(conn, user_id, asset_id, &inputs).await
     }
 }

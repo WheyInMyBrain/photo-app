@@ -1,5 +1,8 @@
+// photo-app/backend/src/services/cache.rs
+
 use db::CacheRepo;
 use media_processing::KnownPersonCluster;
+use sqlx::PgPool;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -9,18 +12,18 @@ pub type SharedClusterCache = Arc<RwLock<HashMap<String, Vec<KnownPersonCluster>
 pub struct ClusterCacheManager;
 
 impl ClusterCacheManager {
-    pub async fn load_initial(pool: &sqlx::SqlitePool) -> Result<SharedClusterCache, sqlx::Error> {
+    pub async fn load_initial(pool: &PgPool) -> Result<SharedClusterCache, sqlx::Error> {
         let raw_clusters = CacheRepo::fetch_all_person_clusters(pool).await?;
         let mut user_buckets: HashMap<String, Vec<KnownPersonCluster>> = HashMap::new();
 
         for rc in raw_clusters {
             user_buckets
-                .entry(rc.user_id)
+                .entry(rc.user_id.to_string())
                 .or_default()
                 .push(KnownPersonCluster {
-                    person_id: rc.id,
+                    person_id: rc.id.to_string(),
                     face_count: rc.face_count as i32,
-                    cover_face_id: rc.cover_face_id,
+                    cover_face_id: rc.cover_face_id.map(|id| id.to_string()),
                     exemplars: rc.exemplars,
                 });
         }

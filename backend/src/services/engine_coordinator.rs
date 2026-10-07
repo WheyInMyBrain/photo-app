@@ -3,15 +3,14 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use sqlx::SqlitePool;
+use sqlx::PgPool;
 use tokio::sync::{Mutex, RwLock};
 use tracing::info;
 
 use crate::config::Config;
-use crate::services::clip_cache::load_clip_cache;
-use crate::services::cluster_cache::{ClusterCacheManager, SharedClusterCache};
+use crate::services::cache::{ClusterCacheManager, SharedClusterCache};
 
-use media_processing::{ClipCacheManager, ClipEngine, FaceEngine, MediaEngine, TagEngine, YoloEngine};
+use media_processing::{ClipEngine, FaceEngine, MediaEngine, TagEngine, YoloEngine};
 
 /// Generic container that manages a resource's lazy loading and idle eviction.
 struct ManagedResource<T> {
@@ -21,9 +20,7 @@ struct ManagedResource<T> {
     idle_timeout: Duration,
 }
 
-// Direct FFI bindings to tell allocators to release memory arenas to the OS
 extern "C" {
-    // mimalloc's internal collect function (force = true releases cached pages)
     fn mi_collect(force: bool);
 
     #[cfg(target_os = "macos")]
@@ -92,7 +89,6 @@ impl<T: Send + Sync + 'static> ManagedResource<T> {
         F: FnOnce() -> Fut,
         Fut: std::future::Future<Output = Result<T, E>>,
     {
-        // 1. Fast read-lock check
         {
             let read_guard = self.instance.read().await;
             if let Some(existing) = &*read_guard {
@@ -101,7 +97,6 @@ impl<T: Send + Sync + 'static> ManagedResource<T> {
             }
         }
 
-        // 2. Write-lock check and load
         let mut write_guard = self.instance.write().await;
         if let Some(existing) = &*write_guard {
             *self.last_accessed.lock().await = Instant::now();
@@ -109,10 +104,7 @@ impl<T: Send + Sync + 'static> ManagedResource<T> {
         }
 
         let before_ram = get_process_rss_mb();
-        info!(
-            "[RAM: {:.2} MB] -> Loading '{}' into memory...",
-            before_ram, self.name
-        );
+        info!("[RAM: {:.2} MB] -> Loading '{}' into memory...", before_ram, self.name);
 
         let start = Instant::now();
         let loaded = loader().await?;
@@ -151,9 +143,8 @@ impl<T: Send + Sync + 'static> ManagedResource<T> {
                     before_ram, self.name
                 );
 
-                *write_guard = None; // Drops Rust & C++ session handles
+                *write_guard = None;
 
-                // Force mimalloc and macOS system allocator to release cached arenas
                 unsafe {
                     mi_collect(true);
 
@@ -161,7 +152,6 @@ impl<T: Send + Sync + 'static> ManagedResource<T> {
                     malloc_zone_pressure_relief(std::ptr::null_mut(), 0);
                 }
 
-                // Brief pause so the OS kernel updates resident page statistics
                 tokio::time::sleep(Duration::from_millis(50)).await;
 
                 let after_ram = get_process_rss_mb();
@@ -176,43 +166,37 @@ impl<T: Send + Sync + 'static> ManagedResource<T> {
     }
 }
 
-/// Central coordinator for all transient, heavy resources:
-/// - Tier 2: Vector caches (ClipCache ~20MB, ClusterCache ~1MB)
-/// - Tier 3: AI Inference Engines (ClipEngine ~150MB, Full MediaEngine ~950MB)
+/// Central coordinator for heavy runtime resources:
+/// - ClusterCache (~1MB)
+/// - AI Inference Engines (ClipEngine ~150MB, Full MediaEngine ~950MB)
 #[derive(Clone)]
 pub struct EngineCoordinator {
-    pool: SqlitePool,
+    pool: PgPool,
     models_dir: PathBuf,
     config: Config,
 
-    // Tier 2: In-memory vector caches (5-minute idle eviction)
-    clip_cache: Arc<ManagedResource<ClipCacheManager>>,
+    // Vector cache for person clusters
     cluster_cache: Arc<ManagedResource<SharedClusterCache>>,
 
-    // Tier 3: AI Inference engines (3-minute idle eviction)
+    // ONNX AI engines
     clip_engine: Arc<ManagedResource<ClipEngine>>,
     media_engine: Arc<ManagedResource<MediaEngine>>,
 }
 
 impl EngineCoordinator {
-    pub fn new(pool: SqlitePool, models_dir: PathBuf, config: Config) -> Self {
+    pub fn new(pool: PgPool, models_dir: PathBuf, config: Config) -> Self {
         let ai_enabled = config.ai.enabled;
 
         let coordinator = Self {
             pool,
             models_dir,
             config,
-            // Caches: 5 minutes idle timeout (300s)
-            clip_cache: Arc::new(ManagedResource::new("ClipCache", 300)),
             cluster_cache: Arc::new(ManagedResource::new("ClusterCache", 300)),
-            // ONNX Models: 3 minutes idle timeout (180s)
             clip_engine: Arc::new(ManagedResource::new("ClipEngine", 180)),
             media_engine: Arc::new(ManagedResource::new("MediaEngine", 180)),
         };
 
-        // Only start background eviction monitor if AI is enabled
         if ai_enabled {
-            let weak_clip_cache = Arc::downgrade(&coordinator.clip_cache);
             let weak_cluster_cache = Arc::downgrade(&coordinator.cluster_cache);
             let weak_clip_engine = Arc::downgrade(&coordinator.clip_engine);
             let weak_media_engine = Arc::downgrade(&coordinator.media_engine);
@@ -221,16 +205,14 @@ impl EngineCoordinator {
                 loop {
                     tokio::time::sleep(Duration::from_secs(30)).await;
 
-                    let c_cache = weak_clip_cache.upgrade();
                     let cl_cache = weak_cluster_cache.upgrade();
                     let c_engine = weak_clip_engine.upgrade();
                     let m_engine = weak_media_engine.upgrade();
 
-                    if c_cache.is_none() && cl_cache.is_none() && c_engine.is_none() && m_engine.is_none() {
+                    if cl_cache.is_none() && c_engine.is_none() && m_engine.is_none() {
                         break;
                     }
 
-                    if let Some(r) = c_cache { r.try_evict().await; }
                     if let Some(r) = cl_cache { r.try_evict().await; }
                     if let Some(r) = c_engine { r.try_evict().await; }
                     if let Some(r) = m_engine { r.try_evict().await; }
@@ -239,29 +221,6 @@ impl EngineCoordinator {
         }
 
         coordinator
-    }
-
-    // -------------------------------------------------------------------------
-    // Tier 2: Lightweight Cache Accessors
-    // -------------------------------------------------------------------------
-
-    /// Ensures the CLIP vector embedding cache is ready in RAM (for similarity lookups)
-    pub async fn ensure_clip_cache(&self) -> Result<ClipCacheManager, String> {
-        if !self.config.ai.enabled || !self.config.ai.enable_clip {
-            return Err("CLIP cache disabled in config".to_string());
-        }
-
-        let pool = self.pool.clone();
-        let arc_cache = self
-            .clip_cache
-            .get_or_load(|| async move {
-                load_clip_cache(&pool)
-                    .await
-                    .map_err(|e| e.to_string())
-            })
-            .await?;
-
-        Ok((*arc_cache).clone())
     }
 
     /// Ensures the Face Cluster centroids are ready in RAM
@@ -283,11 +242,7 @@ impl EngineCoordinator {
         Ok((*arc_shared).clone())
     }
 
-    // -------------------------------------------------------------------------
-    // Tier 3: AI Inference Model Accessors
-    // -------------------------------------------------------------------------
-
-    /// Ensures only the CLIP text encoder is loaded (~150 MB) for natural language search queries
+    /// Ensures the CLIP text encoder is loaded (~150 MB) for natural language search queries
     pub async fn ensure_search_engine(&self) -> Result<Arc<ClipEngine>, String> {
         if !self.config.ai.enabled || !self.config.ai.enable_clip {
             return Err("CLIP search engine disabled in config".to_string());
@@ -305,7 +260,7 @@ impl EngineCoordinator {
             .await
     }
 
-    /// Ensures the pipeline engine is loaded for processing ingested uploads
+    /// Ensures the full pipeline engine is loaded for processing ingested uploads
     pub async fn ensure_pipeline_engine(&self) -> Result<Arc<MediaEngine>, String> {
         if !self.config.ai.enabled {
             return Err("AI pipeline engine disabled in config".to_string());
@@ -327,12 +282,10 @@ impl EngineCoordinator {
             .await
     }
 
-    /// Touch running resources so they stay hot while a long batch is actively processing
     pub async fn keep_warm(&self) {
         if !self.config.ai.enabled {
             return;
         }
-        self.clip_cache.touch().await;
         self.cluster_cache.touch().await;
         self.clip_engine.touch().await;
         self.media_engine.touch().await;

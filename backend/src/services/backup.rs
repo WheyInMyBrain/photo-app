@@ -1,3 +1,5 @@
+// photo-app/backend/src/services/backup.rs
+
 use aes_gcm::{
     aead::{Aead, KeyInit},
     Aes256Gcm, Nonce,
@@ -8,7 +10,7 @@ use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::Client as S3Client;
 use rand::rngs::SysRng;
 use rand::TryRng;
-use sqlx::SqlitePool;
+use sqlx::PgPool;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use tracing::{error, info, warn};
@@ -20,12 +22,12 @@ pub struct BackupService;
 
 impl BackupService {
     pub fn start_scheduler(
-        pool: SqlitePool,
+        pool: PgPool,
         storage_root: PathBuf,
         b2_config: B2Config,
     ) {
         if !b2_config.is_configured() {
-            info!("B2 credentials not fully configured. Backup scheduler disabled.");
+            info!("B2 credentials not configured or incomplete. Backup scheduler disabled.");
             return;
         }
 
@@ -84,7 +86,7 @@ impl BackupService {
     }
 
     pub async fn run_backup_sweep(
-        pool: &SqlitePool,
+        pool: &PgPool,
         storage_root: &Path,
         client: &S3Client,
         bucket: &str,
@@ -110,7 +112,7 @@ impl BackupService {
     }
 
     async fn handle_upload(
-        pool: &SqlitePool,
+        pool: &PgPool,
         storage_root: &Path,
         client: &S3Client,
         bucket: &str,
@@ -189,8 +191,8 @@ impl BackupService {
             Ok(_) => {
                 let _ = BackupRepo::mark_synced(
                     pool,
-                    &item.asset_id,
-                    &item.user_id,
+                    item.asset_id,
+                    item.user_id,
                     &remote_path,
                     &item.sha256,
                 )
@@ -213,13 +215,12 @@ impl BackupService {
     }
 
     async fn handle_deletion(
-        pool: &SqlitePool,
+        pool: &PgPool,
         client: &S3Client,
         bucket: &str,
         item: &BackupCandidate,
         is_encrypted: bool,
     ) {
-        // suggested_remote_path from the query is already the stored remote_path
         let remote_key = if is_encrypted && !item.suggested_remote_path.ends_with(".enc") {
             format!("{}.enc", item.suggested_remote_path)
         } else {
@@ -233,7 +234,7 @@ impl BackupService {
             .send()
             .await;
 
-        let _ = BackupRepo::remove_backup_record(pool, &item.asset_id).await;
+        let _ = BackupRepo::remove_backup_record(pool, item.asset_id).await;
         info!(
             asset_id = %item.asset_id,
             remote = %remote_key,

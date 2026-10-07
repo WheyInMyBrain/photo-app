@@ -1,3 +1,5 @@
+// photo-app/backend/src/routes/auth.rs
+
 use argon2::{
     password_hash::{phc::PasswordHash, PasswordHasher, PasswordVerifier},
     Argon2,
@@ -38,7 +40,7 @@ fn generate_api_key() -> String {
     format!("vlt_{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple())
 }
 
-fn make_session_cookie(user_id: &str) -> HeaderValue {
+fn make_session_cookie(user_id: Uuid) -> HeaderValue {
     HeaderValue::from_str(&format!(
         "app_session={}; HttpOnly; SameSite=Lax; Path=/; Max-Age=2592000",
         user_id
@@ -85,7 +87,7 @@ async fn get_status(
         }
     };
 
-    let (display_name, has_passkey) = AuthRepo::get_user_status(&state.db, &user.id)
+    let (display_name, has_passkey) = AuthRepo::get_user_status(&state.db, user.id)
         .await
         .unwrap_or_default();
 
@@ -130,13 +132,13 @@ async fn register(
         .map_err(|e| AppError::Internal(e.to_string()))?
         .to_string();
 
-    let user_id = Uuid::new_v4().to_string();
+    let user_id = Uuid::new_v4();
     let api_key = generate_api_key();
     let clean_display = payload.display_name.as_deref().map(str::trim).filter(|s| !s.is_empty());
 
     AuthRepo::create_user(
         &state.db,
-        &user_id,
+        user_id,
         username,
         &password_hash,
         clean_display,
@@ -146,14 +148,14 @@ async fn register(
     .map_err(|e| AppError::Internal(e.to_string()))?;
 
     let response_body = AuthSuccessResponse {
-        user_id: user_id.clone(),
+        user_id,
         username: username.to_string(),
         display_name: clean_display.map(String::from),
         api_key,
     };
 
     let mut headers = HeaderMap::new();
-    headers.insert(header::SET_COOKIE, make_session_cookie(&user_id));
+    headers.insert(header::SET_COOKIE, make_session_cookie(user_id));
 
     Ok((StatusCode::CREATED, headers, Json(response_body)).into_response())
 }
@@ -182,20 +184,20 @@ async fn login(
         Some(k) if !k.is_empty() => k,
         _ => {
             let new_key = generate_api_key();
-            let _ = AuthRepo::set_api_key(&state.db, &user.id, &new_key).await;
+            let _ = AuthRepo::set_api_key(&state.db, user.id, &new_key).await;
             new_key
         }
     };
 
     let response_body = AuthSuccessResponse {
-        user_id: user.id.clone(),
+        user_id: user.id,
         username: user.username,
         display_name: user.display_name,
         api_key: active_key,
     };
 
     let mut headers = HeaderMap::new();
-    headers.insert(header::SET_COOKIE, make_session_cookie(&user.id));
+    headers.insert(header::SET_COOKIE, make_session_cookie(user.id));
 
     Ok((StatusCode::OK, headers, Json(response_body)).into_response())
 }
@@ -212,7 +214,7 @@ async fn get_api_key(
     State(state): State<AppState>,
     auth_user: AuthUser,
 ) -> Result<Json<ApiKeyResponse>, AppError> {
-    let key = AuthRepo::get_api_key(&state.db, &auth_user.id)
+    let key = AuthRepo::get_api_key(&state.db, auth_user.id)
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?;
 
@@ -220,7 +222,7 @@ async fn get_api_key(
         Some(k) if !k.is_empty() => k,
         _ => {
             let new_key = generate_api_key();
-            AuthRepo::set_api_key(&state.db, &auth_user.id, &new_key)
+            AuthRepo::set_api_key(&state.db, auth_user.id, &new_key)
                 .await
                 .map_err(|e| AppError::Internal(e.to_string()))?;
             new_key
@@ -237,7 +239,7 @@ async fn rotate_api_key(
 ) -> Result<Json<ApiKeyResponse>, AppError> {
     let new_key = generate_api_key();
 
-    AuthRepo::set_api_key(&state.db, &auth_user.id, &new_key)
+    AuthRepo::set_api_key(&state.db, auth_user.id, &new_key)
         .await
         .map_err(|e| AppError::Internal(e.to_string()))?;
 
@@ -253,7 +255,7 @@ async fn register_biometric(
     AuthRepo::upsert_passkey_credential(
         &state.db,
         &payload.credential_id,
-        &auth_user.id,
+        auth_user.id,
         payload.name.as_deref(),
     )
     .await

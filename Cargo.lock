@@ -794,6 +794,7 @@ dependencies = [
  "media_downloader",
  "media_processing",
  "mimalloc",
+ "pgvector",
  "rand 0.10.2",
  "serde",
  "serde_json",
@@ -1090,6 +1091,7 @@ dependencies = [
  "iana-time-zone",
  "js-sys",
  "num-traits",
+ "serde",
  "wasm-bindgen",
  "windows-link",
 ]
@@ -1451,6 +1453,7 @@ dependencies = [
  "axum",
  "bytemuck",
  "chrono",
+ "pgvector",
  "serde",
  "serde_json",
  "sqlx",
@@ -3499,6 +3502,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 
 [[package]]
+name = "pgvector"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3673cba5b9a124916096a423b806a9f29620972c6c97b08db5f2053e9428b481"
+dependencies = [
+ "sqlx",
+]
+
+[[package]]
 name = "phc"
 version = "0.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4579,6 +4591,7 @@ dependencies = [
  "base64 0.22.1",
  "bytes",
  "cfg-if",
+ "chrono",
  "crc",
  "crossbeam-queue",
  "either",
@@ -4602,6 +4615,7 @@ dependencies = [
  "tokio-stream",
  "tracing",
  "url",
+ "uuid",
 ]
 
 [[package]]
@@ -4652,6 +4666,7 @@ dependencies = [
  "bitflags",
  "byteorder",
  "bytes",
+ "chrono",
  "crc",
  "digest 0.11.3",
  "dotenvy",
@@ -4667,6 +4682,7 @@ dependencies = [
  "sqlx-core",
  "thiserror",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -4679,6 +4695,7 @@ dependencies = [
  "base64 0.22.1",
  "bitflags",
  "byteorder",
+ "chrono",
  "crc",
  "dotenvy",
  "etcetera",
@@ -4701,6 +4718,7 @@ dependencies = [
  "stringprep",
  "thiserror",
  "tracing",
+ "uuid",
  "whoami",
 ]
 
@@ -4711,6 +4729,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "488e99c397a62007e4229aec669a179816339afc6d2620ca6fa420dbee2e982c"
 dependencies = [
  "atoi",
+ "chrono",
  "flume",
  "form_urlencoded",
  "futures-channel",
@@ -4726,6 +4745,7 @@ dependencies = [
  "thiserror",
  "tracing",
  "url",
+ "uuid",
 ]
 
 [[package]]
@@ -5450,6 +5470,7 @@ dependencies = [
  "getrandom 0.4.3",
  "js-sys",
  "rand 0.10.2",
+ "serde_core",
  "wasm-bindgen",
 ]
 

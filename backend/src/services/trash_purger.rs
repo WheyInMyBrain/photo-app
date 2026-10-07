@@ -3,7 +3,7 @@
 use async_recursion::async_recursion;
 use db::album_repo::AlbumRepo;
 use db::asset_repo::AssetRepo;
-use sqlx::SqlitePool;
+use sqlx::PgPool;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 use tokio::time::interval;
@@ -12,20 +12,20 @@ use tracing::{error, info, warn};
 pub struct TrashPurgerService;
 
 impl TrashPurgerService {
-    pub fn start(pool: SqlitePool, storage_root: PathBuf) {
+    pub fn start(pool: PgPool, storage_root: PathBuf) {
         tokio::spawn(async move {
             info!("Storage background maintenance service initialized (Trash purge + Temp cleaner)");
 
             // Runs once every 24 hours
             let mut ticker = interval(Duration::from_secs(24 * 3600));
 
-            // Retention period for abandoned temp chunks/files (e.g., 24 hours)
+            // Retention period for abandoned temp chunks/files (24 hours)
             let temp_retention = Duration::from_secs(24 * 3600);
 
             loop {
                 ticker.tick().await;
 
-                // 1. Purge expired trash media from SQLite and disk
+                // 1. Purge expired trash media from PostgreSQL and disk
                 match AssetRepo::fetch_and_purge_expired_trash(&pool, &storage_root).await {
                     Ok(count) if count > 0 => {
                         info!("Auto-purge completed: permanently purged {} expired assets", count);

@@ -2,45 +2,40 @@
 
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use uuid::Uuid;
 
-/// Scraped / social metadata payload passed along the job queue
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JobPayload {
-    #[serde(default)]
     pub author: Option<String>,
-    #[serde(default)]
     pub platform: Option<String>,
-    #[serde(default)]
     pub source_url: Option<String>,
-    #[serde(default)]
     pub source_post_id: Option<String>,
-    #[serde(default)]
     pub caption: Option<String>,
-    #[serde(default)]
     pub tags: Vec<String>,
-    #[serde(default)]
     pub scraped_item_id: Option<String>,
-    #[serde(default)]
     pub latitude: Option<f64>,
-    #[serde(default)]
     pub longitude: Option<f64>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct DbJob {
-    pub id: String,
-    pub user_id: String,
-    pub asset_id: String,
+    pub id: Uuid,
+    pub user_id: Uuid,
+    pub asset_id: Uuid,
     pub file_name: String,
     pub rel_path: String,
     pub folder_path: String,
     pub disk_path: PathBuf,
     pub sha256: String,
     pub file_size_bytes: i64,
-    pub job_type: String,
+    pub status: String,
+    pub current_stage: String,
     pub payload: Option<JobPayload>,
-    pub ai_faces_done: i64,
-    pub ai_clip_done: i64,
-    pub ai_tags_done: i64,
-    pub ai_poses_done: i64,
+
+    pub assemble_done: bool,
+    pub thumb_done: bool,
+    pub ai_faces_done: bool,
+    pub ai_clip_done: bool,
+    pub ai_tags_done: bool,
+    pub ai_poses_done: bool,
 }

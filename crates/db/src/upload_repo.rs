@@ -1,7 +1,9 @@
-use sqlx::{Result, SqlitePool};
+// photo-app/crates/db/src/upload_repo.rs
+
+use sqlx::{PgPool, Result};
 use uuid::Uuid;
 
-use crate::domain::DbJob;
+use crate::domain::job_repo::DbJob;
 
 pub struct UploadRepo;
 
@@ -11,17 +13,16 @@ impl UploadRepo {
         Uuid::new_v4().to_string()
     }
 
-    /// Insert directly into your existing `processing_jobs` table.
+    /// Insert directly into `processing_jobs`.
     /// If `batch_id` is supplied, insert with status = 'staged'
-    /// so Worker 0 completely ignores it while uploads are in flight.
+    /// so workers ignore it while uploads are in flight.
     pub async fn enqueue_staged_job(
-        pool: &SqlitePool,
+        pool: &PgPool,
         job: &DbJob,
         batch_id: Option<&str>,
     ) -> Result<()> {
         let status = if batch_id.is_some() { "staged" } else { "pending" };
 
-        // Embed batch_id into the existing payload JSON
         let mut payload_value = match &job.payload {
             Some(p) => serde_json::to_value(p).unwrap_or_else(|_| serde_json::json!({})),
             None => serde_json::json!({}),
@@ -33,29 +34,43 @@ impl UploadRepo {
             }
         }
 
-        let payload_json = serde_json::to_string(&payload_value).ok();
-
         sqlx::query(
             r#"
             INSERT INTO processing_jobs (
                 id, user_id, asset_id, file_name, rel_path, folder_path,
-                disk_path, sha256, file_size_bytes, job_type, status, payload
+                disk_path, sha256, file_size_bytes, status, current_stage, payload,
+                assemble_done, thumb_done, ai_faces_done, ai_clip_done, ai_tags_done, ai_poses_done
             )
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+            VALUES (
+                $1, $2, $3, $4, $5, $6,
+                $7, $8, $9, $10, $11, $12,
+                $13, $14, $15, $16, $17, $18
+            )
+            ON CONFLICT (asset_id) DO UPDATE SET
+                disk_path = EXCLUDED.disk_path,
+                payload = EXCLUDED.payload,
+                status = EXCLUDED.status,
+                updated_at = CURRENT_TIMESTAMP
             "#,
         )
-        .bind(&job.id)
-        .bind(&job.user_id)
-        .bind(&job.asset_id)
+        .bind(job.id)
+        .bind(job.user_id)
+        .bind(job.asset_id)
         .bind(&job.file_name)
         .bind(&job.rel_path)
         .bind(&job.folder_path)
-        .bind(job.disk_path.to_string_lossy().to_string())
+        .bind(job.disk_path.to_string_lossy().as_ref())
         .bind(&job.sha256)
         .bind(job.file_size_bytes)
-        .bind(&job.job_type)
         .bind(status)
-        .bind(payload_json)
+        .bind(&job.current_stage)
+        .bind(payload_value)
+        .bind(job.assemble_done)
+        .bind(job.thumb_done)
+        .bind(job.ai_faces_done)
+        .bind(job.ai_clip_done)
+        .bind(job.ai_tags_done)
+        .bind(job.ai_poses_done)
         .execute(pool)
         .await?;
 
@@ -63,10 +78,10 @@ impl UploadRepo {
     }
 
     /// Releases all staged jobs belonging to this batch_id.
-    /// Flips status from 'staged' -> 'pending' using SQLite's native JSON path query.
+    /// Flips status from 'staged' -> 'pending' using Postgres JSONB traversal (`->>`).
     pub async fn commit_batch(
-        pool: &SqlitePool,
-        user_id: &str,
+        pool: &PgPool,
+        user_id: Uuid,
         batch_id: &str,
     ) -> Result<u64> {
         let res = sqlx::query(
@@ -74,9 +89,9 @@ impl UploadRepo {
             UPDATE processing_jobs
             SET status = 'pending',
                 updated_at = CURRENT_TIMESTAMP
-            WHERE user_id = ?1
+            WHERE user_id = $1
               AND status = 'staged'
-              AND json_extract(payload, '$.batch_id') = ?2
+              AND payload->>'batch_id' = $2
             "#,
         )
         .bind(user_id)

@@ -1,7 +1,7 @@
 use image::{DynamicImage, ImageFormat};
 use serde::Deserialize;
 use std::fs::File;
-use std::io::Cursor;
+use std::io::{BufWriter, Cursor};
 use std::path::Path;
 use std::process::Command;
 
@@ -184,6 +184,9 @@ impl VideoProcessor {
     ) -> Result<VideoDerivatives, Box<dyn std::error::Error + Send + Sync>> {
         let path_str = input_path.to_str().ok_or("Invalid path string")?;
 
+        // Ensure the 2-tier target directory exists before executing encoders
+        std::fs::create_dir_all(target_shard_dir)?;
+
         let thumb_name = format!("{}_thumb.webp", asset_id);
         let motion_name = format!("{}_motion.mp4", asset_id);
         let preview_name = format!("{}_preview.mp4", asset_id);
@@ -192,13 +195,13 @@ impl VideoProcessor {
         let motion_dest = target_shard_dir.join(&motion_name);
         let preview_dest = target_shard_dir.join(&preview_name);
 
-        let shard = target_shard_dir
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("00");
+        // Extract 2-tier shard components from asset_id (e.g., "a1" and "b2")
+        let clean_id = asset_id.replace('-', "");
+        let shard_1 = clean_id.get(0..2).unwrap_or("00");
+        let shard_2 = clean_id.get(2..4).unwrap_or("00");
 
-        // 1. Static Thumbnail Poster (Extract single keyframe at 0.5s or start)
-        let seek_time = if duration_seconds > 1.0 { "00:00:00.500" } else { "00:00:00.000" };
+        // 1. Static Poster Thumbnail (Fast seek to 0.5s or 0s)
+        let seek_time = if duration_seconds > 1.0 { "0.500" } else { "0.000" };
         let thumb_output = Command::new("ffmpeg")
             .args([
                 "-ss", seek_time,
@@ -210,23 +213,34 @@ impl VideoProcessor {
             ])
             .output()?;
 
-        if thumb_output.status.success() && !thumb_output.stdout.is_empty() {
-            let img = image::load(Cursor::new(&thumb_output.stdout), ImageFormat::Jpeg)?;
-            let thumb = img.thumbnail(320, 320);
-            let mut f = File::create(&thumb_dest)?;
-            thumb.write_to(&mut f, ImageFormat::WebP)?;
+        if !thumb_output.status.success() || thumb_output.stdout.is_empty() {
+            let err = String::from_utf8_lossy(&thumb_output.stderr);
+            return Err(format!("FFmpeg failed generating poster frame: {err}").into());
         }
 
-        // 2. Motion Hover Clip: 480p silent loop, max 5 seconds, -movflags +faststart
-        let motion_dur = if duration_seconds > 0.0 { duration_seconds.min(5.0) } else { 5.0 };
-        let _ = Command::new("ffmpeg")
+        let img = image::load(Cursor::new(&thumb_output.stdout), ImageFormat::Jpeg)?;
+        let thumb = img.thumbnail(320, 320);
+        {
+            let f = File::create(&thumb_dest)?;
+            let mut writer = BufWriter::with_capacity(64 * 1024, f);
+            thumb.write_to(&mut writer, ImageFormat::WebP)?;
+        }
+
+        // Bounded scale filter: maintains aspect ratio while bounding within target box
+        // and guarantees even dimensions for yuv420p
+        let scale_480p = "scale=480:480:force_original_aspect_ratio=decrease,scale=trunc(iw/2)*2:trunc(ih/2)*2";
+        let scale_720p = "scale=1280:720:force_original_aspect_ratio=decrease,scale=trunc(iw/2)*2:trunc(ih/2)*2";
+
+        // 2. Motion Hover Clip (480p silent loop, max 4s, CRF 28)
+        let motion_dur = if duration_seconds > 0.0 { duration_seconds.min(4.0) } else { 4.0 };
+        let motion_status = Command::new("ffmpeg")
             .args([
                 "-y",
                 "-ss", seek_time,
                 "-t", &format!("{:.2}", motion_dur),
                 "-i", path_str,
-                "-an", // Strip audio
-                "-vf", "scale='min(480,iw)':-2", // Keep aspect ratio, force even dimensions
+                "-an",
+                "-vf", scale_480p,
                 "-c:v", "libx264",
                 "-preset", "veryfast",
                 "-crf", "28",
@@ -234,29 +248,40 @@ impl VideoProcessor {
                 "-movflags", "+faststart",
                 motion_dest.to_str().ok_or("Invalid motion path")?,
             ])
-            .output();
+            .output()?;
 
-        // 3. Web-Streamable Preview Video: 720p max, H.264 + AAC audio, -movflags +faststart
-        let _ = Command::new("ffmpeg")
+        if !motion_status.status.success() {
+            let err = String::from_utf8_lossy(&motion_status.stderr);
+            return Err(format!("FFmpeg failed generating motion preview: {err}").into());
+        }
+
+        // 3. Web Streaming Proxy (720p, H.264 + AAC, FastStart)
+        let preview_status = Command::new("ffmpeg")
             .args([
                 "-y",
                 "-i", path_str,
-                "-vf", "scale='min(1280,iw)':-2",
+                "-vf", scale_720p,
                 "-c:v", "libx264",
                 "-preset", "veryfast",
                 "-crf", "23",
                 "-c:a", "aac",
                 "-b:a", "128k",
+                "-ac", "2",
                 "-pix_fmt", "yuv420p",
                 "-movflags", "+faststart",
                 preview_dest.to_str().ok_or("Invalid preview path")?,
             ])
-            .output();
+            .output()?;
+
+        if !preview_status.status.success() {
+            let err = String::from_utf8_lossy(&preview_status.stderr);
+            return Err(format!("FFmpeg failed generating preview video: {err}").into());
+        }
 
         Ok(VideoDerivatives {
-            thumb_rel: format!("{}/{}", shard, thumb_name),
-            motion_rel: format!("{}/{}", shard, motion_name),
-            preview_rel: format!("{}/{}", shard, preview_name),
+            thumb_rel: format!("{}/{}/{}", shard_1, shard_2, thumb_name),
+            motion_rel: format!("{}/{}/{}", shard_1, shard_2, motion_name),
+            preview_rel: format!("{}/{}/{}", shard_1, shard_2, preview_name),
         })
     }
 }

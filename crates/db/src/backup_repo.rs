@@ -1,10 +1,13 @@
-use sqlx::{Row, SqlitePool};
+// photo-app/crates/db/src/backup_repo.rs
+
+use sqlx::{PgPool, Row};
 use std::collections::HashSet;
+use uuid::Uuid;
 
 #[derive(Debug, Clone)]
 pub struct BackupCandidate {
-    pub asset_id: String,
-    pub user_id: String,
+    pub asset_id: Uuid,
+    pub user_id: Uuid,
     pub username: String,
     pub disk_rel_path: String,
     pub suggested_remote_path: String,
@@ -19,7 +22,7 @@ impl BackupRepo {
     /// 1. New/modified active assets needing upload (is_deleted = false)
     /// 2. Orphaned backups where local asset was hard-deleted (is_deleted = true)
     pub async fn fetch_pending_sync_items(
-        pool: &SqlitePool,
+        pool: &PgPool,
     ) -> Result<Vec<BackupCandidate>, sqlx::Error> {
         let mut candidates = Vec::new();
 
@@ -37,7 +40,7 @@ impl BackupRepo {
             FROM assets a
             JOIN users u ON a.user_id = u.id
             LEFT JOIN asset_backups b ON a.id = b.asset_id
-            WHERE u.backup_enabled = 1
+            WHERE u.backup_enabled = TRUE
               AND a.deleted_at IS NULL
               AND (
                   b.asset_id IS NULL
@@ -52,8 +55,8 @@ impl BackupRepo {
         let mut seen_paths: HashSet<String> = HashSet::new();
 
         for r in upload_rows {
-            let asset_id: String = r.get("asset_id");
-            let user_id: String = r.get("user_id");
+            let asset_id: Uuid = r.get("asset_id");
+            let user_id: Uuid = r.get("user_id");
             let username: String = r.get("username");
             let disk_rel_path: String = r.get("disk_rel_path");
             let folder_path: String = r.get("folder_path");
@@ -136,19 +139,19 @@ impl BackupRepo {
     }
 
     pub async fn mark_synced(
-        pool: &SqlitePool,
-        asset_id: &str,
-        user_id: &str,
+        pool: &PgPool,
+        asset_id: Uuid,
+        user_id: Uuid,
         remote_path: &str,
         sha256: &str,
     ) -> Result<(), sqlx::Error> {
         sqlx::query(
             r#"
             INSERT INTO asset_backups (asset_id, user_id, remote_path, synced_sha256, backed_up_at)
-            VALUES (?1, ?2, ?3, ?4, CURRENT_TIMESTAMP)
-            ON CONFLICT(asset_id) DO UPDATE SET
-                remote_path = excluded.remote_path,
-                synced_sha256 = excluded.synced_sha256,
+            VALUES ($1, $2, $3, $4, CURRENT_TIMESTAMP)
+            ON CONFLICT (asset_id) DO UPDATE SET
+                remote_path = EXCLUDED.remote_path,
+                synced_sha256 = EXCLUDED.synced_sha256,
                 backed_up_at = CURRENT_TIMESTAMP
             "#,
         )
@@ -163,10 +166,10 @@ impl BackupRepo {
     }
 
     pub async fn remove_backup_record(
-        pool: &SqlitePool,
-        asset_id: &str,
+        pool: &PgPool,
+        asset_id: Uuid,
     ) -> Result<(), sqlx::Error> {
-        sqlx::query("DELETE FROM asset_backups WHERE asset_id = ?1")
+        sqlx::query("DELETE FROM asset_backups WHERE asset_id = $1")
             .bind(asset_id)
             .execute(pool)
             .await?;

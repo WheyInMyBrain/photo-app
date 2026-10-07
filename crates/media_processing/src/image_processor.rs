@@ -2,6 +2,7 @@ use image::{DynamicImage, ImageFormat, ImageReader, RgbImage};
 use libheif_rs::{ColorSpace, HeifContext, ItemId, LibHeif, RgbChroma};
 use std::fs::File;
 use std::path::Path;
+use std::io::BufWriter;
 use std::time::Instant;
 use tracing::{debug, info};
 
@@ -173,41 +174,45 @@ impl ImageProcessor {
     ) -> Result<(String, String), Box<dyn std::error::Error + Send + Sync>> {
         let total_start = Instant::now();
 
+        // Ensure the 2-tier target directory exists before writing
+        std::fs::create_dir_all(target_shard_dir)?;
+
         let thumb_name = format!("{}_thumb.webp", asset_id);
         let preview_name = format!("{}_preview.webp", asset_id);
 
         let thumb_file_path = target_shard_dir.join(&thumb_name);
         let preview_file_path = target_shard_dir.join(&preview_name);
 
-        // 1. Generate High-Res Preview first (1600px max edge)
+        // 1. High-Res Preview (1600px boundary)
         let t_preview_resize_start = Instant::now();
         let preview = img.thumbnail(1600, 1600);
         let t_preview_resize = t_preview_resize_start.elapsed();
 
         let t_preview_write_start = Instant::now();
-        let mut preview_file = File::create(&preview_file_path)?;
-        preview.write_to(&mut preview_file, ImageFormat::WebP)?;
-        preview_file.sync_all().ok();
-        drop(preview_file);
+        {
+            let file = File::create(&preview_file_path)?;
+            let mut writer = BufWriter::with_capacity(128 * 1024, file);
+            preview.write_to(&mut writer, ImageFormat::WebP)?;
+        }
         let t_preview_write = t_preview_write_start.elapsed();
 
-        // 2. Generate Grid Thumbnail FROM THE PREVIEW (320px)
-        // Downscaling 1600 -> 320 is ~5-10x faster than downscaling 8000 -> 320
+        // 2. Fast Grid Thumbnail downscaled from preview (320px boundary)
         let t_thumb_resize_start = Instant::now();
         let thumb = preview.thumbnail(320, 320);
         let t_thumb_resize = t_thumb_resize_start.elapsed();
 
         let t_thumb_write_start = Instant::now();
-        let mut thumb_file = File::create(&thumb_file_path)?;
-        thumb.write_to(&mut thumb_file, ImageFormat::WebP)?;
-        thumb_file.sync_all().ok();
-        drop(thumb_file);
+        {
+            let file = File::create(&thumb_file_path)?;
+            let mut writer = BufWriter::with_capacity(64 * 1024, file);
+            thumb.write_to(&mut writer, ImageFormat::WebP)?;
+        }
         let t_thumb_write = t_thumb_write_start.elapsed();
 
-        let shard = target_shard_dir
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("00");
+        // Extract 2-tier shard components from asset_id (e.g., "a1" and "b2")
+        let clean_id = asset_id.replace('-', "");
+        let shard_1 = clean_id.get(0..2).unwrap_or("00");
+        let shard_2 = clean_id.get(2..4).unwrap_or("00");
 
         info!(
             target: "perf",
@@ -221,8 +226,8 @@ impl ImageProcessor {
         );
 
         Ok((
-            format!("{}/{}", shard, thumb_name),
-            format!("{}/{}", shard, preview_name),
+            format!("{}/{}/{}", shard_1, shard_2, thumb_name),
+            format!("{}/{}/{}", shard_1, shard_2, preview_name),
         ))
     }
 }
