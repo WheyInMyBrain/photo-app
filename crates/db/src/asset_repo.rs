@@ -480,7 +480,6 @@ impl AssetRepo {
             .unwrap_or_default();
 
         // Project ONLY the lightweight columns required for aggregation.
-        // Never select a.* (avoids copying large BLOBs/JSON into SQLite temporary storage).
         let build_cte = || {
             let mut builder: QueryBuilder<Sqlite> = QueryBuilder::new(
                 "WITH filtered AS ( \
@@ -497,8 +496,7 @@ impl AssetRepo {
                     FROM assets a "
             );
 
-            // If an album filter is present, JOIN directly on album_assets
-            // This utilizes idx_album_assets_cover_lookup instead of scanning the full table
+            // Directly join album_assets if album filter is specified
             if let Some(ref album_id) = q.album_id {
                 builder.push(" JOIN album_assets aa ON aa.asset_id = a.id AND aa.album_id = ");
                 builder.push_bind(album_id);
@@ -625,7 +623,7 @@ impl AssetRepo {
         let min_date: Option<String> = stats_row.try_get("min_d").ok();
         let max_date: Option<String> = stats_row.try_get("max_d").ok();
 
-        // 2. Timeline Milestones
+        // 2. Full Timeline Milestones
         let mut timeline_builder = build_cte();
         timeline_builder.push(
             r#"
@@ -687,14 +685,13 @@ impl AssetRepo {
             })
             .collect();
 
-        // 4. People breakdown
+        // 4. People breakdown: Drives directly from asset_id clustered index
         let mut people_builder = build_cte();
         people_builder.push(
             r#"
             SELECT p.id, p.name, COUNT(DISTINCT af.asset_id) as count
             FROM asset_faces af
             JOIN persons p ON af.person_id = p.id
-            JOIN filtered f ON af.asset_id = f.id
             WHERE p.user_id = 
             "#
         );
@@ -702,7 +699,8 @@ impl AssetRepo {
         people_builder.push(
             r#"
               AND p.name IS NOT NULL
-            GROUP BY p.id 
+              AND af.asset_id IN (SELECT id FROM filtered)
+            GROUP BY p.id, p.name
             ORDER BY count DESC 
             LIMIT 30
             "#
@@ -717,20 +715,20 @@ impl AssetRepo {
             })
             .collect();
 
-        // 5. Tags breakdown
+        // 5. Tags breakdown: Drives directly from asset_tags primary key (asset_id, tag_id)
         let mut tags_builder = build_cte();
         tags_builder.push(
             r#"
             SELECT t.name, COUNT(DISTINCT at.asset_id) as count
             FROM asset_tags at
             JOIN tags t ON at.tag_id = t.id
-            JOIN filtered f ON at.asset_id = f.id
             WHERE t.user_id = 
             "#
         );
         tags_builder.push_bind(user_id);
         tags_builder.push(
             r#"
+              AND at.asset_id IN (SELECT id FROM filtered)
             GROUP BY t.id, t.name
             ORDER BY count DESC 
             LIMIT 40
