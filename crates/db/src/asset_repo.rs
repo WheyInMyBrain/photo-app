@@ -479,8 +479,30 @@ impl AssetRepo {
             .map(|s| s.split(',').map(|t| t.trim().to_lowercase()).filter(|t| !t.is_empty()).collect())
             .unwrap_or_default();
 
+        // Project ONLY the lightweight columns required for aggregation.
+        // Never select a.* (avoids copying large BLOBs/JSON into SQLite temporary storage).
         let build_cte = || {
-            let mut builder: QueryBuilder<Sqlite> = QueryBuilder::new("WITH filtered AS (SELECT a.* FROM assets a ");
+            let mut builder: QueryBuilder<Sqlite> = QueryBuilder::new(
+                "WITH filtered AS ( \
+                    SELECT \
+                        a.id, \
+                        a.duration_seconds, \
+                        a.captured_at, \
+                        a.year, \
+                        a.month, \
+                        a.hour, \
+                        a.city, \
+                        a.camera_model, \
+                        a.folder_path \
+                    FROM assets a "
+            );
+
+            // If an album filter is present, JOIN directly on album_assets
+            // This utilizes idx_album_assets_cover_lookup instead of scanning the full table
+            if let Some(ref album_id) = q.album_id {
+                builder.push(" JOIN album_assets aa ON aa.asset_id = a.id AND aa.album_id = ");
+                builder.push_bind(album_id);
+            }
 
             if fts_query.is_some() {
                 builder.push(" JOIN asset_search_index fts ON fts.asset_id = a.id ");
@@ -552,14 +574,6 @@ impl AssetRepo {
                 builder.push(") ");
             }
 
-            if let Some(ref album_id) = q.album_id {
-                builder.push(" AND a.id IN (SELECT aa.asset_id FROM album_assets aa JOIN albums alb ON aa.album_id = alb.id WHERE alb.id = ");
-                builder.push_bind(album_id);
-                builder.push(" AND alb.user_id = ");
-                builder.push_bind(user_id);
-                builder.push(") ");
-            }
-
             if let Some(ref folder) = q.folder_path {
                 builder.push(" AND a.folder_path = ");
                 builder.push_bind(folder);
@@ -585,7 +599,7 @@ impl AssetRepo {
             builder
         };
 
-        // 1. Primary counts and date bounds (Min & Max for Range Slider)
+        // 1. Primary counts and date bounds
         let mut stats_builder = build_cte();
         stats_builder.push(
             r#"
@@ -611,7 +625,7 @@ impl AssetRepo {
         let min_date: Option<String> = stats_row.try_get("min_d").ok();
         let max_date: Option<String> = stats_row.try_get("max_d").ok();
 
-        // 2. Full Timeline Milestones (for the Scrubber)
+        // 2. Timeline Milestones
         let mut timeline_builder = build_cte();
         timeline_builder.push(
             r#"
@@ -717,7 +731,7 @@ impl AssetRepo {
         tags_builder.push_bind(user_id);
         tags_builder.push(
             r#"
-            GROUP BY t.id 
+            GROUP BY t.id, t.name
             ORDER BY count DESC 
             LIMIT 40
             "#
@@ -776,7 +790,7 @@ impl AssetRepo {
             })
             .collect();
 
-        // 8. Folders / Albums breakdown
+        // 8. Folders breakdown
         let mut album_builder = build_cte();
         album_builder.push(
             r#"

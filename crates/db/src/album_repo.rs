@@ -39,7 +39,7 @@ impl AlbumRepo {
         pool: &SqlitePool,
         user_id: &str,
         current_path: &str,
-    ) -> Result<Vec<SubAlbumRecord>> {
+    ) -> Result<Vec<SubAlbumRecord>, sqlx::Error> {
         let names: Vec<String> = if current_path.is_empty() {
             let rows = sqlx::query(
                 r#"
@@ -119,7 +119,7 @@ impl AlbumRepo {
                 name,
                 full_path: child_full_path,
                 media_count: row.try_get("count").unwrap_or(0),
-                cover_thumb: row.try_get("cover_thumb").ok(),
+                cover_thumb: row.try_get("cover_thumb").ok().flatten(),
             });
         }
 
@@ -151,7 +151,7 @@ impl AlbumRepo {
     // =======================================================================
 
     /// List all custom/smart albums for a user with dynamic cover resolution
-    pub async fn list_custom_albums(pool: &SqlitePool, user_id: &str) -> Result<Vec<AlbumRecord>> {
+    pub async fn list_custom_albums(pool: &SqlitePool, user_id: &str) -> Result<Vec<AlbumRecord>, sqlx::Error> {
         let rows = sqlx::query(
             r#"
             SELECT 
@@ -164,7 +164,15 @@ impl AlbumRepo {
                 a.filter_criteria,
                 a.created_at,
                 a.updated_at,
-                (SELECT COUNT(*) FROM album_assets aa JOIN assets ast ON aa.asset_id = ast.id WHERE aa.album_id = a.id AND ast.deleted_at IS NULL) AS media_count,
+                COALESCE(
+                    (
+                        SELECT COUNT(*) 
+                        FROM album_assets aa 
+                        JOIN assets ast ON aa.asset_id = ast.id 
+                        WHERE aa.album_id = a.id AND ast.deleted_at IS NULL
+                    ), 
+                    0
+                ) AS media_count,
                 COALESCE(
                     (SELECT thumb_path FROM assets WHERE id = a.cover_asset_id AND deleted_at IS NULL),
                     (
@@ -187,18 +195,35 @@ impl AlbumRepo {
 
         let mut albums = Vec::with_capacity(rows.len());
         for r in rows {
+            let media_count: i64 = r
+                .try_get("media_count")
+                .or_else(|_| r.try_get::<i32, _>("media_count").map(|c| c as i64))
+                .unwrap_or(0);
+
+            // Handles raw string or JSON column storage
+            let filter_criteria: Option<String> = r
+                .try_get::<Option<String>, _>("filter_criteria")
+                .ok()
+                .flatten()
+                .or_else(|| {
+                    r.try_get::<Option<serde_json::Value>, _>("filter_criteria")
+                        .ok()
+                        .flatten()
+                        .map(|v| v.to_string())
+                });
+
             albums.push(AlbumRecord {
-                id: r.get("id"),
-                user_id: r.get("user_id"),
-                title: r.get("title"),
-                description: r.get("description"),
-                album_type: r.get("album_type"),
-                cover_asset_id: r.get("cover_asset_id"),
-                cover_thumb: r.get("cover_thumb"),
-                media_count: r.get("media_count"),
-                filter_criteria: r.get("filter_criteria"),
-                created_at: r.get("created_at"),
-                updated_at: r.get("updated_at"),
+                id: r.try_get("id").unwrap_or_default(),
+                user_id: r.try_get("user_id").unwrap_or_default(),
+                title: r.try_get("title").unwrap_or_default(),
+                description: r.try_get("description").ok().flatten(),
+                album_type: r.try_get("album_type").unwrap_or_else(|_| "MANUAL".to_string()),
+                cover_asset_id: r.try_get("cover_asset_id").ok().flatten(),
+                cover_thumb: r.try_get("cover_thumb").ok().flatten(),
+                media_count,
+                filter_criteria,
+                created_at: r.try_get("created_at").unwrap_or_default(),
+                updated_at: r.try_get("updated_at").unwrap_or_default(),
             });
         }
 
@@ -210,7 +235,7 @@ impl AlbumRepo {
         pool: &SqlitePool,
         album_id: &str,
         user_id: &str,
-    ) -> Result<Option<AlbumRecord>> {
+    ) -> Result<Option<AlbumRecord>, sqlx::Error> {
         let row = sqlx::query(
             r#"
             SELECT 
@@ -223,7 +248,15 @@ impl AlbumRepo {
                 a.filter_criteria,
                 a.created_at,
                 a.updated_at,
-                (SELECT COUNT(*) FROM album_assets aa JOIN assets ast ON aa.asset_id = ast.id WHERE aa.album_id = a.id AND ast.deleted_at IS NULL) AS media_count,
+                COALESCE(
+                    (
+                        SELECT COUNT(*) 
+                        FROM album_assets aa 
+                        JOIN assets ast ON aa.asset_id = ast.id 
+                        WHERE aa.album_id = a.id AND ast.deleted_at IS NULL
+                    ), 
+                    0
+                ) AS media_count,
                 COALESCE(
                     (SELECT thumb_path FROM assets WHERE id = a.cover_asset_id AND deleted_at IS NULL),
                     (
@@ -237,7 +270,6 @@ impl AlbumRepo {
                 ) AS cover_thumb
             FROM albums a
             WHERE a.id = ?1 AND a.user_id = ?2 AND a.deleted_at IS NULL
-            LIMIT 1
             "#,
         )
         .bind(album_id)
@@ -245,22 +277,37 @@ impl AlbumRepo {
         .fetch_optional(pool)
         .await?;
 
-        Ok(match row {
-            Some(r) => Some(AlbumRecord {
-                id: r.try_get("id")?,
-                user_id: r.try_get("user_id")?,
-                title: r.try_get("title")?,
-                description: r.try_get("description")?,
-                album_type: r.try_get("album_type")?,
-                cover_asset_id: r.try_get("cover_asset_id")?,
-                cover_thumb: r.try_get("cover_thumb")?,
-                media_count: r.try_get("media_count")?,
-                filter_criteria: r.try_get("filter_criteria")?,
-                created_at: r.try_get("created_at")?,
-                updated_at: r.try_get("updated_at")?,
-            }),
-            None => None,
-        })
+        Ok(row.map(|r| {
+            let media_count: i64 = r
+                .try_get("media_count")
+                .or_else(|_| r.try_get::<i32, _>("media_count").map(|c| c as i64))
+                .unwrap_or(0);
+
+            let filter_criteria: Option<String> = r
+                .try_get::<Option<String>, _>("filter_criteria")
+                .ok()
+                .flatten()
+                .or_else(|| {
+                    r.try_get::<Option<serde_json::Value>, _>("filter_criteria")
+                        .ok()
+                        .flatten()
+                        .map(|v| v.to_string())
+                });
+
+            AlbumRecord {
+                id: r.try_get("id").unwrap_or_default(),
+                user_id: r.try_get("user_id").unwrap_or_default(),
+                title: r.try_get("title").unwrap_or_default(),
+                description: r.try_get("description").ok().flatten(),
+                album_type: r.try_get("album_type").unwrap_or_else(|_| "MANUAL".to_string()),
+                cover_asset_id: r.try_get("cover_asset_id").ok().flatten(),
+                cover_thumb: r.try_get("cover_thumb").ok().flatten(),
+                media_count,
+                filter_criteria,
+                created_at: r.try_get("created_at").unwrap_or_default(),
+                updated_at: r.try_get("updated_at").unwrap_or_default(),
+            }
+        }))
     }
 
     /// Create a custom or smart album with hierarchical support
