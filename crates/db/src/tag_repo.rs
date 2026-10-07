@@ -17,7 +17,7 @@ impl IngestionTagInput {
     pub fn new_ai(name: impl Into<String>, confidence: f32) -> Self {
         Self {
             name: name.into(),
-            confidence,
+            confidence: Self::sanitize_confidence(confidence),
             category: 0,
             source: "model".to_string(),
         }
@@ -40,12 +40,22 @@ impl IngestionTagInput {
             source: "scraped".to_string(),
         }
     }
+
+    #[inline]
+    fn sanitize_confidence(val: f32) -> f32 {
+        if val.is_nan() || val.is_infinite() {
+            0.0
+        } else {
+            val.clamp(0.0, 1.0)
+        }
+    }
 }
 
 pub struct TagRepo;
 
 impl TagRepo {
-    /// Fetch all tags attached to a specific asset
+    /// Fetch all tags attached to a specific asset.
+    /// Explicitly decodes `confidence` as `f32` to match PostgreSQL `REAL` / `FLOAT4`.
     pub async fn get_by_asset(
         pool: &PgPool,
         asset_id: Uuid,
@@ -72,7 +82,8 @@ impl TagRepo {
             .map(|r| AssetTagItem {
                 tag_id: r.get("tag_id"),
                 name: r.get("name"),
-                confidence: r.get("confidence"),
+                // Match Postgres REAL (FLOAT4) explicitly to prevent ColumnDecode panic
+                confidence: r.get::<f32, _>("confidence") as f64,
                 source: r.get("source"),
             })
             .collect();
@@ -80,8 +91,8 @@ impl TagRepo {
         Ok(tags)
     }
 
-    /// High-throughput atomic upsert and linkage using a single CTE statement.
-    /// Eliminates Rust-side ID lookups and avoids multiple database roundtrips.
+    /// High-throughput atomic upsert and linkage.
+    /// Uses two clean, safe batch operations within the active transaction.
     pub async fn save_asset_tags_tx(
         conn: &mut PgConnection,
         user_id: Uuid,
@@ -92,23 +103,34 @@ impl TagRepo {
             return Ok(());
         }
 
-        // Deduplicate input by lowercased name, preserving the highest confidence entry
+        // 1. Strictly deduplicate by lowercased tag name, retaining highest confidence
         let mut deduped: HashMap<String, IngestionTagInput> = HashMap::with_capacity(tags.len());
         for tag in tags {
             let lower = tag.name.trim().to_lowercase();
             if lower.is_empty() {
                 continue;
             }
+
+            let conf = IngestionTagInput::sanitize_confidence(tag.confidence);
+
             match deduped.get_mut(&lower) {
                 Some(existing) => {
-                    if tag.confidence > existing.confidence {
-                        *existing = tag.clone();
+                    if conf > existing.confidence {
+                        existing.confidence = conf;
+                        existing.category = tag.category;
+                        existing.source = tag.source.clone();
                     }
                 }
                 None => {
-                    let mut t = tag.clone();
-                    t.name = lower.clone();
-                    deduped.insert(lower, t);
+                    deduped.insert(
+                        lower.clone(),
+                        IngestionTagInput {
+                            name: lower,
+                            confidence: conf,
+                            category: tag.category,
+                            source: tag.source.clone(),
+                        },
+                    );
                 }
             }
         }
@@ -136,40 +158,40 @@ impl TagRepo {
             link_sources.push(link_src.to_string());
         }
 
-        // Single roundtrip: Upserts tags into the catalog and links them into asset_tags directly
+        // Step 2a: Upsert all unique tags into the user's tags catalog
         sqlx::query(
             r#"
-            WITH input_data AS (
-                SELECT * FROM UNNEST(
-                    $3::text[], 
-                    $4::int[], 
-                    $5::real[], 
-                    $6::text[], 
-                    $7::text[]
-                ) AS u(name, category, confidence, source, link_source)
-            ),
-            upserted_tags AS (
-                INSERT INTO tags (user_id, name, category, usage_count, source)
-                SELECT 
-                    $1, 
-                    inp.name, 
-                    inp.category, 
-                    1, 
-                    inp.source
-                FROM input_data inp
-                ON CONFLICT (user_id, name) DO UPDATE SET 
-                    usage_count = tags.usage_count + 1
-                RETURNING id, name
-            )
+            INSERT INTO tags (user_id, name, category, usage_count, source)
+            SELECT 
+                $1, 
+                u.name, 
+                u.category, 
+                1,
+                u.source
+            FROM UNNEST($2::text[], $3::int[], $4::text[]) AS u(name, category, source)
+            ON CONFLICT (user_id, name) DO UPDATE SET 
+                usage_count = tags.usage_count + 1;
+            "#,
+        )
+        .bind(user_id)
+        .bind(&names)
+        .bind(&categories)
+        .bind(&sources)
+        .execute(&mut *conn)
+        .await?;
+
+        // Step 2b: Link tags into asset_tags cleanly via tag table join
+        sqlx::query(
+            r#"
             INSERT INTO asset_tags (user_id, asset_id, tag_id, confidence, source)
             SELECT 
                 $1, 
                 $2, 
-                ut.id, 
-                inp.confidence, 
-                inp.link_source
-            FROM input_data inp
-            JOIN upserted_tags ut ON ut.name = inp.name
+                t.id, 
+                u.confidence, 
+                u.link_source
+            FROM UNNEST($3::text[], $4::real[], $5::text[]) AS u(name, confidence, link_source)
+            JOIN tags t ON t.user_id = $1 AND t.name = u.name
             ON CONFLICT (asset_id, tag_id) DO UPDATE SET 
                 confidence = GREATEST(EXCLUDED.confidence, asset_tags.confidence);
             "#,
@@ -177,9 +199,7 @@ impl TagRepo {
         .bind(user_id)
         .bind(asset_id)
         .bind(&names)
-        .bind(&categories)
         .bind(&confidences)
-        .bind(&sources)
         .bind(&link_sources)
         .execute(&mut *conn)
         .await?;
