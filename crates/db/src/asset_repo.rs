@@ -685,12 +685,16 @@ impl AssetRepo {
             })
             .collect();
 
-        // 4. People breakdown: Drives directly from asset_id clustered index
+        // 4. People breakdown: Start FROM filtered f, JOIN outward
         let mut people_builder = build_cte();
         people_builder.push(
             r#"
-            SELECT p.id, p.name, COUNT(DISTINCT af.asset_id) as count
-            FROM asset_faces af
+            SELECT 
+                p.id, 
+                p.name, 
+                COUNT(DISTINCT af.asset_id) as count
+            FROM filtered f
+            JOIN asset_faces af ON f.id = af.asset_id
             JOIN persons p ON af.person_id = p.id
             WHERE p.user_id = 
             "#
@@ -699,7 +703,6 @@ impl AssetRepo {
         people_builder.push(
             r#"
               AND p.name IS NOT NULL
-              AND af.asset_id IN (SELECT id FROM filtered)
             GROUP BY p.id, p.name
             ORDER BY count DESC 
             LIMIT 30
@@ -715,12 +718,15 @@ impl AssetRepo {
             })
             .collect();
 
-        // 5. Tags breakdown: Drives directly from asset_tags primary key (asset_id, tag_id)
+        // 5. Tags breakdown: Start FROM filtered f, JOIN outward
         let mut tags_builder = build_cte();
         tags_builder.push(
             r#"
-            SELECT t.name, COUNT(DISTINCT at.asset_id) as count
-            FROM asset_tags at
+            SELECT 
+                t.name, 
+                COUNT(DISTINCT at.asset_id) as count
+            FROM filtered f
+            JOIN asset_tags at ON f.id = at.asset_id
             JOIN tags t ON at.tag_id = t.id
             WHERE t.user_id = 
             "#
@@ -728,7 +734,6 @@ impl AssetRepo {
         tags_builder.push_bind(user_id);
         tags_builder.push(
             r#"
-              AND at.asset_id IN (SELECT id FROM filtered)
             GROUP BY t.id, t.name
             ORDER BY count DESC 
             LIMIT 40
