@@ -187,30 +187,60 @@ impl AssetRepo {
         let fetch_limit = (limit + 1) as i64;
         let show_trash = q.show_trash.unwrap_or(false);
 
-        // Sort mode: defaults to "random" when not explicitly set
-        let sort_mode = q.sort.as_deref().unwrap_or("random");
-        let is_random = sort_mode == "random";
+        let fts_query = q.q.as_deref().and_then(Self::sanitize_query);
+        let has_fts = fts_query.is_some();
 
-        // Seed used for stable pagination in random mode
+        // If searching text, always sort by FTS relevance rank
+        let sort_mode = if has_fts {
+            "rank"
+        } else {
+            q.sort.as_deref().unwrap_or("random")
+        };
+        let is_random = sort_mode == "random";
         let random_seed = q.seed.unwrap_or(1337).abs();
 
-        // 1. Base SELECT query
-        let mut builder: QueryBuilder<Sqlite> = QueryBuilder::new(
-            "SELECT \
-                a.id, a.file_name, a.thumb_path, a.preview_path, \
-                a.aspect_ratio, a.duration_seconds, a.mime_type, a.captured_at, \
-                a.is_favorite, a.deleted_at, a.latitude, a.longitude \
-            FROM assets a "
-        );
+        // 1. Build Base SELECT query
+        // When FTS is present, drive FROM asset_search_index first for immediate index seeking.
+        let mut builder: QueryBuilder<Sqlite> = if let Some(ref expr) = fts_query {
+            let mut b = QueryBuilder::new(
+                "SELECT \
+                    a.id, a.file_name, a.thumb_path, a.preview_path, \
+                    a.aspect_ratio, a.duration_seconds, a.mime_type, a.captured_at, \
+                    a.is_favorite, a.deleted_at, a.latitude, a.longitude \
+                FROM asset_search_index fts \
+                JOIN assets a ON fts.asset_id = a.id "
+            );
 
-        let fts_query = q.q.as_deref().and_then(Self::sanitize_query);
-        if fts_query.is_some() {
-            builder.push(" JOIN asset_search_index fts ON fts.asset_id = a.id ");
-        }
+            if let Some(ref album_id) = q.album_id {
+                b.push(" JOIN album_assets aa ON aa.asset_id = a.id AND aa.album_id = ");
+                b.push_bind(album_id);
+            }
 
-        // --- HARD USER ISOLATION ---
-        builder.push(" WHERE a.user_id = ");
-        builder.push_bind(user_id);
+            b.push(" WHERE fts.user_id = ");
+            b.push_bind(user_id);
+            b.push(" AND asset_search_index MATCH ");
+            b.push_bind(expr);
+            b.push(" AND a.user_id = ");
+            b.push_bind(user_id);
+            b
+        } else {
+            let mut b = QueryBuilder::new(
+                "SELECT \
+                    a.id, a.file_name, a.thumb_path, a.preview_path, \
+                    a.aspect_ratio, a.duration_seconds, a.mime_type, a.captured_at, \
+                    a.is_favorite, a.deleted_at, a.latitude, a.longitude \
+                FROM assets a "
+            );
+
+            if let Some(ref album_id) = q.album_id {
+                b.push(" JOIN album_assets aa ON aa.asset_id = a.id AND aa.album_id = ");
+                b.push_bind(album_id);
+            }
+
+            b.push(" WHERE a.user_id = ");
+            b.push_bind(user_id);
+            b
+        };
 
         // --- TRASH SEPARATION ---
         if show_trash {
@@ -219,22 +249,14 @@ impl AssetRepo {
             builder.push(" AND a.deleted_at IS NULL ");
         }
 
-        // --- FULL TEXT SEARCH ---
-        if let Some(ref expr) = fts_query {
-            builder.push(" AND fts.user_id = ");
-            builder.push_bind(user_id);
-            builder.push(" AND asset_search_index MATCH ");
-            builder.push_bind(expr);
-        }
-
         // --- MEDIA TYPE FILTER ---
         if let Some(ref m_type) = q.media_type {
             match m_type.as_str() {
                 "photos" => {
-                    builder.push(" AND (a.mime_type NOT LIKE 'video/%' OR a.mime_type IS NULL) ");
+                    builder.push(" AND a.duration_seconds IS NULL ");
                 }
                 "videos" => {
-                    builder.push(" AND a.mime_type LIKE 'video/%' ");
+                    builder.push(" AND a.duration_seconds IS NOT NULL ");
                 }
                 _ => {}
             }
@@ -318,21 +340,6 @@ impl AssetRepo {
             }
         }
 
-        // --- ALBUM FILTER ---
-        if let Some(ref album_id) = q.album_id {
-            builder.push(
-                " AND a.id IN ( \
-                    SELECT aa.asset_id \
-                    FROM album_assets aa \
-                    JOIN albums alb ON aa.album_id = alb.id \
-                    WHERE alb.id = "
-                );
-            builder.push_bind(album_id);
-            builder.push(" AND alb.user_id = ");
-            builder.push_bind(user_id);
-            builder.push(") ");
-        }
-
         // --- DIRECTORY / EXIF FILTERS ---
         if let Some(ref folder) = q.folder_path {
             builder.push(" AND a.folder_path = ");
@@ -347,29 +354,29 @@ impl AssetRepo {
             builder.push_bind(model);
         }
         if let Some(ref from_date) = q.from {
-            builder.push(" AND COALESCE(a.captured_at, a.created_at) >= ");
+            builder.push(" AND a.captured_at >= ");
             builder.push_bind(from_date);
         }
         if let Some(ref to_date) = q.to {
-            builder.push(" AND COALESCE(a.captured_at, a.created_at) <= ");
+            builder.push(" AND a.captured_at <= ");
             builder.push_bind(to_date);
         }
 
         // --- PAGINATION & ORDERING ---
-        if is_random {
+        if has_fts {
+            builder.push(" ORDER BY fts.rank ASC LIMIT ");
+            builder.push_bind(fetch_limit);
+        } else if is_random {
             let seed_scalar: i64 = (random_seed % 100_000) + 1;
-
+            // Use integer cast on hex prefix of UUID to avoid nested unicode(substr()) evaluations
             let hash_expr = format!(
-                "abs(((unicode(substr(a.id, 1, 1)) * 31 + unicode(substr(a.id, 2, 1))) * 31 + unicode(substr(a.id, 3, 1))) * {seed_scalar}) % 1000003"
+                "abs((CAST(('0x' || substr(a.id, 1, 6)) AS INTEGER) * {seed_scalar}) % 1000003)"
             );
 
             if let Some(cid) = q.cursor_id.as_deref().filter(|s| !s.trim().is_empty()) {
-                // Compute the cursor's hash in Rust directly.
-                // Unicode codepoints of ASCII characters in Rust match SQLite's unicode() 1:1.
-                let c0 = cid.chars().nth(0).map(|c| c as u32 as i64).unwrap_or(0);
-                let c1 = cid.chars().nth(1).map(|c| c as u32 as i64).unwrap_or(0);
-                let c2 = cid.chars().nth(2).map(|c| c as u32 as i64).unwrap_or(0);
-                let cursor_hash = (((c0 * 31 + c1) * 31 + c2) * seed_scalar).abs() % 1_000_003;
+                let prefix_hex = if cid.len() >= 6 { &cid[..6] } else { cid };
+                let hex_val = i64::from_str_radix(prefix_hex, 16).unwrap_or(0);
+                let cursor_hash = ((hex_val * seed_scalar).abs()) % 1_000_003;
 
                 builder.push(" AND (");
                 builder.push(&hash_expr);
@@ -401,38 +408,30 @@ impl AssetRepo {
                 }
             }
 
-            if fts_query.is_some() {
-                builder.push(" ORDER BY fts.rank ASC, COALESCE(a.captured_at, '') DESC, a.id DESC LIMIT ");
-            } else {
-                builder.push(" ORDER BY COALESCE(a.captured_at, '') DESC, a.id DESC LIMIT ");
-            }
+            builder.push(" ORDER BY COALESCE(a.captured_at, '') DESC, a.id DESC LIMIT ");
             builder.push_bind(fetch_limit);
         }
 
-        // Sub-album retrieval (Only in timeline root folder view, not in random feed)
-        let albums = if q.cursor_id.is_none() && !show_trash && q.album_id.is_none() && !is_random {
+        // Sub-album retrieval (Only in root timeline view)
+        let albums = if q.cursor_id.is_none() && !show_trash && q.album_id.is_none() && !is_random && !has_fts {
             let curr = q.folder_path.as_deref().unwrap_or("");
             Self::get_sub_albums(pool, user_id, curr, q.media_type.as_deref()).await.unwrap_or_default()
         } else {
             Vec::new()
         };
 
-        // Breadcrumbs: generated server-side from folder_path
         let breadcrumbs = Self::build_path_breadcrumbs(q.folder_path.as_deref());
 
-        // 2. Fetch rows
         let mut rows = builder.build_query_as::<RawMediaRow>().fetch_all(pool).await?;
         let has_more = rows.len() > limit;
         if has_more {
             rows.truncate(limit);
         }
 
-        // 3. Extract cursors from the last item
         let next_cursor_captured_at = rows.last().map(|i| i.captured_at.clone().unwrap_or_default());
         let next_cursor_id = rows.last().map(|i| i.id.clone());
 
-        // 4. Group into sections
-        let sections = if is_random {
+        let sections = if is_random || has_fts {
             if rows.is_empty() {
                 Vec::new()
             } else {
@@ -479,7 +478,6 @@ impl AssetRepo {
             .map(|s| s.split(',').map(|t| t.trim().to_lowercase()).filter(|t| !t.is_empty()).collect())
             .unwrap_or_default();
 
-        // Project ONLY the lightweight columns required for aggregation.
         let build_cte = || {
             let mut builder: QueryBuilder<Sqlite> = QueryBuilder::new(
                 "WITH filtered AS ( \
@@ -496,7 +494,6 @@ impl AssetRepo {
                     FROM assets a "
             );
 
-            // Directly join album_assets if album filter is specified
             if let Some(ref album_id) = q.album_id {
                 builder.push(" JOIN album_assets aa ON aa.asset_id = a.id AND aa.album_id = ");
                 builder.push_bind(album_id);
@@ -623,7 +620,7 @@ impl AssetRepo {
         let min_date: Option<String> = stats_row.try_get("min_d").ok();
         let max_date: Option<String> = stats_row.try_get("max_d").ok();
 
-        // 2. Full Timeline Milestones
+        // 2. Timeline Milestones
         let mut timeline_builder = build_cte();
         timeline_builder.push(
             r#"
@@ -685,7 +682,7 @@ impl AssetRepo {
             })
             .collect();
 
-        // 4. People breakdown: Start FROM filtered f, JOIN outward
+        // 4. People breakdown: Drives directly from filtered assets outward
         let mut people_builder = build_cte();
         people_builder.push(
             r#"
@@ -718,7 +715,7 @@ impl AssetRepo {
             })
             .collect();
 
-        // 5. Tags breakdown: Start FROM filtered f, JOIN outward
+        // 5. Tags breakdown: Drives directly from filtered assets outward
         let mut tags_builder = build_cte();
         tags_builder.push(
             r#"
@@ -1034,11 +1031,21 @@ impl AssetRepo {
             format!("{clean_current}/")
         };
 
+        // Query folders grouped by path in SQL instead of transferring all rows to Rust
         let mut builder: QueryBuilder<Sqlite> = QueryBuilder::new(
             r#"
             SELECT 
-                folder_path, 
-                thumb_path
+                folder_path,
+                COUNT(*) as item_count,
+                (
+                    SELECT sub.thumb_path 
+                    FROM assets sub 
+                    WHERE sub.user_id = assets.user_id 
+                      AND sub.folder_path = assets.folder_path 
+                      AND sub.deleted_at IS NULL 
+                    ORDER BY COALESCE(sub.captured_at, sub.created_at) DESC 
+                    LIMIT 1
+                ) as latest_thumb
             FROM assets
             WHERE user_id = 
             "#,
@@ -1050,7 +1057,6 @@ impl AssetRepo {
         builder.push(" AND folder_path != ");
         builder.push_bind(if clean_current.is_empty() { "root" } else { clean_current });
 
-        // Photo / Video separation in album tree
         if let Some(m_type) = media_type {
             match m_type {
                 "photos" => { builder.push(" AND duration_seconds IS NULL "); }
@@ -1059,17 +1065,16 @@ impl AssetRepo {
             }
         }
 
-        // Newest assets first so the first row encountered per folder is the latest cover
-        builder.push(" ORDER BY COALESCE(captured_at, created_at) DESC ");
+        builder.push(" GROUP BY folder_path ");
 
         let rows = builder.build().fetch_all(pool).await?;
 
-        // Map: direct_child_name -> (full_child_path, item_count, latest_cover_thumb)
         let mut groups: BTreeMap<String, (String, i64, Option<String>)> = BTreeMap::new();
 
         for r in rows {
             let full_fp: String = r.try_get("folder_path").unwrap_or_default();
-            let thumb: Option<String> = r.try_get("thumb_path").ok();
+            let count: i64 = r.try_get("item_count").unwrap_or(0);
+            let thumb: Option<String> = r.try_get("latest_thumb").ok();
 
             let clean_fp = full_fp.trim_matches('/');
             let remainder = if prefix.is_empty() {
@@ -1091,14 +1096,17 @@ impl AssetRepo {
 
             let entry = groups
                 .entry(direct_child.to_string())
-                .or_insert_with(|| (full_child_path, 0, thumb));
-            entry.1 += 1;
+                .or_insert_with(|| (full_child_path, 0, thumb.clone()));
+            entry.1 += count;
+            if entry.2.is_none() {
+                entry.2 = thumb;
+            }
         }
 
         let albums = groups
             .into_iter()
             .map(|(name, (path, count, cover_thumb))| SubAlbum {
-                id: None, // Raw folder path directory; None signals filesystem-backed
+                id: None,
                 name,
                 path,
                 count,

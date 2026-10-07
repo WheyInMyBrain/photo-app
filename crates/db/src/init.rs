@@ -42,13 +42,13 @@ pub async fn init_db_pool(db_url: &str) -> Result<SqlitePool, sqlx::Error> {
         // 1. Give SQLite up to 30s to wait out concurrent write locks before throwing SQLITE_BUSY
         .busy_timeout(Duration::from_secs(30))
         .pragma("cache_size", "-64000")        // 64 MB page cache
-        .pragma("mmap_size", "268435456")      // 256 MB memory mapping
+        .pragma("mmap_size", "67108864")      // 256 MB memory mapping
         .pragma("temp_store", "memory")        // In-memory temp tables
         .pragma("wal_autocheckpoint", "1000"); // Auto-prune WAL at 1,000 pages (~4MB)
 
     let pool = SqlitePoolOptions::new()
         // 2. Bump max connections so background workers cannot starve web readers
-        .max_connections(25)
+        .max_connections(10)
         // 3. Keep 3 warm connections alive to avoid latency spikes on cold requests
         .min_connections(3)
         // 4. Increase acquire timeout to match busy_timeout so requests don't bail at 10s
