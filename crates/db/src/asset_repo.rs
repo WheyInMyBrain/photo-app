@@ -326,11 +326,38 @@ impl AssetRepo {
 
         // Pagination & Ordering
         if has_search {
+            // Rank pagination fallback using captured_at and id
+            if let (Some(cat), Some(cid)) = (q.cursor_captured_at, q.cursor_id) {
+                builder.push(" AND (a.captured_at < ");
+                builder.push_bind(cat);
+                builder.push(" OR (a.captured_at = ");
+                builder.push_bind(cat);
+                builder.push(" AND a.id < ");
+                builder.push_bind(cid);
+                builder.push(")) ");
+            }
+
             builder.push(" ORDER BY ts_rank_cd(a.search_vector, websearch_to_tsquery('simple', ");
             builder.push_bind(search_term.unwrap());
             builder.push(")) DESC, a.captured_at DESC NULLS LAST, a.id DESC LIMIT ");
             builder.push_bind(fetch_limit);
         } else if is_random {
+            // Deterministic pseudo-random cursor pagination
+            if let Some(cid) = q.cursor_id {
+                builder.push(" AND ( \
+                    ('x' || substr(md5(a.id::text || ");
+                builder.push_bind(random_seed);
+                builder.push("::text), 1, 8))::bit(32)::int, a.id \
+                ) > ( \
+                    (SELECT ('x' || substr(md5(c.id::text || ");
+                builder.push_bind(random_seed);
+                builder.push("::text), 1, 8))::bit(32)::int FROM assets c WHERE c.id = ");
+                builder.push_bind(cid);
+                builder.push("), ");
+                builder.push_bind(cid);
+                builder.push(") ");
+            }
+
             builder.push(" ORDER BY ('x' || substr(md5(a.id::text || ");
             builder.push_bind(random_seed);
             builder.push("::text), 1, 8))::bit(32)::int ASC, a.id ASC LIMIT ");

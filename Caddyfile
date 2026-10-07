@@ -1,12 +1,25 @@
 :80 {
-    # 1. Reverse proxy API calls to backend
+    # 1. Specialized handling for long-lived SSE / stream connections
+    handle /api/events* {
+        reverse_proxy backend:3000 {
+            flush_interval -1
+            # Prevent Caddy from cutting idle/long-lived event streams
+            transport http {
+                response_header_timeout 0s
+                read_timeout 0s
+                write_timeout 0s
+            }
+        }
+    }
+
+    # 2. General API calls
     handle /api/* {
         reverse_proxy backend:3000 {
             flush_interval -1
         }
     }
 
-    # 2. Reverse proxy static user assets and thumbnails to backend
+    # 3. Static user assets & thumbnails served by Axum
     handle /users/* {
         reverse_proxy backend:3000
     }
@@ -15,7 +28,7 @@
         reverse_proxy backend:3000
     }
 
-    # 3. Everything else goes to the frontend
+    # 4. Frontend (SvelteKit / SPA)
     handle {
         reverse_proxy frontend:3000
     }
