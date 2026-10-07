@@ -89,7 +89,6 @@ export function createTimelineStore() {
         }
       }
 
-      console.log('Fetching media URL:', `/api/media?${params.toString()}`);
       const res = await fetch(`/api/media?${params.toString()}`, { signal: pageAbortCtrl.signal });
 
       if (requestId !== currentRequestId) return;
