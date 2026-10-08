@@ -5,7 +5,9 @@ use crate::models::{ExtractedMediaMetadata, MediaDimensions, MediaItem, MediaTyp
 use crate::websites::hls;
 use crate::websites::Extractor;
 use anyhow::{bail, Context, Result};
-use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, ACCEPT_LANGUAGE, USER_AGENT};
+use reqwest::header::{
+    HeaderMap, HeaderValue, ACCEPT, ACCEPT_LANGUAGE, USER_AGENT,
+};
 use reqwest::Client;
 use serde_json::Value;
 use std::collections::HashSet;
@@ -35,24 +37,54 @@ pub async fn extract_reddit(input_url: &str) -> Result<ExtractedMediaMetadata> {
     let mut headers = HeaderMap::new();
     headers.insert(
         USER_AGENT,
-        HeaderValue::from_static("Reddit/2024.10.0 (iPhone; iOS 17.4.1; Scale/3.00)"),
+        HeaderValue::from_static(
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+        ),
     );
-    headers.insert(ACCEPT, HeaderValue::from_static("application/json, text/html"));
-    headers.insert(ACCEPT_LANGUAGE, HeaderValue::from_static("en-US,en;q=0.5"));
+    headers.insert(
+        ACCEPT,
+        HeaderValue::from_static("text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8"),
+    );
+    headers.insert(ACCEPT_LANGUAGE, HeaderValue::from_static("en-US,en;q=0.9"));
+    headers.insert(
+        "sec-fetch-site",
+        HeaderValue::from_static("none"),
+    );
+    headers.insert(
+        "sec-fetch-mode",
+        HeaderValue::from_static("navigate"),
+    );
+    headers.insert(
+        "sec-fetch-dest",
+        HeaderValue::from_static("document"),
+    );
 
     let client = Client::builder()
         .cookie_store(true)
         .default_headers(headers)
+        .redirect(reqwest::redirect::Policy::limited(10))
         .build()?;
 
-    // Check if URL is a user profile feed
-    if let Some(username) = extract_reddit_username(input_url) {
-        info!(username = %username, "Detected Reddit user profile link; starting full crawl");
-        return extract_reddit_user_profile(&client, &username).await;
+    // 1. Follow initial redirects to resolve canonical target (e.g. /s/... share links)
+    let initial_resp = client
+        .get(input_url)
+        .send()
+        .await
+        .context("Failed following Reddit URL")?;
+
+    let resolved_url = initial_resp.url().to_string();
+    debug!(input = %input_url, resolved = %resolved_url, "Resolved final Reddit target URL");
+
+    // 2. Check if the resolved URL is actually a user profile feed
+    if let Some(username) = extract_reddit_username(&resolved_url) {
+        if !resolved_url.contains("/comments/") && !resolved_url.contains("/s/") {
+            info!(username = %username, "Detected Reddit user profile link; starting full crawl");
+            return extract_reddit_user_profile(&client, &username).await;
+        }
     }
 
-    // Default: Single post extraction
-    extract_reddit_single_post(&client, input_url).await
+    // 3. Extract as single submission using the canonical resolved URL
+    extract_reddit_single_post(&client, &resolved_url).await
 }
 
 // -----------------------------------------------------------------------------
@@ -70,7 +102,7 @@ async fn extract_reddit_user_profile(
 
     let mut after: Option<String> = None;
     let mut page_count = 0;
-    const MAX_PAGES: usize = 100; // 100 pages * 100 = up to 10,000 submissions
+    const MAX_PAGES: usize = 100;
 
     loop {
         page_count += 1;
@@ -82,7 +114,15 @@ async fn extract_reddit_user_profile(
         }
 
         debug!(page = page_count, url = %api_url, "Fetching user submission page");
-        let resp = client.get(&api_url).send().await?;
+        let mut resp = client.get(&api_url).send().await?;
+
+        // Fallback to old.reddit.com if blocked with 403
+        if resp.status() == reqwest::StatusCode::FORBIDDEN {
+            let alt_url = api_url.replace("www.reddit.com", "old.reddit.com");
+            debug!(alt_url = %alt_url, "Retrying user profile via old.reddit.com fallback");
+            resp = client.get(&alt_url).send().await?;
+        }
+
         if !resp.status().is_success() {
             if all_items.is_empty() {
                 bail!("Reddit user profile API returned HTTP {}", resp.status());
@@ -143,10 +183,8 @@ async fn extract_reddit_user_profile(
                 aggregated_tags.insert(format!("r/{sub}"));
             }
 
-            // Extract all media types for this submission
             let mut post_media_items = extract_post_media_items(post, &permalink).await;
 
-            // Stamp submission metadata onto each item
             for item in &mut post_media_items {
                 item.source_post_url = Some(permalink.clone());
                 if item.caption.is_none() && !post_title.is_empty() {
@@ -179,8 +217,7 @@ async fn extract_reddit_user_profile(
         }
 
         after = next_cursor;
-        // Moderate delay to respect Reddit's rate limits
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        tokio::time::sleep(Duration::from_millis(1000)).await;
     }
 
     if all_items.is_empty() {
@@ -207,14 +244,25 @@ async fn extract_reddit_user_profile(
 // -----------------------------------------------------------------------------
 async fn extract_reddit_single_post(
     client: &Client,
-    input_url: &str,
+    canonical_url: &str,
 ) -> Result<ExtractedMediaMetadata> {
-    let resp = client.get(input_url).send().await.context("Failed to follow Reddit URL")?;
-    let canonical_url = resp.url().to_string();
-    let clean_url = canonical_url.split('?').next().unwrap_or(&canonical_url).trim_end_matches('/');
+    let clean_url = canonical_url
+        .split('?')
+        .next()
+        .unwrap_or(canonical_url)
+        .trim_end_matches('/');
+
     let json_endpoint = format!("{clean_url}.json?raw_json=1");
 
-    let json_resp = client.get(&json_endpoint).send().await?;
+    let mut json_resp = client.get(&json_endpoint).send().await?;
+
+    // Fallback to old.reddit.com if blocked with 403
+    if json_resp.status() == reqwest::StatusCode::FORBIDDEN {
+        let alt_endpoint = json_endpoint.replace("www.reddit.com", "old.reddit.com");
+        debug!(alt = %alt_endpoint, "403 encountered, trying old.reddit.com fallback");
+        json_resp = client.get(&alt_endpoint).send().await?;
+    }
+
     if !json_resp.status().is_success() {
         bail!("Reddit API returned HTTP {}", json_resp.status());
     }
@@ -264,13 +312,13 @@ async fn extract_reddit_single_post(
         tags.push(format!("r/{sub}"));
     }
 
-    let mut items = extract_post_media_items(post_data, input_url).await;
+    let mut items = extract_post_media_items(post_data, canonical_url).await;
     if items.is_empty() {
         bail!("No media items found for this Reddit post.");
     }
 
     for item in &mut items {
-        item.source_post_url = Some(input_url.to_string());
+        item.source_post_url = Some(canonical_url.to_string());
         item.caption = Some(caption.clone());
         item.published_at = published_at.clone();
         item.tags = tags.clone();
