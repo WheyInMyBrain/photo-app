@@ -15,12 +15,13 @@ use axum::{
     response::Json,
 };
 use media_processing::StorageService;
-use tokio::fs;
 use uuid::Uuid;
+use tracing::{error, info};
 
 use crate::error::AppError;
 use crate::middleware::auth::AuthUser;
 use crate::AppState;
+use crate::services::link_ingest_service::LinkIngestService;
 
 use db::domain::{
     CommitLinkRequest, DbJob, IngestResponse, InspectLinkRequest,
@@ -94,8 +95,11 @@ pub async fn upload_ingest(
         .and_then(|h| h.to_str().ok())
         .unwrap_or("");
 
+    // =========================================================================
     // Case 1: JSON Payloads (Apple Shortcuts or Selective Imports)
+    // =========================================================================
     if content_type.starts_with("application/json") || body.starts_with(b"{") {
+        // Sub-case 1A: Selective commit of already resolved media items
         if let Ok(commit_req) = serde_json::from_slice::<CommitLinkRequest>(&body) {
             let target_folder = commit_req
                 .folder
@@ -106,6 +110,7 @@ pub async fn upload_ingest(
             let items = commit_req.selected_items;
             let platform = commit_req.platform;
 
+            // Direct file downloads execute sequentially via execute_item_downloads
             tokio::spawn(async move {
                 if let Err(e) = execute_item_downloads(
                     &state_clone,
@@ -116,7 +121,7 @@ pub async fn upload_ingest(
                 )
                 .await
                 {
-                    tracing::error!(error = %e, "Background item downloads failed");
+                    error!(error = %e, "Item downloads failed in background");
                 }
             });
 
@@ -129,6 +134,7 @@ pub async fn upload_ingest(
             })));
         }
 
+        // Sub-case 1B: JSON containing a raw link (e.g., {"url": "https://..."})
         if let Ok(val) = serde_json::from_slice::<serde_json::Value>(&body) {
             let extracted_url = val
                 .get("url")
@@ -139,46 +145,41 @@ pub async fn upload_ingest(
 
             if let Some(target_url) = extracted_url {
                 if target_url.starts_with("http://") || target_url.starts_with("https://") {
-                    let state_clone = state.clone();
-                    let user_clone = auth_user.clone();
-                    let requested_folder = query.folder.clone();
-                    let target_url_clone = target_url.clone();
+                    let enqueued = LinkIngestService::enqueue(
+                        &state.db,
+                        auth_user.id,
+                        &target_url,
+                        query.folder.as_deref(),
+                    )
+                    .await
+                    .map_err(|e| AppError::Internal(format!("Failed to enqueue link: {e}")))?;
 
-                    tokio::spawn(async move {
-                        match resolve_or_scrape_manifest(&state_clone, &user_clone, &target_url_clone).await {
-                            Ok(manifest) => {
-                                let target_folder = requested_folder.unwrap_or(manifest.suggested_folder);
-                                if let Err(e) = execute_item_downloads(
-                                    &state_clone,
-                                    &user_clone,
-                                    manifest.items,
-                                    &target_folder,
-                                    &manifest.platform,
-                                )
-                                .await
-                                {
-                                    tracing::error!(url = %target_url_clone, error = %e, "Background download execution failed");
-                                }
-                            }
-                            Err(e) => {
-                                tracing::error!(url = %target_url_clone, error = %e, "Background link resolution failed");
-                            }
-                        }
-                    });
+                    info!(
+                        url = %target_url,
+                        user_id = %auth_user.id,
+                        enqueued,
+                        "JSON link recorded to persistent queue"
+                    );
 
                     return Ok(Json(IngestResponse::File(UploadItemResult {
                         file_name: target_url,
                         status: "queued".to_string(),
                         id: None,
                         relative_path: None,
-                        message: Some("Link queued for background resolution and download".to_string()),
+                        message: Some(if enqueued {
+                            "Link safely queued for sequential download".to_string()
+                        } else {
+                            "Link already present in queue, processing will continue".to_string()
+                        }),
                     })));
                 }
             }
         }
     }
 
-    // Case 2: URL Auto-Commit (Raw text link)
+    // =========================================================================
+    // Case 2: URL Auto-Commit (Raw text link via curl or Shortcuts)
+    // =========================================================================
     let is_text_or_url = content_type.starts_with("text/")
         || (body.len() < 2048
             && std::str::from_utf8(&body)
@@ -189,45 +190,40 @@ pub async fn upload_ingest(
         if let Ok(raw_str) = std::str::from_utf8(&body) {
             let trimmed = raw_str.trim().to_string();
             if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
-                let state_clone = state.clone();
-                let user_clone = auth_user.clone();
-                let requested_folder = query.folder.clone();
-                let target_url = trimmed.clone();
+                let enqueued = LinkIngestService::enqueue(
+                    &state.db,
+                    auth_user.id,
+                    &trimmed,
+                    query.folder.as_deref(),
+                )
+                .await
+                .map_err(|e| AppError::Internal(format!("Failed to enqueue link: {e}")))?;
 
-                tokio::spawn(async move {
-                    match resolve_or_scrape_manifest(&state_clone, &user_clone, &target_url).await {
-                        Ok(manifest) => {
-                            let target_folder = requested_folder.unwrap_or(manifest.suggested_folder);
-                            if let Err(e) = execute_item_downloads(
-                                &state_clone,
-                                &user_clone,
-                                manifest.items,
-                                &target_folder,
-                                &manifest.platform,
-                            )
-                            .await
-                            {
-                                tracing::error!(url = %target_url, error = %e, "Background download execution failed");
-                            }
-                        }
-                        Err(e) => {
-                            tracing::error!(url = %target_url, error = %e, "Background link resolution failed");
-                        }
-                    }
-                });
+                info!(
+                    url = %trimmed,
+                    user_id = %auth_user.id,
+                    enqueued,
+                    "Raw text link recorded to persistent queue"
+                );
 
                 return Ok(Json(IngestResponse::File(UploadItemResult {
                     file_name: trimmed,
                     status: "queued".to_string(),
                     id: None,
                     relative_path: None,
-                    message: Some("Link queued for background resolution and download".to_string()),
+                    message: Some(if enqueued {
+                        "Link safely queued for sequential download".to_string()
+                    } else {
+                        "Link already present in queue, processing will continue".to_string()
+                    }),
                 })));
             }
         }
     }
 
+    // =========================================================================
     // Case 3: Binary Media Upload (Directly queued to single-row pipeline)
+    // =========================================================================
     let file_name = resolve_incoming_filename(&query, &headers, &body);
     let final_folder = query.folder.unwrap_or_else(default_camera_folder);
     let sanitized_folder = StorageService::sanitize_folder_path(&final_folder);
@@ -236,7 +232,7 @@ pub async fn upload_ingest(
     let asset_id = Uuid::new_v4();
     let staged_path = staging_root.join(format!("{}.staged", asset_id));
 
-    fs::write(&staged_path, &body).await.map_err(|e| {
+    tokio::fs::write(&staged_path, &body).await.map_err(|e| {
         AppError::Internal(format!("Failed writing staged ingest file: {e}"))
     })?;
 

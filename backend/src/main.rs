@@ -31,6 +31,7 @@ use uuid::Uuid;
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 use services::engine_coordinator::EngineCoordinator;
+use services::link_ingest_service::LinkIngestService;
 use services::queue::{QueueChannels, QueueService};
 use services::trash_purger::TrashPurgerService;
 
@@ -165,6 +166,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         thumb_rx,
         ai_rx,
     );
+
+    let ingest_state = state.clone();
+    tokio::spawn(async move {
+        LinkIngestService::run_worker_loop(ingest_state).await;
+    });
 
     // =========================================================================
     // 4. PostgreSQL Startup Recovery: Reclaim stalled jobs & refill channels
