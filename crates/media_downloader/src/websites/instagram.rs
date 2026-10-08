@@ -78,7 +78,7 @@ pub async fn extract_instagram(
     info!("URL matched as Instagram profile feed");
     let cfg = config.context("DownloaderConfig with active credentials required to scrape profile feed")?;
     let auth_client = build_auth_client(cfg)?;
-    extract_user_profile_feed(input_url, cfg, &auth_client).await
+    extract_user_profile_feed(input_url, cfg, &auth_client, None, None).await
 }
 
 // -----------------------------------------------------------------------------
@@ -586,15 +586,23 @@ async fn extract_highlight_links(input_url: &str, client: &Client) -> Result<Ext
 // -----------------------------------------------------------------------------
 // User Profile Feed: Ingests timeline directly in a single pagination pass
 // -----------------------------------------------------------------------------
-async fn extract_user_profile_feed(
+pub async fn extract_user_profile_feed(
     input_url: &str,
     cfg: &DownloaderConfig,
     client: &Client,
+    initial_cursor: Option<String>,
+    page_budget: Option<usize>,
 ) -> Result<ExtractedMediaMetadata> {
     let username = extract_username_from_url(input_url)
         .context("Could not extract username from Instagram profile URL")?;
 
-    info!(username = %username, "Starting unified profile extraction");
+    let max_pages = page_budget.unwrap_or(30); // Sensible batch ceiling per session
+    info!(
+        username = %username,
+        has_initial_cursor = initial_cursor.is_some(),
+        max_pages,
+        "Starting profile timeline extraction"
+    );
 
     let rate_limiter = StealthRateLimiter::new();
     let mut backoff_attempt: u32 = 0;
@@ -624,14 +632,19 @@ async fn extract_user_profile_feed(
     let mut latest_post_date = None;
     let mut primary_location = None;
 
-    let mut cursor: Option<String> = None;
+    let mut cursor: Option<String> = initial_cursor;
     let mut page_count = 0;
-    const MAX_PAGES: usize = 5000;
     let mut hit_known_boundary = false;
+    let mut next_cursor_to_return: Option<String> = None;
 
     loop {
         page_count += 1;
-        debug!(username = %username, page = page_count, has_cursor = cursor.is_some(), "Requesting profile timeline page");
+        debug!(
+            username = %username,
+            page = page_count,
+            has_cursor = cursor.is_some(),
+            "Requesting profile timeline page"
+        );
 
         let (doc_id, friendly_name, variables) = if let Some(ref c) = cursor {
             (
@@ -689,6 +702,7 @@ async fn extract_user_profile_feed(
             .header(REFERER, format!("https://www.instagram.com/{username}/"))
             .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
             .header("X-FB-Friendly-Name", friendly_name)
+            .header("X-IG-App-ID", "936619743392459")
             .header("X-Root-Field-Name", "xdt_api__v1__feed__user_timeline_graphql_connection")
             .body(form_body)
             .send()
@@ -708,19 +722,14 @@ async fn extract_user_profile_feed(
 
         let status = resp.status();
 
-        // Detect HTTP rate limiting codes (429 Too Many Requests / 403 Forbidden)
+        // Detect HTTP rate limiting
         if status == reqwest::StatusCode::TOO_MANY_REQUESTS || status == reqwest::StatusCode::FORBIDDEN {
-            warn!(status = %status, "Rate limit HTTP code encountered. Triggering cooldown.");
-            backoff_attempt += 1;
-            if backoff_attempt > 3 {
-                bail!("Rate limited by Instagram (HTTP {status}). Stopping to preserve account session.");
-            }
-            rate_limiter.handle_backoff(backoff_attempt).await;
-            continue;
+            warn!(status = %status, "Rate limit HTTP code encountered from Instagram. Stopping session.");
+            bail!("Rate limited by Instagram (HTTP {status}). Stopping to preserve account session.");
         }
 
         if !status.is_success() {
-            error!(username = %username, page = page_count, status = %status, "Timeline query failed");
+            error!(username = %username, page = page_count, status = %status, "Timeline query returned failure status");
             if all_media_items.is_empty() && !hit_known_boundary {
                 bail!("Instagram GraphQL query failed with HTTP {status}");
             } else {
@@ -745,34 +754,33 @@ async fn extract_user_profile_feed(
             }
         };
 
-        // Detect Meta action-blocks / checkpoints embedded in JSON responses
+        // CIRCUIT BREAKER: Halt immediately on checkpoint / feedback required
         let message = payload.get("message").and_then(|m| m.as_str()).unwrap_or("");
         let status_field = payload.get("status").and_then(|s| s.as_str()).unwrap_or("");
-        if status_field == "fail" || message.contains("feedback_required") || message.contains("checkpoint") {
-            warn!(
-                message,
+
+        if status_field == "fail"
+            || message.contains("feedback_required")
+            || message.contains("checkpoint_required")
+            || message.contains("login_required")
+        {
+            error!(
                 status = status_field,
-                "Instagram returned action-block response. Entering backoff."
+                message = message,
+                "CRITICAL: Instagram flagged request with action challenge / checkpoint. Aborting immediately."
             );
-            backoff_attempt += 1;
-            if backoff_attempt > 2 {
-                bail!("Action restricted by Instagram: '{message}'. Halting crawl.");
-            }
-            rate_limiter.handle_backoff(backoff_attempt).await;
-            continue;
+            bail!("Scraper stopped: Instagram challenge triggered ('{message}'). Log in via a browser to verify session.");
         }
 
         if let Some(err_code) = payload.get("error") {
             let msg = payload.get("errorSummary").and_then(|s| s.as_str()).unwrap_or("unknown error");
-            error!(username = %username, error_code = %err_code, summary = %msg, "Meta returned an API-level error");
+            error!(username = %username, error_code = %err_code, summary = %msg, "Meta API-level error returned");
             if all_media_items.is_empty() && !hit_known_boundary {
-                bail!("Meta GraphQL error {err_code}: {msg}. Verify session cookies in .env.");
+                bail!("Meta GraphQL error {err_code}: {msg}. Verify session cookies.");
             } else {
                 break;
             }
         }
 
-        // Successfully fetched and parsed a valid page; reset backoff
         backoff_attempt = 0;
 
         let (edges, page_info) = if let Some(conn) = payload.pointer("/data/xdt_api__v1__feed__user_timeline_graphql_connection") {
@@ -780,7 +788,7 @@ async fn extract_user_profile_feed(
         } else if let Some(conn) = payload.pointer("/data/user/edge_owner_to_timeline_media") {
             (conn.get("edges").and_then(|e| e.as_array()), conn.get("page_info"))
         } else {
-            warn!(username = %username, preview = %&body[..body.len().min(300)], "Could not locate timeline connection in payload");
+            warn!(username = %username, preview = %&body[..body.len().min(300)], "Could not locate timeline connection in response");
             if all_media_items.is_empty() && !hit_known_boundary {
                 bail!("Failed to locate timeline connection in GraphQL response.");
             } else {
@@ -805,7 +813,7 @@ async fn extract_user_profile_feed(
                 None => continue,
             };
 
-            // EARLY-EXIT CHECK: Stop if post was already downloaded previously
+            // EARLY-EXIT CHECK: Stop immediately if post has already been recorded
             if cfg.is_known_post(code) {
                 info!(
                     shortcode = %code,
@@ -845,13 +853,13 @@ async fn extract_user_profile_feed(
                 latest_post_date = published_at.clone();
             }
 
-            // 3. Location (with lightweight pacing)
+            // 3. Location
             let post_location = extract_and_resolve_location(node.get("location"), client, Some(&rate_limiter)).await;
             if primary_location.is_none() && post_location.is_some() {
                 primary_location = post_location.clone();
             }
 
-            // 4. Media nodes (Carousels vs Single Post)
+            // 4. Media nodes (Carousel vs Single Post)
             let raw_media_nodes: Vec<&Value> = if let Some(carousel) = node.get("carousel_media").and_then(|c| c.as_array()) {
                 carousel.iter().collect()
             } else {
@@ -892,7 +900,8 @@ async fn extract_user_profile_feed(
         );
 
         if hit_known_boundary {
-            debug!(username = %username, "Boundary reached, terminating pagination loop");
+            debug!(username = %username, "Known post boundary reached, stopping crawl");
+            next_cursor_to_return = None;
             break;
         }
 
@@ -906,20 +915,32 @@ async fn extract_user_profile_feed(
             .and_then(|c| c.as_str())
             .map(|s| s.to_string());
 
-        if !has_next_page || next_cursor.is_none() || page_count >= MAX_PAGES {
-            debug!(username = %username, has_next_page, max_pages_reached = page_count >= MAX_PAGES, "Finished timeline pagination");
+        if !has_next_page || next_cursor.is_none() {
+            debug!(username = %username, "Reached end of feed (no further pages)");
+            next_cursor_to_return = None;
+            break;
+        }
+
+        // Check if page budget for this batch was reached
+        if page_count >= max_pages {
+            info!(
+                username = %username,
+                pages_completed = page_count,
+                "Batch quota reached. Preserving end cursor for subsequent queue cycle."
+            );
+            next_cursor_to_return = next_cursor;
             break;
         }
 
         cursor = next_cursor;
 
-        // Pacing delay between sequential pagination calls
+        // Pacing delay between timeline pages
         rate_limiter.wait_for_next_page().await;
     }
 
     if all_media_items.is_empty() {
         if hit_known_boundary {
-            info!(username = %username, "Profile is already completely up-to-date (0 new posts found)");
+            info!(username = %username, "Profile is already up to date (0 new posts found)");
         } else {
             bail!("No media items could be extracted for @{username}");
         }
@@ -929,7 +950,8 @@ async fn extract_user_profile_feed(
         username = %username,
         total_media_items = all_media_items.len(),
         total_posts = discovered_post_urls.len(),
-        "Unified extraction complete"
+        has_continuation_cursor = next_cursor_to_return.is_some(),
+        "Profile extraction batch completed"
     );
 
     Ok(ExtractedMediaMetadata {
@@ -941,7 +963,7 @@ async fn extract_user_profile_feed(
         tags: aggregated_tags.into_iter().collect(),
         items: all_media_items,
         location: primary_location,
-        next_page_url: None,
+        next_page_url: next_cursor_to_return,
         discovered_post_urls,
         embedded_player_urls: Vec::new(),
     })

@@ -1,7 +1,7 @@
 // photo-app/backend/src/services/link_ingest_service.rs
 
 use std::time::Duration;
-use rand::RngExt;
+use media_downloader::utils::rate_limiter::StealthRateLimiter;
 use sqlx::PgPool;
 use tracing::{error, info, warn};
 use uuid::Uuid;
@@ -15,7 +15,7 @@ pub struct LinkIngestService;
 
 impl LinkIngestService {
     /// Enqueues a target URL into the database queue.
-    /// Deduplicates active URLs so rapid successive hits do not trigger concurrent scrapes.
+    /// Deduplicates active URLs so rapid submissions do not trigger duplicate processing.
     pub async fn enqueue(
         pool: &PgPool,
         user_id: Uuid,
@@ -31,10 +31,12 @@ impl LinkIngestService {
         ScrapesRepo::enqueue_link(pool, user_id, target_url, platform, requested_folder).await
     }
 
-    /// Background runner that continuously processes links strictly one by one.
-    /// Applies randomized human delays and handles error backoff.
+    /// Background worker loop that pulls links sequentially and applies
+    /// StealthRateLimiter behavior.
     pub async fn run_worker_loop(state: AppState) {
-        info!("Background Link Ingest Worker started (Strict Sequential Concurrency = 1)");
+        info!("Background Link Ingest Worker started (Strict Concurrency = 1 with StealthRateLimiter)");
+
+        let limiter = StealthRateLimiter::new();
 
         loop {
             // 1. Atomically claim the next pending link using SKIP LOCKED
@@ -50,7 +52,7 @@ impl LinkIngestService {
             let item = match item_opt {
                 Some(it) => it,
                 None => {
-                    // Queue is idle: sleep briefly before polling again
+                    // Queue is idle: pause before re-checking
                     tokio::time::sleep(Duration::from_secs(4)).await;
                     continue;
                 }
@@ -63,13 +65,8 @@ impl LinkIngestService {
                 "Picked up link from ingest queue"
             );
 
-            // 2. Pre-scrape Human Jitter: Wait 3.5s - 7.5s before making network calls
-            let pre_jitter: f64 = rand::rng().random_range(3.5..7.5);
-            info!(
-                delay_secs = format!("{:.2}", pre_jitter),
-                "Simulating natural human pause before scraping manifest"
-            );
-            tokio::time::sleep(Duration::from_secs_f64(pre_jitter)).await;
+            // 2. Pre-scrape pacing: simulates natural user delay before requesting metadata
+            limiter.wait_for_new_link().await;
 
             let auth_user = AuthUser {
                 id: item.user_id,
@@ -84,9 +81,8 @@ impl LinkIngestService {
                         .clone()
                         .unwrap_or(manifest.suggested_folder);
 
-                    // 4. Intermediate Jitter: Short pause before downloading binary assets
-                    let cdn_jitter: f64 = rand::rng().random_range(1.5..3.5);
-                    tokio::time::sleep(Duration::from_secs_f64(cdn_jitter)).await;
+                    // 4. Brief pause between metadata parsing and downloading media files
+                    limiter.wait_before_download().await;
 
                     // 5. Download media files sequentially
                     match execute_item_downloads(
@@ -108,8 +104,10 @@ impl LinkIngestService {
                         Err(e) => {
                             let err_msg = e.to_string();
                             error!(url = %item.target_url, error = %err_msg, "Item download execution failed");
-                            
-                            let (is_rate_limit, backoff_secs) = Self::evaluate_error(&err_msg);
+
+                            let (is_rate_limit, backoff_secs) =
+                                StealthRateLimiter::calculate_backoff(&err_msg, item.attempts);
+
                             let _ = ScrapesRepo::mark_link_retry_backoff(
                                 &state.db,
                                 item.id,
@@ -125,7 +123,9 @@ impl LinkIngestService {
                     let err_msg = e.to_string();
                     warn!(url = %item.target_url, error = %err_msg, "Manifest resolution failed");
 
-                    let (is_rate_limit, backoff_secs) = Self::evaluate_error(&err_msg);
+                    let (is_rate_limit, backoff_secs) =
+                        StealthRateLimiter::calculate_backoff(&err_msg, item.attempts);
+
                     if is_rate_limit {
                         warn!(
                             backoff_seconds = backoff_secs,
@@ -144,31 +144,8 @@ impl LinkIngestService {
                 }
             }
 
-            // 6. Post-Job Cooldown: Natural pause of 6.0s - 14.0s before considering the next link
-            let post_cooldown: f64 = rand::rng().random_range(6.0..14.0);
-            info!(
-                cooldown_secs = format!("{:.2}", post_cooldown),
-                "Resting before processing the next item in queue"
-            );
-            tokio::time::sleep(Duration::from_secs_f64(post_cooldown)).await;
-        }
-    }
-
-    /// Evaluates errors to determine whether to trigger a defensive rate-limit backoff
-    fn evaluate_error(err: &str) -> (bool, i64) {
-        let lower = err.to_lowercase();
-        if lower.contains("429")
-            || lower.contains("feedback_required")
-            || lower.contains("checkpoint")
-            || lower.contains("rate limit")
-        {
-            // Back off 3 to 6 minutes for external rate limits
-            let jitter: i64 = rand::rng().random_range(180..360);
-            (true, jitter)
-        } else {
-            // Standard network failure retry: 30 to 60 seconds
-            let jitter: i64 = rand::rng().random_range(30..60);
-            (false, jitter)
+            // 6. Natural inter-post pause before picking the next link
+            limiter.wait_lightweight().await;
         }
     }
 }
