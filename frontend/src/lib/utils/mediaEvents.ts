@@ -31,6 +31,7 @@ export interface AiCompletedData {
 
 export interface MediaEventHandlers {
   onAssetReady?: (data: AssetReadyData) => void;
+  onBatchAssetsReady?: (batch: AssetReadyData[]) => void;
   onAssetFailed?: (data: AssetFailedData) => void;
   onAlbumUpdated?: (data: AlbumUpdatedData) => void;
   onPeopleUpdated?: (data: PeopleUpdatedData) => void;
@@ -40,10 +41,22 @@ export interface MediaEventHandlers {
 export function initMediaEvents(handlers: MediaEventHandlers) {
   const source = new EventSource('/api/events');
 
+  let readyBatch: AssetReadyData[] = [];
+  let batchTimer: ReturnType<typeof setTimeout> | null = null;
+
+  function flushBatch() {
+    if (readyBatch.length > 0) {
+      if (handlers.onBatchAssetsReady) {
+        handlers.onBatchAssetsReady([...readyBatch]);
+      }
+      readyBatch = [];
+    }
+    batchTimer = null;
+  }
+
   function parseEvent<T>(e: MessageEvent): T | null {
     try {
       const parsed = JSON.parse(e.data);
-      // Handles both { type: "...", data: { ... } } and raw payload
       return (parsed.data ?? parsed) as T;
     } catch (err) {
       console.error('[SSE] Failed parsing event payload', err, e.data);
@@ -51,15 +64,24 @@ export function initMediaEvents(handlers: MediaEventHandlers) {
     }
   }
 
-  // 1. Image/Video Thumbnail is ready -> Add/Update photo feed
+  // 1. Batch AssetReady events to avoid rapid UI refetches
   source.addEventListener('asset_ready', (event) => {
     const data = parseEvent<AssetReadyData>(event as MessageEvent);
-    if (data && handlers.onAssetReady) {
+    if (!data) return;
+
+    if (handlers.onAssetReady) {
       handlers.onAssetReady(data);
+    }
+
+    if (handlers.onBatchAssetsReady) {
+      readyBatch.push(data);
+      if (!batchTimer) {
+        batchTimer = setTimeout(flushBatch, 250);
+      }
     }
   });
 
-  // 2. Asset processing failed -> Update UI status
+  // 2. Asset processing failed
   source.addEventListener('asset_failed', (event) => {
     const data = parseEvent<AssetFailedData>(event as MessageEvent);
     if (data && handlers.onAssetFailed) {
@@ -67,7 +89,7 @@ export function initMediaEvents(handlers: MediaEventHandlers) {
     }
   });
 
-  // 3. Album or Folder item count/cover changed -> Refresh albums
+  // 3. Album or Folder item count/cover changed
   source.addEventListener('album_updated', (event) => {
     const data = parseEvent<AlbumUpdatedData>(event as MessageEvent);
     if (data && handlers.onAlbumUpdated) {
@@ -75,7 +97,7 @@ export function initMediaEvents(handlers: MediaEventHandlers) {
     }
   });
 
-  // 4. Person cluster updated or new person created -> Refresh smart people album
+  // 4. Person cluster updated
   source.addEventListener('people_updated', (event) => {
     const data = parseEvent<PeopleUpdatedData>(event as MessageEvent);
     if (data && handlers.onPeopleUpdated) {
@@ -83,7 +105,7 @@ export function initMediaEvents(handlers: MediaEventHandlers) {
     }
   });
 
-  // 5. AI vectors, tags, and poses completed -> Refresh metadata/search views
+  // 5. AI vectors, tags, and poses completed
   source.addEventListener('ai_completed', (event) => {
     const data = parseEvent<AiCompletedData>(event as MessageEvent);
     if (data && handlers.onAiCompleted) {
@@ -96,6 +118,9 @@ export function initMediaEvents(handlers: MediaEventHandlers) {
   };
 
   return {
-    close: () => source.close()
+    close: () => {
+      if (batchTimer) clearTimeout(batchTimer);
+      source.close();
+    }
   };
 }

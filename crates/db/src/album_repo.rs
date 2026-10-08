@@ -37,7 +37,7 @@ impl AlbumRepo {
     // 1. Virtual Folder Navigation (Disk-backed path explorer)
     // =======================================================================
 
-    /// Retrieves all immediate sub-folders under `current_path` in ONE query.
+    /// Retrieves all immediate sub-folders under `current_path` in ONE query, sorted alphabetically.
     pub async fn get_sub_albums(
         pool: &PgPool,
         user_id: Uuid,
@@ -57,9 +57,9 @@ impl AlbumRepo {
                         created_at
                     FROM assets
                     WHERE user_id = $1 
-                      AND deleted_at IS NULL 
-                      AND folder_path <> '' 
-                      AND folder_path <> 'root'
+                    AND deleted_at IS NULL 
+                    AND folder_path <> '' 
+                    AND folder_path <> 'root'
                 ),
                 ranked_covers AS (
                     SELECT 
@@ -74,7 +74,7 @@ impl AlbumRepo {
                 )
                 SELECT album_name, count, cover_thumb
                 FROM ranked_covers
-                ORDER BY album_name ASC;
+                ORDER BY LOWER(album_name) ASC, album_name ASC;
                 "#,
             )
             .bind(user_id)
@@ -95,8 +95,8 @@ impl AlbumRepo {
                         created_at
                     FROM assets
                     WHERE user_id = $1 
-                      AND deleted_at IS NULL 
-                      AND folder_path LIKE $2
+                    AND deleted_at IS NULL 
+                    AND folder_path LIKE $2
                 ),
                 ranked_covers AS (
                     SELECT 
@@ -111,7 +111,7 @@ impl AlbumRepo {
                 )
                 SELECT album_name, count, cover_thumb
                 FROM ranked_covers
-                ORDER BY album_name ASC;
+                ORDER BY LOWER(album_name) ASC, album_name ASC;
                 "#,
             )
             .bind(user_id)

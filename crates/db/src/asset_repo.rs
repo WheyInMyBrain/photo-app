@@ -467,22 +467,8 @@ impl AssetRepo {
             })
             .unwrap_or_default();
 
-        let build_base_cte = || {
-            let mut builder: QueryBuilder<Postgres> = QueryBuilder::new(
-                "WITH filtered AS ( \
-                    SELECT \
-                        a.id, \
-                        a.duration_seconds, \
-                        a.captured_at, \
-                        a.year, \
-                        a.month, \
-                        a.hour, \
-                        a.city, \
-                        a.camera_model, \
-                        a.folder_path \
-                    FROM assets a ",
-            );
-
+        // Helper closure to attach common filter clauses
+        let apply_common_filters = |builder: &mut QueryBuilder<Postgres>| {
             if let Some(ref album_id) = q.album_id {
                 builder.push(" JOIN album_assets aa ON aa.asset_id = a.id AND aa.album_id = ");
                 builder.push_bind(album_id);
@@ -585,24 +571,35 @@ impl AssetRepo {
                 builder.push(" AND a.captured_at <= ");
                 builder.push_bind(to_date);
             }
-
-            builder.push(") ");
-            builder
         };
 
-        // ROUNDTRIP 1: Compute counts, date bounds, timeline, times-of-day, cities, cameras, and folders
-        let mut main_builder = build_base_cte();
+        // =========================================================================
+        // ROUNDTRIP 1: Summary, Timeline, Locations, Cameras, and Folders
+        // =========================================================================
+        let mut main_builder: QueryBuilder<Postgres> = QueryBuilder::new(
+            "WITH filtered AS ( \
+                SELECT \
+                    a.id, \
+                    a.duration_seconds, \
+                    a.captured_at, \
+                    a.year, \
+                    a.month, \
+                    a.hour, \
+                    a.city, \
+                    a.camera_model, \
+                    a.folder_path \
+                FROM assets a ",
+        );
+        apply_common_filters(&mut main_builder);
         main_builder.push(
-            r#"
+            r#")
             SELECT 
-                -- Summary stats
                 COUNT(*)::bigint AS total_count,
                 COUNT(CASE WHEN duration_seconds IS NULL THEN 1 END)::bigint AS p_count,
                 COUNT(CASE WHEN duration_seconds IS NOT NULL THEN 1 END)::bigint AS v_count,
                 MIN(captured_at) AS min_d, 
                 MAX(captured_at) AS max_d,
 
-                -- Timeline
                 COALESCE((
                     SELECT jsonb_agg(jsonb_build_object(
                         'year', t.year::text,
@@ -619,7 +616,6 @@ impl AssetRepo {
                     ) t
                 ), '[]'::jsonb) AS timeline_json,
 
-                -- Times of day
                 COALESCE((
                     SELECT jsonb_agg(jsonb_build_object(
                         'value', LOWER(tod.period),
@@ -641,7 +637,6 @@ impl AssetRepo {
                     ) tod
                 ), '[]'::jsonb) AS tod_json,
 
-                -- Locations
                 COALESCE((
                     SELECT jsonb_agg(jsonb_build_object(
                         'value', loc.city,
@@ -657,7 +652,6 @@ impl AssetRepo {
                     ) loc
                 ), '[]'::jsonb) AS locations_json,
 
-                -- Cameras
                 COALESCE((
                     SELECT jsonb_agg(jsonb_build_object(
                         'value', cam.camera_model,
@@ -673,7 +667,6 @@ impl AssetRepo {
                     ) cam
                 ), '[]'::jsonb) AS cameras_json,
 
-                -- Folders
                 COALESCE((
                     SELECT jsonb_agg(jsonb_build_object(
                         'value', fld.folder_path,
@@ -710,14 +703,26 @@ impl AssetRepo {
         let cameras: Vec<FilterOption> = serde_json::from_value(row.get("cameras_json")).unwrap_or_default();
         let albums: Vec<FilterOption> = serde_json::from_value(row.get("albums_json")).unwrap_or_default();
 
-        // ROUNDTRIP 2: Tags & People (Relational Hash Joins)
-        let mut tags_builder = build_base_cte();
+        // =========================================================================
+        // ROUNDTRIP 2: Lean ID-only CTE for Tags and People
+        // =========================================================================
+        let build_id_only_cte = || {
+            let mut builder: QueryBuilder<Postgres> = QueryBuilder::new(
+                "WITH filtered_ids AS ( SELECT a.id FROM assets a ",
+            );
+            apply_common_filters(&mut builder);
+            builder.push(") ");
+            builder
+        };
+
+        // 1. Tags Query (uses COUNT(*) instead of COUNT(DISTINCT))
+        let mut tags_builder = build_id_only_cte();
         tags_builder.push(
             r#"
             SELECT 
                 t.name, 
-                COUNT(DISTINCT at.asset_id)::bigint AS count
-            FROM filtered f
+                COUNT(*)::bigint AS count
+            FROM filtered_ids f
             JOIN asset_tags at ON f.id = at.asset_id AND at.user_id = 
             "#,
         );
@@ -731,26 +736,15 @@ impl AssetRepo {
             "#,
         );
 
-        let tags = tags_builder
-            .build()
-            .fetch_all(pool)
-            .await?
-            .into_iter()
-            .map(|r| FilterOption {
-                value: r.get("name"),
-                label: r.get("name"),
-                count: r.get("count"),
-            })
-            .collect();
-
-        let mut people_builder = build_base_cte();
+        // 2. People Query (uses COUNT(*) instead of COUNT(DISTINCT))
+        let mut people_builder = build_id_only_cte();
         people_builder.push(
             r#"
             SELECT 
                 p.id::text AS id, 
                 p.name, 
-                COUNT(DISTINCT af.asset_id)::bigint AS count
-            FROM filtered f
+                COUNT(*)::bigint AS count
+            FROM filtered_ids f
             JOIN asset_faces af ON f.id = af.asset_id AND af.user_id = 
             "#,
         );
@@ -765,10 +759,22 @@ impl AssetRepo {
             "#,
         );
 
-        let people = people_builder
-            .build()
-            .fetch_all(pool)
-            .await?
+        // Execute Tags and People queries concurrently
+        let (tags_rows, people_rows) = tokio::try_join!(
+            tags_builder.build().fetch_all(pool),
+            people_builder.build().fetch_all(pool)
+        )?;
+
+        let tags = tags_rows
+            .into_iter()
+            .map(|r| FilterOption {
+                value: r.get("name"),
+                label: r.get("name"),
+                count: r.get("count"),
+            })
+            .collect();
+
+        let people = people_rows
             .into_iter()
             .map(|r| FilterOption {
                 value: r.get("id"),

@@ -11,6 +11,7 @@
     type SimilarMediaItem
   } from '$lib/api/assets';
   import type { FaceDetail, TagItem, PersonCandidate } from '$lib/types/modal';
+  import { downloadAsset, shareAsset } from '$lib/utils/shareAndDownload';
   import PhotoDetailsSheet from './PhotoDetailsSheet.svelte';
 
   export let asset: {
@@ -56,6 +57,9 @@
   // Sidebar & Overlay Data
   let showMobileInfo = false;
   let isFavorite = false;
+  let isSharing = false;
+  let isDownloading = false;
+
   let faces: FaceDetail[] = [];
   let poses: AssetPoseDetail[] = [];
   let tags: TagItem[] = [];
@@ -320,6 +324,29 @@
     return clean.startsWith('users/') ? `/${clean}` : `/thumbs/${clean}`;
   }
 
+  // Primary URL for downloading/sharing full original media
+  $: activeDownloadUrl = asset ? `/api/assets/${asset.id}/stream` : '';
+
+  async function handleShare() {
+    if (!asset || isSharing) return;
+    isSharing = true;
+    try {
+      await shareAsset(activeDownloadUrl, asset.file_name, asset.mime_type || 'image/jpeg');
+    } finally {
+      isSharing = false;
+    }
+  }
+
+  async function handleDownload() {
+    if (!asset || isDownloading) return;
+    isDownloading = true;
+    try {
+      await downloadAsset(activeDownloadUrl, asset.file_name);
+    } finally {
+      isDownloading = false;
+    }
+  }
+
   $: if (asset?.id) {
     isFavorite = Boolean(asset.is_favorite);
     showMobileInfo = false;
@@ -524,7 +551,7 @@
         </svg>
       </button>
 
-      <div class="pointer-events-auto flex items-center gap-2">
+      <div class="pointer-events-auto flex items-center gap-1.5 sm:gap-2">
         {#if scale > 1.05}
           <button
             type="button"
@@ -537,6 +564,45 @@
           </button>
         {/if}
 
+        <!-- Native Share Button -->
+        <button
+          type="button"
+          disabled={isSharing}
+          on:click={handleShare}
+          class="liquid-icon-btn w-9 h-9 rounded-full flex items-center justify-center text-[var(--text-muted)] hover:text-[var(--text-main)] spring-tap cursor-pointer disabled:opacity-40"
+          title="Share"
+          aria-label="Share"
+        >
+          {#if isSharing}
+            <div class="w-3.5 h-3.5 border-2 border-purple-400 border-t-transparent rounded-full animate-spin"></div>
+          {:else}
+            <svg xmlns="http://www.w3.org/2000/svg" class="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M8.684 13.342C8.886 12.938 9 12.482 9 12c0-.482-.114-.938-.316-1.342m0 2.684a3 3 0 110-2.684m0 2.684l6.632 3.316m-6.632-6l6.632-3.316m0 0a3 3 0 105.367-2.684 3 3 0 00-5.367 2.684zm0 9.316a3 3 0 105.368 2.684 3 3 0 00-5.368-2.684z" />
+            </svg>
+          {/if}
+        </button>
+
+        <!-- Direct Download Button -->
+        <button
+          type="button"
+          disabled={isDownloading}
+          on:click={handleDownload}
+          class="liquid-icon-btn w-9 h-9 rounded-full flex items-center justify-center text-[var(--text-muted)] hover:text-[var(--text-main)] spring-tap cursor-pointer disabled:opacity-40"
+          title="Download original"
+          aria-label="Download original"
+        >
+          {#if isDownloading}
+            <div class="w-3.5 h-3.5 border-2 border-purple-400 border-t-transparent rounded-full animate-spin"></div>
+          {:else}
+            <svg xmlns="http://www.w3.org/2000/svg" class="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+              <polyline points="7 10 12 15 17 10"></polyline>
+              <line x1="12" y1="15" x2="12" y2="3"></line>
+            </svg>
+          {/if}
+        </button>
+
+        <!-- Favorite Toggle Button -->
         <button
           type="button"
           on:click={handleToggleFavorite}
@@ -549,6 +615,7 @@
           </svg>
         </button>
 
+        <!-- Mobile Info Sheet Toggle Button -->
         <button
           type="button"
           on:click={() => (showMobileInfo = !showMobileInfo)}

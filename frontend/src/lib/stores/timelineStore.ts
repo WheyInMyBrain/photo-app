@@ -5,28 +5,50 @@ import { authStore } from '$lib/stores/authStore';
 import type { SubAlbum, BreadcrumbSegment, MediaSection, MediaPageResponse, MediaItemSummary } from '$lib/types/media';
 
 /**
- * Merges incoming sections across pagination boundaries.
- * If the first incoming section shares an ID with the last loaded section
- * (e.g. photos from the same day crossing cursor limits), append items directly.
+ * Deduplicates and merges incoming sections across pagination boundaries.
+ * Prevents Svelte each_key_duplicate crashes by strictly filtering out
+ * already-rendered asset IDs across all sections.
  */
 function mergeSections(current: MediaSection[], incoming: MediaSection[]): MediaSection[] {
   if (incoming.length === 0) return current;
   if (current.length === 0) return incoming;
 
+  // Track existing IDs across the entire view to guarantee uniqueness
+  const existingIds = new Set<string>();
+  for (const sec of current) {
+    for (const item of sec.items) {
+      existingIds.add(item.id);
+    }
+  }
+
+  // Filter out any incoming item that already exists in memory
+  const sanitizedIncoming = incoming
+    .map((sec) => ({
+      ...sec,
+      items: sec.items.filter((item) => {
+        if (existingIds.has(item.id)) return false;
+        existingIds.add(item.id);
+        return true;
+      })
+    }))
+    .filter((sec) => sec.items.length > 0);
+
+  if (sanitizedIncoming.length === 0) return current;
+
   const cloned = [...current];
-  const firstInc = incoming[0];
+  const firstInc = sanitizedIncoming[0];
   const lastCur = cloned[cloned.length - 1];
 
   let startIdx = 0;
 
-  // Stitch items if the boundary section ID matches (covers both matching dates AND 'explore-feed')
+  // Stitch items if the boundary section ID matches (dates match OR explore-feed)
   if (lastCur.id === firstInc.id) {
     lastCur.items = [...lastCur.items, ...firstInc.items];
     startIdx = 1;
   }
 
-  for (let i = startIdx; i < incoming.length; i++) {
-    cloned.push(incoming[i]);
+  for (let i = startIdx; i < sanitizedIncoming.length; i++) {
+    cloned.push(sanitizedIncoming[i]);
   }
 
   return cloned;
@@ -185,6 +207,43 @@ export function createTimelineStore() {
     });
   }
 
+  /**
+   * Patches a thumbnail in-place upon receiving an `asset_ready` event from SSE.
+   * Updates only the affected image without touching pagination cursors or scroll position.
+   */
+  function patchAssetThumb(assetId: string, thumbPath: string) {
+    sections.update((curr) => {
+      let found = false;
+      const updated = curr.map((sec) => {
+        const itemIdx = sec.items.findIndex((item) => item.id === assetId);
+        if (itemIdx === -1) return sec;
+
+        found = true;
+        const newItems = [...sec.items];
+        newItems[itemIdx] = { ...newItems[itemIdx], thumb_path: thumbPath };
+        return { ...sec, items: newItems };
+      });
+
+      return found ? updated : curr;
+    });
+  }
+
+  /**
+   * Removes deleted/unlinked assets locally from memory.
+   * Keeps the feed intact and retains the user's scroll position.
+   */
+  function removeAssetsLocally(assetIds: string[]) {
+    const idSet = new Set(assetIds);
+    sections.update((curr) => {
+      return curr
+        .map((sec) => ({
+          ...sec,
+          items: sec.items.filter((item) => !idSet.has(item.id))
+        }))
+        .filter((sec) => sec.items.length > 0);
+    });
+  }
+
   function destroy() {
     currentRequestId++;
     if (pageAbortCtrl) pageAbortCtrl.abort();
@@ -199,6 +258,8 @@ export function createTimelineStore() {
     fetchMedia,
     jumpToDate,
     patchFavorite,
+    patchAssetThumb,
+    removeAssetsLocally,
     destroy
   };
 }

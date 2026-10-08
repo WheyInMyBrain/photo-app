@@ -626,7 +626,7 @@ async fn extract_user_profile_feed(
 
     let mut cursor: Option<String> = None;
     let mut page_count = 0;
-    const MAX_PAGES: usize = 500;
+    const MAX_PAGES: usize = 5000;
     let mut hit_known_boundary = false;
 
     loop {

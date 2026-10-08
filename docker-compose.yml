@@ -3,9 +3,10 @@ services:
     image: caddy:2-alpine
     restart: unless-stopped
     ports:
-      - "3001:80"
+      - "3001:443"
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - ./storage:/data/storage:ro
     depends_on:
       - backend
       - frontend

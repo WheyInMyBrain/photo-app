@@ -11,6 +11,7 @@
   import { gridDensity, DENSITY_PRESETS } from '$lib/stores/gridDensityStore';
   import { initMediaEvents } from '$lib/utils/mediaEvents';
   import { createPinchZoomHandler } from '$lib/utils/pinchZoom';
+  import { downloadAsset, shareAsset } from '$lib/utils/shareAndDownload';
   import {
     resolveAsset,
     getPrevCoords,
@@ -37,6 +38,7 @@
   let scrollTrigger: HTMLDivElement;
   let observer: IntersectionObserver | null = null;
   let filterDebounceTimer: ReturnType<typeof setTimeout> | null = null;
+  let albumReloadTimer: ReturnType<typeof setTimeout> | null = null;
   let sseSubscription: { close: () => void } | null = null;
 
   let showAddToAlbumModal = false;
@@ -94,12 +96,18 @@
     activeCoords = [secIdx, itemIdx];
   }
 
+  // Optimistic/In-Place removal so scroll never jumps
   async function handleRemoveFromAlbum() {
     if (!$filterStore.album_id || selectedAssetIds.length === 0) return;
-    const ok = await albumStore.removeItems($filterStore.album_id, selectedAssetIds);
+    const idsToRemove = [...selectedAssetIds];
+    const ok = await albumStore.removeItems($filterStore.album_id, idsToRemove);
     if (ok) {
       selection.clearSelection();
-      timeline.fetchMedia($filterQueryString, true);
+      if (typeof (timeline as any).removeAssetsLocally === 'function') {
+        (timeline as any).removeAssetsLocally(idsToRemove);
+      } else {
+        timeline.fetchMedia($filterQueryString, true);
+      }
       albumStore.load();
     }
   }
@@ -107,6 +115,68 @@
   async function handleSetCover(assetId: string, thumbPath: string) {
     if (!$filterStore.album_id) return;
     await albumStore.setCover($filterStore.album_id, assetId, thumbPath);
+  }
+
+  // =========================================================================
+  // Batch Download & Share Handlers
+  // =========================================================================
+  function getSelectedAssetObjects() {
+    const selectedList: any[] = [];
+    for (const sec of $sections) {
+      for (const item of sec.items) {
+        if (selectedSet.has(item.id)) {
+          selectedList.push(item);
+        }
+      }
+    }
+    return selectedList;
+  }
+
+  async function handleBatchDownload() {
+    const items = getSelectedAssetObjects();
+    for (const item of items) {
+      const url = `/api/assets/${item.id}/stream`;
+      await downloadAsset(url, item.file_name);
+    }
+  }
+
+  async function handleBatchShare() {
+    const items = getSelectedAssetObjects();
+    if (items.length === 0) return;
+
+    if (items.length === 1) {
+      const item = items[0];
+      const url = `/api/assets/${item.id}/stream`;
+      await shareAsset(url, item.file_name, item.mime_type || 'image/jpeg');
+      return;
+    }
+
+    // Multi-file native sharing (supported on iOS Safari / macOS / Android Chrome)
+    if (navigator.canShare && typeof navigator.share === 'function') {
+      try {
+        const files: File[] = [];
+        for (const item of items) {
+          const url = `/api/assets/${item.id}/stream`;
+          const res = await fetch(url);
+          const blob = await res.blob();
+          files.push(new File([blob], item.file_name, { type: blob.type || item.mime_type || 'image/jpeg' }));
+        }
+
+        if (navigator.canShare({ files })) {
+          await navigator.share({
+            title: `${files.length} Photos`,
+            files
+          });
+          return;
+        }
+      } catch (err: any) {
+        if (err.name === 'AbortError') return;
+        console.warn('Batch native share failed, falling back to download:', err);
+      }
+    }
+
+    // Fallback if browser does not support multi-file native sharing
+    await handleBatchDownload();
   }
 
   function formatTime(seconds?: number | null): string {
@@ -154,12 +224,26 @@
   onMount(() => {
     albumStore.load();
 
-    const handleRefresh = () => {
+    const handleManualRefresh = () => {
       timeline.fetchMedia($filterQueryString, true);
       albumStore.load();
     };
-    window.addEventListener('vault:refresh-timeline', handleRefresh);
-    sseSubscription = initMediaEvents(handleRefresh);
+    window.addEventListener('vault:refresh-timeline', handleManualRefresh);
+
+    // Fine-grained SSE handlers that DO NOT reload the full feed
+    sseSubscription = initMediaEvents({
+      onAssetReady: (data) => {
+        if (typeof (timeline as any).patchAssetThumb === 'function') {
+          (timeline as any).patchAssetThumb(data.asset_id, data.thumb_path);
+        }
+      },
+      onAlbumUpdated: () => {
+        if (albumReloadTimer) clearTimeout(albumReloadTimer);
+        albumReloadTimer = setTimeout(() => {
+          albumStore.load();
+        }, 500);
+      }
+    });
 
     const handleOpenAsset = (e: Event) => {
       const customEvent = e as CustomEvent<{ id: string }>;
@@ -175,19 +259,20 @@
     };
     scrollParent?.addEventListener('scroll', handleScroll, { passive: true });
 
+    // RootMargin tuned to 400px to avoid HDD saturation
     observer = new IntersectionObserver(
       (entries) => {
         if (entries[0].isIntersecting && $hasMore && !$isLoading) {
           timeline.fetchMedia($filterQueryString, false);
         }
       },
-      { rootMargin: '1800px 0px', threshold: 0.01 }
+      { rootMargin: '400px 0px', threshold: 0.01 }
     );
 
     if (scrollTrigger) observer.observe(scrollTrigger);
 
     return () => {
-      window.removeEventListener('vault:refresh-timeline', handleRefresh);
+      window.removeEventListener('vault:refresh-timeline', handleManualRefresh);
       window.removeEventListener('vault:open-asset', handleOpenAsset);
       scrollParent?.removeEventListener('scroll', handleScroll);
     };
@@ -196,6 +281,7 @@
   onDestroy(() => {
     timeline.destroy();
     if (filterDebounceTimer) clearTimeout(filterDebounceTimer);
+    if (albumReloadTimer) clearTimeout(albumReloadTimer);
     if (observer) observer.disconnect();
     if (sseSubscription) sseSubscription.close();
   });
@@ -357,6 +443,8 @@
   on:purge={selection.batchPurge}
   on:addToAlbum={() => (showAddToAlbumModal = true)}
   on:removeFromAlbum={handleRemoveFromAlbum}
+  on:share={handleBatchShare}
+  on:download={handleBatchDownload}
   on:clear={selection.clearSelection}
 />
 
@@ -450,6 +538,9 @@
     overflow: hidden;
     -webkit-touch-callout: none;
     background-color: var(--card-bg, #1e1e24);
+    contain: layout paint;
+    content-visibility: auto;
+    contain-intrinsic-size: 150px 150px;
   }
 
   .select-btn {
