@@ -4,6 +4,7 @@ services:
     restart: unless-stopped
     ports:
       - "3001:443"
+      - "4001:80"
     volumes:
       - ./Caddyfile:/etc/caddy/Caddyfile:ro
       - ./storage:/data/storage:ro

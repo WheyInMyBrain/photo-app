@@ -1,6 +1,5 @@
-:443 {
-    tls /etc/ssl/server.crt /etc/ssl/server.key
-
+# Reusable block containing all routing rules
+(app_routes) {
     # 1. Specialized handling for long-lived SSE / stream connections
     handle /api/events* {
         reverse_proxy backend:3000 {
@@ -42,4 +41,20 @@
     handle {
         reverse_proxy frontend:3000
     }
+}
+
+# ---------------------------------------------------------
+# Plain HTTP on port 80 -> Mapped to host port 4001
+# (No TLS/SSL overhead or certificate checks)
+# ---------------------------------------------------------
+:80 {
+    import app_routes
+}
+
+# ---------------------------------------------------------
+# Encrypted HTTPS on port 443 -> Mapped to host port 3001
+# ---------------------------------------------------------
+:443 {
+    tls /etc/ssl/server.crt /etc/ssl/server.key
+    import app_routes
 }
