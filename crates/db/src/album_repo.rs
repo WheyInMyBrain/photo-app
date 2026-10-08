@@ -154,29 +154,23 @@ impl AlbumRepo {
         pool: &PgPool,
         user_id: Uuid,
     ) -> Result<Vec<String>, sqlx::Error> {
-        let asset_folders: Vec<String> = sqlx::query_scalar(
+        let paths: Vec<String> = sqlx::query_scalar(
             r#"
-            SELECT DISTINCT folder_path 
+            SELECT folder_path AS path
             FROM assets 
             WHERE user_id = $1 AND deleted_at IS NULL AND folder_path <> ''
-            "#,
-        )
-        .bind(user_id)
-        .fetch_all(pool)
-        .await?;
-
-        let album_titles: Vec<String> = sqlx::query_scalar(
-            r#"
-            SELECT title 
+            UNION
+            SELECT title AS path
             FROM albums 
             WHERE user_id = $1 AND deleted_at IS NULL
+            ORDER BY LOWER(path) ASC, path ASC;
             "#,
         )
         .bind(user_id)
         .fetch_all(pool)
         .await?;
 
-        Ok(asset_folders.into_iter().chain(album_titles).collect())
+        Ok(paths)
     }
 
     // =======================================================================
@@ -203,7 +197,6 @@ impl AlbumRepo {
                     a.updated_at
                 FROM albums a
                 WHERE a.user_id = $1 AND a.deleted_at IS NULL
-                ORDER BY a.created_at DESC
             ),
             album_stats AS (
                 SELECT 
@@ -232,7 +225,7 @@ impl AlbumRepo {
             LEFT JOIN album_stats st ON ua.id = st.album_id
             LEFT JOIN assets c_explicit 
                 ON ua.cover_asset_id = c_explicit.id AND c_explicit.deleted_at IS NULL
-            ORDER BY ua.created_at DESC;
+            ORDER BY LOWER(ua.title) ASC, ua.title ASC;
             "#,
         )
         .bind(user_id)
