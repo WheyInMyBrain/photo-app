@@ -46,7 +46,6 @@ impl AlbumRepo {
         let clean_path = current_path.trim().trim_matches('/');
 
         let rows = if clean_path.is_empty() {
-            // Root level: Extract first path component before '/'
             sqlx::query(
                 r#"
                 WITH direct_folders AS (
@@ -61,27 +60,30 @@ impl AlbumRepo {
                     AND folder_path <> '' 
                     AND folder_path <> 'root'
                 ),
-                ranked_covers AS (
-                    SELECT 
-                        album_name,
-                        COUNT(*)::bigint AS count,
-                        (
-                            ARRAY_AGG(thumb_path ORDER BY captured_at DESC NULLS LAST, created_at DESC)
-                        )[1] AS cover_thumb
+                folder_counts AS (
+                    SELECT album_name, COUNT(*)::bigint AS count
                     FROM direct_folders
                     WHERE album_name <> ''
                     GROUP BY album_name
+                ),
+                folder_covers AS (
+                    SELECT DISTINCT ON (album_name)
+                        album_name,
+                        thumb_path AS cover_thumb
+                    FROM direct_folders
+                    WHERE album_name <> ''
+                    ORDER BY album_name, captured_at DESC NULLS LAST, created_at DESC
                 )
-                SELECT album_name, count, cover_thumb
-                FROM ranked_covers
-                ORDER BY LOWER(album_name) ASC, album_name ASC;
+                SELECT fc.album_name, fc.count, fcv.cover_thumb
+                FROM folder_counts fc
+                JOIN folder_covers fcv USING (album_name)
+                ORDER BY LOWER(fc.album_name) ASC, fc.album_name ASC;
                 "#,
             )
             .bind(user_id)
             .fetch_all(pool)
             .await?
         } else {
-            // Sub-level: Find immediate child segment directly following the prefix
             let prefix_pattern = format!("{}/%", clean_path);
             let prefix_depth = clean_path.split('/').count() + 1;
 
@@ -98,20 +100,24 @@ impl AlbumRepo {
                     AND deleted_at IS NULL 
                     AND folder_path LIKE $2
                 ),
-                ranked_covers AS (
-                    SELECT 
-                        album_name,
-                        COUNT(*)::bigint AS count,
-                        (
-                            ARRAY_AGG(thumb_path ORDER BY captured_at DESC NULLS LAST, created_at DESC)
-                        )[1] AS cover_thumb
+                folder_counts AS (
+                    SELECT album_name, COUNT(*)::bigint AS count
                     FROM direct_folders
                     WHERE album_name <> ''
                     GROUP BY album_name
+                ),
+                folder_covers AS (
+                    SELECT DISTINCT ON (album_name)
+                        album_name,
+                        thumb_path AS cover_thumb
+                    FROM direct_folders
+                    WHERE album_name <> ''
+                    ORDER BY album_name, captured_at DESC NULLS LAST, created_at DESC
                 )
-                SELECT album_name, count, cover_thumb
-                FROM ranked_covers
-                ORDER BY LOWER(album_name) ASC, album_name ASC;
+                SELECT fc.album_name, fc.count, fcv.cover_thumb
+                FROM folder_counts fc
+                JOIN folder_covers fcv USING (album_name)
+                ORDER BY LOWER(fc.album_name) ASC, fc.album_name ASC;
                 "#,
             )
             .bind(user_id)
@@ -184,40 +190,49 @@ impl AlbumRepo {
     ) -> Result<Vec<AlbumRecord>, sqlx::Error> {
         let rows = sqlx::query(
             r#"
-            SELECT 
-                a.id,
-                a.user_id,
-                a.title,
-                a.description,
-                a.album_type,
-                a.cover_asset_id,
-                a.filter_criteria,
-                a.created_at,
-                a.updated_at,
-                COALESCE(counts.media_count, 0)::bigint AS media_count,
-                COALESCE(c_explicit.thumb_path, c_fallback.thumb_path) AS cover_thumb
-            FROM albums a
-            -- Fast Media Count Aggregation
-            LEFT JOIN LATERAL (
-                SELECT COUNT(*)::bigint AS media_count
+            WITH user_albums AS (
+                SELECT 
+                    a.id,
+                    a.user_id,
+                    a.title,
+                    a.description,
+                    a.album_type,
+                    a.cover_asset_id,
+                    a.filter_criteria,
+                    a.created_at,
+                    a.updated_at
+                FROM albums a
+                WHERE a.user_id = $1 AND a.deleted_at IS NULL
+                ORDER BY a.created_at DESC
+            ),
+            album_stats AS (
+                SELECT 
+                    aa.album_id,
+                    COUNT(aa.asset_id)::bigint AS media_count,
+                    (ARRAY_AGG(ast.thumb_path ORDER BY aa.position ASC, aa.added_at DESC))[1] AS fallback_thumb
                 FROM album_assets aa
-                JOIN assets ast ON aa.asset_id = ast.id
-                WHERE aa.album_id = a.id AND ast.deleted_at IS NULL
-            ) counts ON TRUE
-            -- Explicit Cover Lookup
+                JOIN assets ast ON aa.asset_id = ast.id AND ast.deleted_at IS NULL
+                WHERE aa.user_id = $1
+                AND aa.album_id IN (SELECT id FROM user_albums)
+                GROUP BY aa.album_id
+            )
+            SELECT 
+                ua.id,
+                ua.user_id,
+                ua.title,
+                ua.description,
+                ua.album_type,
+                ua.cover_asset_id,
+                ua.filter_criteria,
+                ua.created_at,
+                ua.updated_at,
+                COALESCE(st.media_count, 0)::bigint AS media_count,
+                COALESCE(c_explicit.thumb_path, st.fallback_thumb) AS cover_thumb
+            FROM user_albums ua
+            LEFT JOIN album_stats st ON ua.id = st.album_id
             LEFT JOIN assets c_explicit 
-                ON a.cover_asset_id = c_explicit.id AND c_explicit.deleted_at IS NULL
-            -- Fallback Cover Lookup (Latest Asset in Album)
-            LEFT JOIN LATERAL (
-                SELECT sub_a.thumb_path
-                FROM album_assets sub_aa
-                JOIN assets sub_a ON sub_aa.asset_id = sub_a.id
-                WHERE sub_aa.album_id = a.id AND sub_a.deleted_at IS NULL
-                ORDER BY sub_aa.position ASC, sub_aa.added_at DESC
-                LIMIT 1
-            ) c_fallback ON TRUE
-            WHERE a.user_id = $1 AND a.deleted_at IS NULL
-            ORDER BY a.created_at DESC;
+                ON ua.cover_asset_id = c_explicit.id AND c_explicit.deleted_at IS NULL
+            ORDER BY ua.created_at DESC;
             "#,
         )
         .bind(user_id)
