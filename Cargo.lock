@@ -2936,6 +2936,7 @@ dependencies = [
  "imagesize",
  "indicatif",
  "little_exif",
+ "rand 0.10.2",
  "regex",
  "reqwest",
  "serde",

@@ -67,6 +67,19 @@ pub struct ScrapedItemContext {
     pub published_at: Option<DateTime<Utc>>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
+pub struct QueuedLinkItem {
+    pub id: Uuid,
+    pub user_id: Uuid,
+    pub target_url: String,
+    pub platform: String,
+    pub requested_folder: Option<String>,
+    pub attempts: i32,
+    pub max_attempts: i32,
+    pub resume_cursor: Option<String>,
+    pub batch_page_count: i32,
+}
+
 pub struct ScrapesRepo;
 
 impl ScrapesRepo {
@@ -466,5 +479,173 @@ impl ScrapesRepo {
         .await?;
 
         Ok(rows.into_iter().collect())
+    }
+
+    /// Safely enqueues a link. If the exact same active link is already pending/processing,
+    /// it ignores the duplicate and returns false.
+    pub async fn enqueue_link(
+        pool: &PgPool,
+        user_id: Uuid,
+        target_url: &str,
+        platform: &str,
+        requested_folder: Option<&str>,
+    ) -> Result<bool, sqlx::Error> {
+        let rows_affected = sqlx::query(
+            r#"
+            INSERT INTO link_ingest_queue (
+                user_id, target_url, platform, requested_folder, status
+            ) VALUES ($1, $2, $3, $4, 'pending')
+            ON CONFLICT (user_id, target_url) DO UPDATE
+                -- Re-activate failed items if the user explicitly re-submits them
+                SET status = 'pending',
+                    attempts = 0,
+                    last_error = NULL,
+                    next_retry_at = CURRENT_TIMESTAMP,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE link_ingest_queue.status = 'failed'
+            "#,
+        )
+        .bind(user_id)
+        .bind(target_url)
+        .bind(platform)
+        .bind(requested_folder)
+        .execute(pool)
+        .await?
+        .rows_affected();
+
+        Ok(rows_affected > 0)
+    }
+
+    /// Atomically locks and claims the next ready pending item using SKIP LOCKED.
+    /// Ensures concurrency = 1 safely without worker collisions.
+    pub async fn claim_next_pending_link(
+        pool: &PgPool,
+    ) -> Result<Option<QueuedLinkItem>, sqlx::Error> {
+        let row = sqlx::query_as::<_, QueuedLinkItem>(
+            r#"
+            UPDATE link_ingest_queue
+            SET status = 'processing',
+                attempts = attempts + 1,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = (
+                SELECT id
+                FROM link_ingest_queue
+                WHERE status IN ('pending', 'rate_limited')
+                  AND next_retry_at <= CURRENT_TIMESTAMP
+                ORDER BY created_at ASC
+                FOR UPDATE SKIP LOCKED
+                LIMIT 1
+            )
+            RETURNING id, user_id, target_url, platform, requested_folder,
+                      attempts, max_attempts, resume_cursor, batch_page_count
+            "#,
+        )
+        .fetch_optional(pool)
+        .await?;
+
+        Ok(row)
+    }
+
+    /// Marks the item as completed and removes it from the active queue
+    pub async fn mark_link_completed(
+        pool: &PgPool,
+        queue_id: Uuid,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            r#"
+            UPDATE link_ingest_queue
+            SET status = 'completed',
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = $1
+            "#,
+        )
+        .bind(queue_id)
+        .execute(pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// Yields back to the queue with an updated pagination cursor and page counter
+    /// for chunked multi-page crawling
+    pub async fn update_link_progress(
+        pool: &PgPool,
+        queue_id: Uuid,
+        resume_cursor: Option<&str>,
+        additional_pages: i32,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            r#"
+            UPDATE link_ingest_queue
+            SET resume_cursor = $2,
+                batch_page_count = batch_page_count + $3,
+                status = 'pending',
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = $1
+            "#,
+        )
+        .bind(queue_id)
+        .bind(resume_cursor)
+        .bind(additional_pages)
+        .execute(pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// Delays future processing when rate limited or encounters a recoverable error
+    pub async fn mark_link_retry_backoff(
+        pool: &PgPool,
+        queue_id: Uuid,
+        error_msg: &str,
+        backoff_secs: i64,
+        is_rate_limit: bool,
+    ) -> Result<(), sqlx::Error> {
+        let status = if is_rate_limit { "rate_limited" } else { "pending" };
+
+        sqlx::query(
+            r#"
+            UPDATE link_ingest_queue
+            SET status = CASE 
+                    WHEN attempts >= max_attempts THEN 'failed'
+                    ELSE $2
+                END,
+                last_error = $3,
+                next_retry_at = CURRENT_TIMESTAMP + ($4 * INTERVAL '1 second'),
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = $1
+            "#,
+        )
+        .bind(queue_id)
+        .bind(status)
+        .bind(error_msg)
+        .bind(backoff_secs)
+        .execute(pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// Marks the item permanently failed
+    pub async fn mark_link_failed(
+        pool: &PgPool,
+        queue_id: Uuid,
+        error_msg: &str,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            r#"
+            UPDATE link_ingest_queue
+            SET status = 'failed',
+                last_error = $2,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = $1
+            "#,
+        )
+        .bind(queue_id)
+        .bind(error_msg)
+        .execute(pool)
+        .await?;
+
+        Ok(())
     }
 }

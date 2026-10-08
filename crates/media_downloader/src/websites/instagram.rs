@@ -5,6 +5,7 @@ use crate::models::{
     ExtractedLocation, ExtractedMediaMetadata, MediaDimensions, MediaItem, MediaType, MediaVariant,
 };
 use crate::utils::page::extract_hashtags_from_text;
+use crate::utils::rate_limiter::StealthRateLimiter;
 use crate::websites::Extractor;
 use anyhow::{bail, Context, Result};
 use reqwest::header::{
@@ -15,7 +16,6 @@ use serde_json::{json, Value};
 use std::collections::HashSet;
 use std::future::Future;
 use std::pin::Pin;
-use std::time::Duration;
 use tracing::{debug, error, info, warn};
 
 const BROWSER_UA: &str =
@@ -87,6 +87,7 @@ pub async fn extract_instagram(
 async fn extract_and_resolve_location(
     loc_val: Option<&Value>,
     client: &Client,
+    limiter: Option<&StealthRateLimiter>,
 ) -> Option<ExtractedLocation> {
     let loc = loc_val?;
     let name = loc.get("name").and_then(|n| n.as_str())?.trim().to_string();
@@ -104,6 +105,9 @@ async fn extract_and_resolve_location(
 
     if (latitude.is_none() || longitude.is_none()) && location_id.is_some() {
         if let Some(ref lid) = location_id {
+            if let Some(rl) = limiter {
+                rl.wait_lightweight().await;
+            }
             debug!(location_name = %name, location_id = %lid, "Fetching missing coordinates from location API");
             let loc_api = format!("https://www.instagram.com/api/v1/locations/{lid}/info/");
             if let Ok(resp) = client
@@ -186,7 +190,7 @@ async fn fetch_mobile_post_info(shortcode: &str, client: &Client) -> Result<Extr
         .and_then(|t| t.as_i64())
         .and_then(format_epoch_timestamp);
 
-    let location = extract_and_resolve_location(item.get("location"), client).await;
+    let location = extract_and_resolve_location(item.get("location"), client, None).await;
     let post_url = format!("https://www.instagram.com/p/{shortcode}/");
 
     let raw_nodes: Vec<&Value> =
@@ -199,14 +203,12 @@ async fn fetch_mobile_post_info(shortcode: &str, client: &Client) -> Result<Extr
     let mut items = Vec::new();
     for node in raw_nodes {
         if let Some(mut media_item) = parse_media_item(node) {
-            // Check for per-slide location or fall back to the post-level location
             let slide_location = if node.get("location").is_some() {
-                extract_and_resolve_location(node.get("location"), client).await
+                extract_and_resolve_location(node.get("location"), client, None).await
             } else {
                 location.clone()
             };
 
-            // Stamp metadata directly onto the media item
             media_item.source_post_url = Some(post_url.clone());
             media_item.caption = if !caption.is_empty() {
                 Some(caption.clone())
@@ -243,7 +245,7 @@ async fn fetch_mobile_post_info(shortcode: &str, client: &Client) -> Result<Extr
 }
 
 // -----------------------------------------------------------------------------
-// Public Web GraphQL Query (Extracts Full Resolution Variants, Timestamps & Loc)
+// Public Web GraphQL Query
 // -----------------------------------------------------------------------------
 async fn fetch_graphql_post_info(shortcode: &str, client: &Client) -> Result<ExtractedMediaMetadata> {
     let gql_url = format!(
@@ -303,7 +305,7 @@ async fn fetch_graphql_post_info(shortcode: &str, client: &Client) -> Result<Ext
         bail!("No items parsed from GraphQL for {shortcode}");
     }
 
-    let location = extract_and_resolve_location(media.get("location"), client).await;
+    let location = extract_and_resolve_location(media.get("location"), client, None).await;
 
     let published_at = media
         .get("taken_at_timestamp")
@@ -313,7 +315,6 @@ async fn fetch_graphql_post_info(shortcode: &str, client: &Client) -> Result<Ext
 
     let post_url = format!("https://www.instagram.com/p/{shortcode}/");
 
-    // Stamp this post's exact metadata onto every MediaItem parsed
     for item in &mut items {
         item.source_post_url = Some(post_url.clone());
         item.caption = if !caption.is_empty() {
@@ -440,7 +441,7 @@ fn parse_graphql_node(node: &Value) -> Option<MediaItem> {
 }
 
 // -----------------------------------------------------------------------------
-// Single Post Resolution (The Single Function That Handles All Posts)
+// Single Post Resolution
 // -----------------------------------------------------------------------------
 pub async fn extract_single_post(
     input_url: &str,
@@ -450,7 +451,7 @@ pub async fn extract_single_post(
         extract_shortcode(input_url).context("Could not extract Instagram shortcode from URL")?;
     let has_auth = config.map_or(false, |c| c.has_instagram_auth());
 
-    // 1. Authenticated Mobile API (Best for raw master files & stories)
+    // 1. Authenticated Mobile API
     if has_auth {
         if let Some(cfg) = config {
             if let Ok(auth_client) = build_auth_client(cfg) {
@@ -467,7 +468,7 @@ pub async fn extract_single_post(
         }
     }
 
-    // 2. Public Web GraphQL Query (Best for exact ISO timestamp, tags, locations & sidecars)
+    // 2. Public Web GraphQL Query
     let guest_client = build_guest_client()?;
     debug!(shortcode, "Attempting GraphQL post fetch");
     match fetch_graphql_post_info(shortcode, &guest_client).await {
@@ -532,13 +533,11 @@ async fn extract_highlight_links(input_url: &str, client: &Client) -> Result<Ext
     let mut items = Vec::new();
     for raw in raw_items {
         if let Some(mut media_item) = parse_media_item(raw) {
-            // Per-slide timestamp
             let slide_date = raw
                 .get("taken_at")
                 .and_then(|t| t.as_i64())
                 .and_then(format_epoch_timestamp);
 
-            // Per-slide caption
             let slide_caption = raw
                 .pointer("/caption/text")
                 .and_then(|t| t.as_str())
@@ -549,10 +548,8 @@ async fn extract_highlight_links(input_url: &str, client: &Client) -> Result<Ext
                 .map(extract_hashtags_from_text)
                 .unwrap_or_default();
 
-            // Per-slide location
-            let slide_location = extract_and_resolve_location(raw.get("location"), client).await;
+            let slide_location = extract_and_resolve_location(raw.get("location"), client, None).await;
 
-            // Direct PK link for source URL
             let pk = raw.get("pk").or_else(|| raw.get("id")).and_then(|v| {
                 v.as_str().map(|s| s.to_string()).or_else(|| v.as_i64().map(|n| n.to_string()))
             });
@@ -598,6 +595,9 @@ async fn extract_user_profile_feed(
         .context("Could not extract username from Instagram profile URL")?;
 
     info!(username = %username, "Starting unified profile extraction");
+
+    let rate_limiter = StealthRateLimiter::new();
+    let mut backoff_attempt: u32 = 0;
 
     let cookie = cfg.ig_cookie.as_deref().unwrap_or("");
     let csrf_token = cfg
@@ -684,7 +684,7 @@ async fn extract_user_profile_feed(
             "av={ds_user_id}&__d=www&__user=0&__a=1&__req=6&dpr=2&__comet_req=7&fb_dtsg={encoded_dtsg}&jazoest={jazoest}&lsd={lsd}&fb_api_caller_class=RelayModern&fb_api_req_friendly_name={friendly_name}&server_timestamps=true&doc_id={doc_id}&variables={encoded_vars}"
         );
 
-        let resp = client
+        let resp = match client
             .post("https://www.instagram.com/graphql/query")
             .header(REFERER, format!("https://www.instagram.com/{username}/"))
             .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
@@ -692,9 +692,33 @@ async fn extract_user_profile_feed(
             .header("X-Root-Field-Name", "xdt_api__v1__feed__user_timeline_graphql_connection")
             .body(form_body)
             .send()
-            .await?;
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                warn!(error = %e, "Network error during profile query, entering backoff");
+                backoff_attempt += 1;
+                if backoff_attempt > 3 {
+                    bail!("Persistent network error contacting Instagram: {e}");
+                }
+                rate_limiter.handle_backoff(backoff_attempt).await;
+                continue;
+            }
+        };
 
         let status = resp.status();
+
+        // Detect HTTP rate limiting codes (429 Too Many Requests / 403 Forbidden)
+        if status == reqwest::StatusCode::TOO_MANY_REQUESTS || status == reqwest::StatusCode::FORBIDDEN {
+            warn!(status = %status, "Rate limit HTTP code encountered. Triggering cooldown.");
+            backoff_attempt += 1;
+            if backoff_attempt > 3 {
+                bail!("Rate limited by Instagram (HTTP {status}). Stopping to preserve account session.");
+            }
+            rate_limiter.handle_backoff(backoff_attempt).await;
+            continue;
+        }
+
         if !status.is_success() {
             error!(username = %username, page = page_count, status = %status, "Timeline query failed");
             if all_media_items.is_empty() && !hit_known_boundary {
@@ -721,6 +745,23 @@ async fn extract_user_profile_feed(
             }
         };
 
+        // Detect Meta action-blocks / checkpoints embedded in JSON responses
+        let message = payload.get("message").and_then(|m| m.as_str()).unwrap_or("");
+        let status_field = payload.get("status").and_then(|s| s.as_str()).unwrap_or("");
+        if status_field == "fail" || message.contains("feedback_required") || message.contains("checkpoint") {
+            warn!(
+                message,
+                status = status_field,
+                "Instagram returned action-block response. Entering backoff."
+            );
+            backoff_attempt += 1;
+            if backoff_attempt > 2 {
+                bail!("Action restricted by Instagram: '{message}'. Halting crawl.");
+            }
+            rate_limiter.handle_backoff(backoff_attempt).await;
+            continue;
+        }
+
         if let Some(err_code) = payload.get("error") {
             let msg = payload.get("errorSummary").and_then(|s| s.as_str()).unwrap_or("unknown error");
             error!(username = %username, error_code = %err_code, summary = %msg, "Meta returned an API-level error");
@@ -730,6 +771,9 @@ async fn extract_user_profile_feed(
                 break;
             }
         }
+
+        // Successfully fetched and parsed a valid page; reset backoff
+        backoff_attempt = 0;
 
         let (edges, page_info) = if let Some(conn) = payload.pointer("/data/xdt_api__v1__feed__user_timeline_graphql_connection") {
             (conn.get("edges").and_then(|e| e.as_array()), conn.get("page_info"))
@@ -801,8 +845,8 @@ async fn extract_user_profile_feed(
                 latest_post_date = published_at.clone();
             }
 
-            // 3. Location
-            let post_location = extract_and_resolve_location(node.get("location"), client).await;
+            // 3. Location (with lightweight pacing)
+            let post_location = extract_and_resolve_location(node.get("location"), client, Some(&rate_limiter)).await;
             if primary_location.is_none() && post_location.is_some() {
                 primary_location = post_location.clone();
             }
@@ -817,7 +861,7 @@ async fn extract_user_profile_feed(
             for media_node in raw_media_nodes {
                 if let Some(mut media_item) = parse_media_item(media_node) {
                     let slide_location = if media_node.get("location").is_some() {
-                        extract_and_resolve_location(media_node.get("location"), client).await
+                        extract_and_resolve_location(media_node.get("location"), client, Some(&rate_limiter)).await
                     } else {
                         post_location.clone()
                     };
@@ -868,7 +912,9 @@ async fn extract_user_profile_feed(
         }
 
         cursor = next_cursor;
-        tokio::time::sleep(Duration::from_millis(350)).await;
+
+        // Pacing delay between sequential pagination calls
+        rate_limiter.wait_for_next_page().await;
     }
 
     if all_media_items.is_empty() {
@@ -956,13 +1002,11 @@ async fn extract_story_links(input_url: &str, client: &Client) -> Result<Extract
     let mut items = Vec::new();
     for node in raw_items {
         if let Some(mut media_item) = parse_media_item(node) {
-            // Per-story slide timestamp
             let slide_date = node
                 .get("taken_at")
                 .and_then(|t| t.as_i64())
                 .and_then(format_epoch_timestamp);
 
-            // Per-story slide caption
             let slide_caption = node
                 .pointer("/caption/text")
                 .and_then(|t| t.as_str())
@@ -973,10 +1017,8 @@ async fn extract_story_links(input_url: &str, client: &Client) -> Result<Extract
                 .map(extract_hashtags_from_text)
                 .unwrap_or_default();
 
-            // Per-story slide location
-            let slide_location = extract_and_resolve_location(node.get("location"), client).await;
+            let slide_location = extract_and_resolve_location(node.get("location"), client, None).await;
 
-            // Direct PK link
             let pk = node.get("pk").or_else(|| node.get("id")).and_then(|v| {
                 v.as_str().map(|s| s.to_string()).or_else(|| v.as_i64().map(|n| n.to_string()))
             });
@@ -1035,7 +1077,7 @@ async fn extract_direct_pk_links(
         .and_then(|t| t.as_i64())
         .and_then(format_epoch_timestamp);
 
-    let location = extract_and_resolve_location(item.get("location"), client).await;
+    let location = extract_and_resolve_location(item.get("location"), client, None).await;
 
     let caption = item
         .pointer("/caption/text")
@@ -1073,12 +1115,11 @@ async fn extract_direct_pk_links(
 }
 
 // -----------------------------------------------------------------------------
-// Media Parser: Guarantees Deduplication & Highest Quality Sorting
+// Media Parser
 // -----------------------------------------------------------------------------
 fn parse_media_item(item: &Value) -> Option<MediaItem> {
     let media_type = item.get("media_type").and_then(|t| t.as_i64()).unwrap_or(1);
 
-    // Extract image candidates used for both image posts and video cover thumbnails
     let img_candidates = item
         .pointer("/image_versions2/candidates")
         .and_then(|c| c.as_array())?;
@@ -1090,7 +1131,6 @@ fn parse_media_item(item: &Value) -> Option<MediaItem> {
         .map(clean_url);
 
     if media_type == 2 {
-        // --- Video Processing ---
         let versions = item.get("video_versions")?.as_array()?;
         if versions.is_empty() {
             return None;
@@ -1101,7 +1141,6 @@ fn parse_media_item(item: &Value) -> Option<MediaItem> {
             return None;
         }
 
-        // Sort descending by resolution (w * h)
         parsed_variants.sort_by_key(|v| {
             std::cmp::Reverse(v.dimensions.as_ref().map(|d| d.width * d.height).unwrap_or(0))
         });
@@ -1127,13 +1166,11 @@ fn parse_media_item(item: &Value) -> Option<MediaItem> {
 
         Some(media)
     } else {
-        // --- Image Processing ---
         let mut parsed_variants = extract_variants(img_candidates);
         if parsed_variants.is_empty() {
             return None;
         }
 
-        // Sort descending by resolution (w * h)
         parsed_variants.sort_by_key(|v| {
             std::cmp::Reverse(v.dimensions.as_ref().map(|d| d.width * d.height).unwrap_or(0))
         });
@@ -1143,7 +1180,6 @@ fn parse_media_item(item: &Value) -> Option<MediaItem> {
         let best_dims = best.dimensions.clone();
         let best_size = best.file_size_bytes;
 
-        // Smallest variant for grid display, fallback to default_thumb_url
         let thumb_url = parsed_variants.last().map(|v| v.url.clone()).or(default_thumb_url);
 
         let mut media = MediaItem::new(
@@ -1164,7 +1200,6 @@ fn parse_media_item(item: &Value) -> Option<MediaItem> {
     }
 }
 
-/// Helper to parse and deduplicate raw URL/dimension variants from a JSON array
 fn extract_variants(raw_list: &[Value]) -> Vec<MediaVariant> {
     let mut variants = Vec::new();
     let mut seen_urls = HashSet::new();
@@ -1345,11 +1380,9 @@ fn format_epoch_timestamp(epoch_secs: i64) -> Option<String> {
 }
 
 pub fn extract_username_from_url(input_url: &str) -> Option<String> {
-    // 1. Strip scheme and parse as Url to isolate the path from any query parameters or fragments
     let path = if let Ok(parsed) = reqwest::Url::parse(input_url) {
         parsed.path().trim_matches('/').to_string()
     } else {
-        // Fallback for raw paths or malformed URLs
         let without_query = input_url.split('?').next().unwrap_or(input_url);
         let without_fragment = without_query.split('#').next().unwrap_or(without_query);
         without_fragment
@@ -1362,7 +1395,6 @@ pub fn extract_username_from_url(input_url: &str) -> Option<String> {
             .to_string()
     };
 
-    // 2. Extract the first valid path segment that is not an internal route
     let username = path
         .split('/')
         .next()?

@@ -4,6 +4,7 @@ pub mod media;
 pub mod page;
 pub mod patterns;
 pub mod url;
+pub mod rate_limiter;
 
 pub use media::*;
 pub use page::*;
