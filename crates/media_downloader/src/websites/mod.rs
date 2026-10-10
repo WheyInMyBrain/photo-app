@@ -3,6 +3,7 @@ pub mod generic_request;
 pub mod hls;
 pub mod instagram;
 pub mod reddit;
+pub mod redgifs;
 
 use crate::config::DownloaderConfig;
 use crate::models::{ExtractedMediaMetadata, MediaItem, MediaType};
@@ -30,6 +31,8 @@ pub async fn route_and_extract(
         instagram::InstagramExtractor.extract(url, config).await?
     } else if reddit::RedditExtractor.supports(url) {
         reddit::RedditExtractor.extract(url, config).await?
+    } else if redgifs::RedgifsExtractor.supports(url) {
+        redgifs::RedgifsExtractor.extract(url, config).await?
     } else {
         let is_video_watch_url = lower_url.contains("/watch")
             || lower_url.contains("/movie")

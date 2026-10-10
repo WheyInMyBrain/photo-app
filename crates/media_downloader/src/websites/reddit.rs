@@ -3,11 +3,10 @@
 use crate::config::DownloaderConfig;
 use crate::models::{ExtractedMediaMetadata, MediaDimensions, MediaItem, MediaType, MediaVariant};
 use crate::websites::hls;
+use crate::websites::redgifs::{extract_redgifs_id, resolve_redgifs_item};
 use crate::websites::Extractor;
 use anyhow::{bail, Context, Result};
-use reqwest::header::{
-    HeaderMap, HeaderValue, ACCEPT, ACCEPT_LANGUAGE, USER_AGENT,
-};
+use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, ACCEPT_LANGUAGE, USER_AGENT};
 use reqwest::Client;
 use serde_json::Value;
 use std::collections::HashSet;
@@ -46,18 +45,9 @@ pub async fn extract_reddit(input_url: &str) -> Result<ExtractedMediaMetadata> {
         HeaderValue::from_static("text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8"),
     );
     headers.insert(ACCEPT_LANGUAGE, HeaderValue::from_static("en-US,en;q=0.9"));
-    headers.insert(
-        "sec-fetch-site",
-        HeaderValue::from_static("none"),
-    );
-    headers.insert(
-        "sec-fetch-mode",
-        HeaderValue::from_static("navigate"),
-    );
-    headers.insert(
-        "sec-fetch-dest",
-        HeaderValue::from_static("document"),
-    );
+    headers.insert("sec-fetch-site", HeaderValue::from_static("none"));
+    headers.insert("sec-fetch-mode", HeaderValue::from_static("navigate"));
+    headers.insert("sec-fetch-dest", HeaderValue::from_static("document"));
 
     let client = Client::builder()
         .cookie_store(true)
@@ -183,7 +173,10 @@ async fn extract_reddit_user_profile(
                 aggregated_tags.insert(format!("r/{sub}"));
             }
 
-            let mut post_media_items = extract_post_media_items(post, &permalink).await;
+            let (mut post_media_items, extra_tags) = extract_post_media_items(client, post, &permalink).await;
+            for t in extra_tags {
+                aggregated_tags.insert(t);
+            }
 
             for item in &mut post_media_items {
                 item.source_post_url = Some(permalink.clone());
@@ -312,14 +305,22 @@ async fn extract_reddit_single_post(
         tags.push(format!("r/{sub}"));
     }
 
-    let mut items = extract_post_media_items(post_data, canonical_url).await;
+    let (mut items, extra_tags) = extract_post_media_items(client, post_data, canonical_url).await;
+    for t in extra_tags {
+        if !tags.contains(&t) {
+            tags.push(t);
+        }
+    }
+
     if items.is_empty() {
         bail!("No media items found for this Reddit post.");
     }
 
     for item in &mut items {
         item.source_post_url = Some(canonical_url.to_string());
-        item.caption = Some(caption.clone());
+        if item.caption.is_none() {
+            item.caption = Some(caption.clone());
+        }
         item.published_at = published_at.clone();
         item.tags = tags.clone();
     }
@@ -340,10 +341,49 @@ async fn extract_reddit_single_post(
 }
 
 // -----------------------------------------------------------------------------
-// Unified Node Inspector: Handles Video, Previews, Galleries, & Direct URLs
+// Unified Node Inspector: Handles RedGIFs, Video, Previews, Galleries
 // -----------------------------------------------------------------------------
-async fn extract_post_media_items(post_data: &Value, page_url: &str) -> Vec<MediaItem> {
+async fn extract_post_media_items(
+    client: &Client,
+    post_data: &Value,
+    page_url: &str,
+) -> (Vec<MediaItem>, Vec<String>) {
     let mut items = Vec::new();
+    let mut extra_tags = Vec::new();
+
+    // 0. RedGIFs Integration (Direct unwatermarked stream resolution)
+    let domain = post_data.get("domain").and_then(|d| d.as_str()).unwrap_or("");
+    let dest_url = post_data.get("url_overridden_by_dest").and_then(|u| u.as_str()).unwrap_or("");
+    let media_embed_url = post_data
+        .pointer("/media/oembed/thumbnail_url")
+        .and_then(|u| u.as_str())
+        .unwrap_or("");
+    let iframe_html = post_data
+        .pointer("/media_embed/content")
+        .and_then(|c| c.as_str())
+        .unwrap_or("");
+
+    let potential_redgifs_target = if domain.contains("redgifs") || dest_url.contains("redgifs.com") {
+        Some(dest_url)
+    } else if media_embed_url.contains("redgifs.com") {
+        Some(media_embed_url)
+    } else if iframe_html.contains("redgifs.com") {
+        Some(iframe_html)
+    } else {
+        None
+    };
+
+    if let Some(target_source) = potential_redgifs_target {
+        if let Some(gif_id) = extract_redgifs_id(target_source) {
+            debug!(gif_id = %gif_id, "Resolving unwatermarked RedGIFs media via RedgifsExtractor");
+            if let Ok((mut redgifs_item, rg_tags, _, _)) = resolve_redgifs_item(client, &gif_id).await {
+                redgifs_item.source_post_url = Some(page_url.to_string());
+                items.push(redgifs_item);
+                extra_tags.extend(rg_tags);
+                return (items, extra_tags);
+            }
+        }
+    }
 
     // 1. Native Reddit Video (v.redd.it)
     let video_target = post_data
@@ -354,14 +394,14 @@ async fn extract_post_media_items(post_data: &Value, page_url: &str) -> Vec<Medi
     if let Some(vid) = video_target {
         if let Some(item) = parse_reddit_video(vid, post_data, page_url).await {
             items.push(item);
-            return items;
+            return (items, extra_tags);
         }
     }
 
     // 2. Animated GIF / Video Preview
     if let Some(gif_item) = parse_reddit_gif_or_preview(post_data, page_url) {
         items.push(gif_item);
-        return items;
+        return (items, extra_tags);
     }
 
     // 3. Multi-image Galleries
@@ -421,7 +461,7 @@ async fn extract_post_media_items(post_data: &Value, page_url: &str) -> Vec<Medi
         }
     }
 
-    items
+    (items, extra_tags)
 }
 
 // -----------------------------------------------------------------------------
@@ -432,7 +472,6 @@ fn extract_reddit_username(url: &str) -> Option<String> {
     let clean = url.split('?').next().unwrap_or(url);
     let parts: Vec<&str> = clean.trim_matches('/').split('/').collect();
 
-    // Matches: /user/<name>, /u/<name>
     for (i, part) in parts.iter().enumerate() {
         if (*part == "user" || *part == "u") && i + 1 < parts.len() {
             let name = parts[i + 1].trim();
