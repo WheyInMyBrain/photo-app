@@ -11,6 +11,8 @@ RUN apt-get update && apt-get install -y \
     libsqlite3-dev \
     libde265-dev \
     libx265-dev \
+    llvm \
+    libclang-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # Build and install libheif 1.23.5
