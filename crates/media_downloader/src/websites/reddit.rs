@@ -6,14 +6,18 @@ use crate::websites::hls;
 use crate::websites::redgifs::{extract_redgifs_id, resolve_redgifs_item};
 use crate::websites::Extractor;
 use anyhow::{bail, Context, Result};
-use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, ACCEPT_LANGUAGE, USER_AGENT};
-use reqwest::Client;
 use serde_json::Value;
 use std::collections::HashSet;
 use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
+use wreq::header::{HeaderMap, HeaderValue, ACCEPT, ACCEPT_LANGUAGE, USER_AGENT};
+use wreq::Client;
+use wreq_util::Emulation;
+
+const SAFARI_UA: &str =
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4.1 Safari/605.1.15";
 
 pub struct RedditExtractor;
 
@@ -34,35 +38,35 @@ impl Extractor for RedditExtractor {
 
 pub async fn extract_reddit(input_url: &str) -> Result<ExtractedMediaMetadata> {
     let mut headers = HeaderMap::new();
-    headers.insert(
-        USER_AGENT,
-        HeaderValue::from_static(
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
-        ),
-    );
+    headers.insert(USER_AGENT, HeaderValue::from_static(SAFARI_UA));
     headers.insert(
         ACCEPT,
-        HeaderValue::from_static("text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8"),
+        HeaderValue::from_static("text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"),
     );
     headers.insert(ACCEPT_LANGUAGE, HeaderValue::from_static("en-US,en;q=0.9"));
     headers.insert("sec-fetch-site", HeaderValue::from_static("none"));
     headers.insert("sec-fetch-mode", HeaderValue::from_static("navigate"));
     headers.insert("sec-fetch-dest", HeaderValue::from_static("document"));
 
+    // Build client using BoringSSL Safari fingerprinting via wreq
     let client = Client::builder()
+        .emulation(Emulation::Safari26)
         .cookie_store(true)
         .default_headers(headers)
-        .redirect(reqwest::redirect::Policy::limited(10))
+        .redirect(wreq::redirect::Policy::limited(10))
         .build()?;
 
     // 1. Follow initial redirects to resolve canonical target (e.g. /s/... share links)
-    let initial_resp = client
-        .get(input_url)
-        .send()
-        .await
-        .context("Failed following Reddit URL")?;
+    let initial_resp = match client.get(input_url).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            error!(error = %e, input_url, "Failed following Reddit URL");
+            bail!("Failed following Reddit URL: {e}");
+        }
+    };
 
-    let resolved_url = initial_resp.url().to_string();
+    // wreq uses .uri() instead of .url()
+    let resolved_url = initial_resp.uri().to_string();
     debug!(input = %input_url, resolved = %resolved_url, "Resolved final Reddit target URL");
 
     // 2. Check if the resolved URL is actually a user profile feed
@@ -104,26 +108,45 @@ async fn extract_reddit_user_profile(
         }
 
         debug!(page = page_count, url = %api_url, "Fetching user submission page");
-        let mut resp = client.get(&api_url).send().await?;
+        let mut resp = match client.get(&api_url).send().await {
+            Ok(r) => r,
+            Err(_) => break,
+        };
 
         // Fallback to old.reddit.com if blocked with 403
-        if resp.status() == reqwest::StatusCode::FORBIDDEN {
+        if resp.status() == wreq::StatusCode::FORBIDDEN || resp.status() == wreq::StatusCode::TOO_MANY_REQUESTS {
             let alt_url = api_url.replace("www.reddit.com", "old.reddit.com");
             debug!(alt_url = %alt_url, "Retrying user profile via old.reddit.com fallback");
-            resp = client.get(&alt_url).send().await?;
+            resp = match client.get(&alt_url).send().await {
+                Ok(r) => r,
+                Err(_) => break,
+            };
         }
 
         if !resp.status().is_success() {
             if all_items.is_empty() {
                 bail!("Reddit user profile API returned HTTP {}", resp.status());
             } else {
-                warn!(page = page_count, status = %resp.status(), "Pagination halted due to HTTP error");
                 break;
             }
         }
 
         let body = resp.text().await?;
-        let payload: Value = serde_json::from_str(&body)?;
+        if body.trim_start().starts_with("<!DOCTYPE") || body.contains("<html") {
+            warn!("Blocked by Cloudflare/Reddit WAF HTML challenge page");
+            if all_items.is_empty() {
+                bail!("Reddit blocked request with an HTML challenge page (403/Cloudflare)");
+            }
+            break;
+        }
+
+        let payload: Value = match serde_json::from_str(&body) {
+            Ok(v) => v,
+            Err(e) => {
+                error!(error = %e, "Failed parsing profile JSON payload");
+                break;
+            }
+        };
 
         let data_node = match payload.get("data") {
             Some(d) => d,
@@ -134,8 +157,6 @@ async fn extract_reddit_user_profile(
             Some(arr) if !arr.is_empty() => arr,
             _ => break,
         };
-
-        let mut new_on_page = 0;
 
         for child in children {
             let post = match child.get("data") {
@@ -188,17 +209,8 @@ async fn extract_reddit_user_profile(
                 }
             }
 
-            new_on_page += post_media_items.len();
             all_items.extend(post_media_items);
         }
-
-        info!(
-            username,
-            page = page_count,
-            items_found = new_on_page,
-            total_items = all_items.len(),
-            "Processed profile page"
-        );
 
         let next_cursor = data_node
             .get("after")
@@ -249,10 +261,10 @@ async fn extract_reddit_single_post(
 
     let mut json_resp = client.get(&json_endpoint).send().await?;
 
-    // Fallback to old.reddit.com if blocked with 403
-    if json_resp.status() == reqwest::StatusCode::FORBIDDEN {
+    // Fallback to old.reddit.com if blocked with 403/Cloudflare
+    if json_resp.status() == wreq::StatusCode::FORBIDDEN || json_resp.status() == wreq::StatusCode::TOO_MANY_REQUESTS {
         let alt_endpoint = json_endpoint.replace("www.reddit.com", "old.reddit.com");
-        debug!(alt = %alt_endpoint, "403 encountered, trying old.reddit.com fallback");
+        debug!(alt = %alt_endpoint, "403/Block encountered, trying old.reddit.com fallback");
         json_resp = client.get(&alt_endpoint).send().await?;
     }
 
@@ -261,7 +273,15 @@ async fn extract_reddit_single_post(
     }
 
     let body = json_resp.text().await?;
-    let payload: Value = serde_json::from_str(&body)?;
+    
+    // Check if Cloudflare blocked us with an HTML challenge page
+    if body.trim_start().starts_with("<!DOCTYPE") || body.contains("<html") {
+        error!(url = %json_endpoint, "Reddit returned an HTML challenge page instead of JSON. Cloudflare WAF block detected.");
+        bail!("Reddit access blocked by Cloudflare challenge (HTML response instead of JSON).");
+    }
+
+    let payload: Value = serde_json::from_str(&body)
+        .context("Failed to parse Reddit JSON payload (possible bot block)")?;
 
     let post_data = payload
         .get(0)
@@ -269,7 +289,7 @@ async fn extract_reddit_single_post(
         .and_then(|v| v.get("children"))
         .and_then(|v| v.get(0))
         .and_then(|v| v.get("data"))
-        .context("Could not parse Reddit post data")?;
+        .context("Could not parse Reddit post data structure")?;
 
     let author = post_data
         .get("author")
@@ -787,7 +807,7 @@ fn extract_preview_thumbnail(post_data: &Value) -> Option<String> {
 }
 
 fn clean_url_str(raw: &str) -> String {
-    raw.replace("&amp;", "&").replace(r"\/", "/")
+    raw.replace("&amp;", "&",).replace(r"\/", "/")
 }
 
 fn format_epoch_timestamp(epoch_secs: i64) -> Option<String> {

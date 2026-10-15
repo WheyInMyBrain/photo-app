@@ -4,14 +4,18 @@ use crate::config::DownloaderConfig;
 use crate::models::{ExtractedMediaMetadata, MediaDimensions, MediaItem, MediaType, MediaVariant};
 use crate::websites::Extractor;
 use anyhow::{bail, Context, Result};
-use reqwest::header::{HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION, USER_AGENT};
-use reqwest::Client;
 use serde_json::Value;
 use std::collections::HashSet;
 use std::future::Future;
 use std::pin::Pin;
 use std::time::Duration;
 use tracing::{debug, info, warn};
+use wreq::header::{HeaderMap, HeaderValue, ACCEPT, AUTHORIZATION, USER_AGENT};
+use wreq::Client;
+use wreq_util::Emulation;
+
+const SAFARI_UA: &str =
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/27.0.1 Safari/605.1.15";
 
 pub struct RedgifsExtractor;
 
@@ -90,12 +94,7 @@ pub async fn resolve_redgifs_item(
 
 pub fn create_redgifs_client() -> Result<Client> {
     let mut headers = HeaderMap::new();
-    headers.insert(
-        USER_AGENT,
-        HeaderValue::from_static(
-            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/27.0.1 Safari/605.1.15",
-        ),
-    );
+    headers.insert(USER_AGENT, HeaderValue::from_static(SAFARI_UA));
     headers.insert(
         ACCEPT,
         HeaderValue::from_static("application/json, text/plain, */*"),
@@ -110,6 +109,7 @@ pub fn create_redgifs_client() -> Result<Client> {
     headers.insert("sec-fetch-dest", HeaderValue::from_static("empty"));
 
     Client::builder()
+        .emulation(Emulation::Safari26)
         .cookie_store(true)
         .default_headers(headers)
         .build()
@@ -128,7 +128,10 @@ pub async fn fetch_guest_token(client: &Client) -> Result<String> {
         bail!("RedGIFs auth request failed with HTTP {}", resp.status());
     }
 
-    let payload: Value = resp.json().await?;
+    let body = resp.text().await?;
+    let payload: Value = serde_json::from_str(&body)
+        .context("Failed parsing RedGIFs auth JSON")?;
+
     let token = payload
         .get("token")
         .and_then(|t| t.as_str())
@@ -160,7 +163,10 @@ async fn resolve_redgifs_item_with_token(
         );
     }
 
-    let payload: Value = resp.json().await?;
+    let body = resp.text().await?;
+    let payload: Value = serde_json::from_str(&body)
+        .context("Failed parsing RedGIFs video metadata JSON")?;
+
     let gif_node = payload
         .get("gif")
         .context("Missing 'gif' object in RedGIFs response")?;
@@ -315,7 +321,10 @@ async fn extract_redgifs_user_profile(
             }
         }
 
-        let payload: Value = resp.json().await?;
+        let body = resp.text().await?;
+        let payload: Value = serde_json::from_str(&body)
+            .context("Failed parsing RedGIFs user timeline JSON")?;
+
         let gifs = match payload.get("gifs").and_then(|g| g.as_array()) {
             Some(arr) if !arr.is_empty() => arr,
             _ => break, // Reached end of user gallery
