@@ -74,18 +74,15 @@ services:
         condition: service_started
 
   chrome:
-    image: ghcr.io/browserless/chromium:latest
+    image: browserless/chrome:latest
     restart: unless-stopped
     shm_size: '2gb'
     environment:
       - MAX_CONCURRENT_SESSIONS=2
       - PREBOOT_CHROME=true
       - CHROME_REFRESH_TIME=0
-      - ENABLE_DEBUGGER=true
-      - WORKSPACE_DIR=/data/workspace
       - DEFAULT_LAUNCH_ARGS=["--user-data-dir=/data/chrome-profile"]
     volumes:
       - ./storage/chrome-profile:/data/chrome-profile
-      - ./storage/chrome-workspace:/data/workspace
     ports:
       - "4002:3000"
