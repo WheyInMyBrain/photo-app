@@ -37,7 +37,15 @@
         }
     }
 
-    # 5. Frontend (SvelteKit / SPA)
+    # 5. Browserless Interactive GUI / Debugger
+    # handle_path strips "/browser" so Browserless receives requests at "/"
+    handle_path /browser* {
+        reverse_proxy chrome:3000 {
+            flush_interval -1
+        }
+    }
+
+    # 6. Frontend (SvelteKit / SPA fallback)
     handle {
         reverse_proxy frontend:3000
     }
@@ -45,7 +53,6 @@
 
 # ---------------------------------------------------------
 # Plain HTTP on port 80 -> Mapped to host port 4001
-# (No TLS/SSL overhead or certificate checks)
 # ---------------------------------------------------------
 :80 {
     import app_routes

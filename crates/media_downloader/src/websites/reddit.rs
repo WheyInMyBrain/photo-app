@@ -48,7 +48,6 @@ pub async fn extract_reddit(input_url: &str) -> Result<ExtractedMediaMetadata> {
     headers.insert("sec-fetch-mode", HeaderValue::from_static("navigate"));
     headers.insert("sec-fetch-dest", HeaderValue::from_static("document"));
 
-    // Build client using BoringSSL Safari fingerprinting via wreq
     let client = Client::builder()
         .emulation(Emulation::Safari26)
         .cookie_store(true)
@@ -56,28 +55,30 @@ pub async fn extract_reddit(input_url: &str) -> Result<ExtractedMediaMetadata> {
         .redirect(wreq::redirect::Policy::limited(10))
         .build()?;
 
-    // 1. Follow initial redirects to resolve canonical target (e.g. /s/... share links)
-    let initial_resp = match client.get(input_url).send().await {
+    // 1. Immediately normalize to old.reddit.com to bypass www Cloudflare challenges
+    let old_reddit_target = to_old_reddit_url(input_url);
+
+    // Follow initial redirects to resolve canonical target (e.g. /s/... share links)
+    let initial_resp = match client.get(&old_reddit_target).send().await {
         Ok(r) => r,
         Err(e) => {
-            error!(error = %e, input_url, "Failed following Reddit URL");
+            error!(error = %e, url = %old_reddit_target, "Failed following Reddit URL");
             bail!("Failed following Reddit URL: {e}");
         }
     };
 
-    // wreq uses .uri() instead of .url()
-    let resolved_url = initial_resp.uri().to_string();
+    let resolved_url = to_old_reddit_url(&initial_resp.uri().to_string());
     debug!(input = %input_url, resolved = %resolved_url, "Resolved final Reddit target URL");
 
     // 2. Check if the resolved URL is actually a user profile feed
     if let Some(username) = extract_reddit_username(&resolved_url) {
         if !resolved_url.contains("/comments/") && !resolved_url.contains("/s/") {
-            info!(username = %username, "Detected Reddit user profile link; starting full crawl");
+            info!(username = %username, "Detected Reddit user profile link; starting full crawl via old.reddit.com");
             return extract_reddit_user_profile(&client, &username).await;
         }
     }
 
-    // 3. Extract as single submission using the canonical resolved URL
+    // 3. Extract as single submission using old.reddit.com
     extract_reddit_single_post(&client, &resolved_url).await
 }
 
@@ -100,28 +101,19 @@ async fn extract_reddit_user_profile(
 
     loop {
         page_count += 1;
+        // Query old.reddit.com directly
         let mut api_url = format!(
-            "https://www.reddit.com/user/{username}/submitted.json?raw_json=1&limit=100"
+            "https://old.reddit.com/user/{username}/submitted.json?raw_json=1&limit=100"
         );
         if let Some(ref cursor) = after {
             api_url.push_str(&format!("&after={cursor}"));
         }
 
-        debug!(page = page_count, url = %api_url, "Fetching user submission page");
-        let mut resp = match client.get(&api_url).send().await {
+        debug!(page = page_count, url = %api_url, "Fetching user submission page via old.reddit.com");
+        let resp = match client.get(&api_url).send().await {
             Ok(r) => r,
             Err(_) => break,
         };
-
-        // Fallback to old.reddit.com if blocked with 403
-        if resp.status() == wreq::StatusCode::FORBIDDEN || resp.status() == wreq::StatusCode::TOO_MANY_REQUESTS {
-            let alt_url = api_url.replace("www.reddit.com", "old.reddit.com");
-            debug!(alt_url = %alt_url, "Retrying user profile via old.reddit.com fallback");
-            resp = match client.get(&alt_url).send().await {
-                Ok(r) => r,
-                Err(_) => break,
-            };
-        }
 
         if !resp.status().is_success() {
             if all_items.is_empty() {
@@ -133,7 +125,7 @@ async fn extract_reddit_user_profile(
 
         let body = resp.text().await?;
         if body.trim_start().starts_with("<!DOCTYPE") || body.contains("<html") {
-            warn!("Blocked by Cloudflare/Reddit WAF HTML challenge page");
+            warn!("Blocked by Cloudflare/Reddit WAF HTML challenge page on old.reddit.com");
             if all_items.is_empty() {
                 bail!("Reddit blocked request with an HTML challenge page (403/Cloudflare)");
             }
@@ -172,7 +164,7 @@ async fn extract_reddit_user_profile(
             let permalink = post
                 .get("permalink")
                 .and_then(|p| p.as_str())
-                .map(|p| format!("https://www.reddit.com{p}"))
+                .map(|p| format!("https://old.reddit.com{p}"))
                 .unwrap_or_default();
 
             if !permalink.is_empty() {
@@ -257,16 +249,11 @@ async fn extract_reddit_single_post(
         .unwrap_or(canonical_url)
         .trim_end_matches('/');
 
-    let json_endpoint = format!("{clean_url}.json?raw_json=1");
+    let old_clean_url = to_old_reddit_url(clean_url);
+    let json_endpoint = format!("{old_clean_url}.json?raw_json=1");
 
-    let mut json_resp = client.get(&json_endpoint).send().await?;
-
-    // Fallback to old.reddit.com if blocked with 403/Cloudflare
-    if json_resp.status() == wreq::StatusCode::FORBIDDEN || json_resp.status() == wreq::StatusCode::TOO_MANY_REQUESTS {
-        let alt_endpoint = json_endpoint.replace("www.reddit.com", "old.reddit.com");
-        debug!(alt = %alt_endpoint, "403/Block encountered, trying old.reddit.com fallback");
-        json_resp = client.get(&alt_endpoint).send().await?;
-    }
+    debug!(url = %json_endpoint, "Querying single Reddit post JSON directly from old.reddit.com");
+    let json_resp = client.get(&json_endpoint).send().await?;
 
     if !json_resp.status().is_success() {
         bail!("Reddit API returned HTTP {}", json_resp.status());
@@ -276,7 +263,7 @@ async fn extract_reddit_single_post(
     
     // Check if Cloudflare blocked us with an HTML challenge page
     if body.trim_start().starts_with("<!DOCTYPE") || body.contains("<html") {
-        error!(url = %json_endpoint, "Reddit returned an HTML challenge page instead of JSON. Cloudflare WAF block detected.");
+        error!(url = %json_endpoint, "Reddit returned an HTML challenge page instead of JSON on old.reddit.com.");
         bail!("Reddit access blocked by Cloudflare challenge (HTML response instead of JSON).");
     }
 
@@ -474,7 +461,7 @@ async fn extract_post_media_items(
                     thumbnail_url,
                     None,
                     None,
-                    Some("https://www.reddit.com/".to_string()),
+                    Some("https://old.reddit.com/".to_string()),
                     clean,
                 ));
             }
@@ -487,6 +474,16 @@ async fn extract_post_media_items(
 // -----------------------------------------------------------------------------
 // Parsers & Helpers
 // -----------------------------------------------------------------------------
+
+fn to_old_reddit_url(url: &str) -> String {
+    if url.contains("www.reddit.com") {
+        url.replace("www.reddit.com", "old.reddit.com")
+    } else if url.contains("://reddit.com") {
+        url.replace("://reddit.com", "://old.reddit.com")
+    } else {
+        url.to_string()
+    }
+}
 
 fn extract_reddit_username(url: &str) -> Option<String> {
     let clean = url.split('?').next().unwrap_or(url);
@@ -577,7 +574,7 @@ async fn parse_reddit_video(vid: &Value, post_data: &Value, page_url: &str) -> O
         thumbnail_url,
         resolved_audio_url,
         None,
-        Some("https://www.reddit.com/".to_string()),
+        Some("https://old.reddit.com/".to_string()),
         resolved_video_url,
     );
 
@@ -634,7 +631,7 @@ fn parse_reddit_single_image(post_data: &Value, _page_url: &str) -> Option<Media
         thumbnail_url,
         None,
         None,
-        Some("https://www.reddit.com/".to_string()),
+        Some("https://old.reddit.com/".to_string()),
         high_res_url,
     );
 
@@ -683,7 +680,7 @@ fn parse_reddit_gallery_node(media_obj: &Value, _page_url: &str) -> Option<Media
             thumbnail,
             None,
             None,
-            Some("https://www.reddit.com/".to_string()),
+            Some("https://old.reddit.com/".to_string()),
             clean_mp4,
         );
         media.variants = variants;
@@ -714,7 +711,7 @@ fn parse_reddit_gallery_node(media_obj: &Value, _page_url: &str) -> Option<Media
             thumbnail,
             None,
             None,
-            Some("https://www.reddit.com/".to_string()),
+            Some("https://old.reddit.com/".to_string()),
             clean_img,
         );
         media.variants = variants;
@@ -743,7 +740,7 @@ fn parse_reddit_gif_or_preview(post_data: &Value, _page_url: &str) -> Option<Med
                 thumbnail_url,
                 None,
                 None,
-                Some("https://www.reddit.com/".to_string()),
+                Some("https://old.reddit.com/".to_string()),
                 clean_vid,
             ));
         }
@@ -763,7 +760,7 @@ fn parse_reddit_gif_or_preview(post_data: &Value, _page_url: &str) -> Option<Med
                         thumbnail_url,
                         None,
                         None,
-                        Some("https://www.reddit.com/".to_string()),
+                        Some("https://old.reddit.com/".to_string()),
                         clean_mp4,
                     ));
                 }
@@ -778,7 +775,7 @@ fn parse_reddit_gif_or_preview(post_data: &Value, _page_url: &str) -> Option<Med
                         thumbnail_url,
                         None,
                         None,
-                        Some("https://www.reddit.com/".to_string()),
+                        Some("https://old.reddit.com/".to_string()),
                         clean_gif,
                     ));
                 }
@@ -807,7 +804,7 @@ fn extract_preview_thumbnail(post_data: &Value) -> Option<String> {
 }
 
 fn clean_url_str(raw: &str) -> String {
-    raw.replace("&amp;", "&",).replace(r"\/", "/")
+    raw.replace("&amp;", "&").replace(r"\/", "/")
 }
 
 fn format_epoch_timestamp(epoch_secs: i64) -> Option<String> {

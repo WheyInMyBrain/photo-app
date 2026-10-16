@@ -12,6 +12,7 @@ services:
     depends_on:
       - backend
       - frontend
+      - chrome
 
   frontend:
     build:
@@ -24,14 +25,12 @@ services:
   postgres:
     image: pgvector/pgvector:pg18
     restart: unless-stopped
-    # Allocate shared memory so HNSW index builds and parallel scans don't OOM
     shm_size: '1gb'
     environment:
       POSTGRES_DB: photo_app
       POSTGRES_USER: photo_user
       POSTGRES_PASSWORD: ${DB_PASSWORD:-7777}
     volumes:
-      # Isolate Postgres data directory from application file storage
       - ./storage/postgres:/var/lib/postgresql
     expose:
       - "5432"
@@ -81,5 +80,9 @@ services:
     environment:
       - MAX_CONCURRENT_SESSIONS=2
       - PREBOOT_CHROME=true
+      - CHROME_REFRESH_TIME=0
+      - DEFAULT_LAUNCH_ARGS=["--user-data-dir=/data/chrome-profile"]
+    volumes:
+      - ./storage/chrome-profile:/data/chrome-profile
     expose:
       - "3000"
