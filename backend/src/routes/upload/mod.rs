@@ -17,6 +17,7 @@ use axum::{
 use media_processing::StorageService;
 use uuid::Uuid;
 use tracing::{error, info};
+use chrono::Utc;
 
 use crate::error::AppError;
 use crate::middleware::auth::AuthUser;
@@ -26,11 +27,13 @@ use crate::services::link_ingest_service::LinkIngestService;
 use db::domain::{
     CommitLinkRequest, DbJob, IngestResponse, InspectLinkRequest,
     InspectLinkResponse, InspectResult, RawUploadQuery, UploadItemResult,
+    DirectManifestRequest, CandidateItem,
 };
+use db::scrapes_repo::{ScrapedMediaItemRecord, ScrapesRepo};
 use db::JobRepo;
 use downloader::{execute_item_downloads, resolve_or_scrape_manifest};
 use media_downloader::stream_thumbnail_base64;
-use utils::{default_camera_folder, resolve_incoming_filename, resolve_user_temp_dir};
+use utils::{default_camera_folder, resolve_incoming_filename, resolve_user_temp_dir, build_suggested_filename};
 
 /// POST /api/upload/inspect
 pub async fn inspect_link(
@@ -274,5 +277,138 @@ pub async fn upload_ingest(
         id: Some(asset_id.to_string()),
         relative_path: None,
         message: Some("Queued for background processing".to_string()),
+    })))
+}
+
+/// POST /api/upload/direct-manifest
+pub async fn upload_direct_manifest(
+    State(state): State<AppState>,
+    auth_user: AuthUser,
+    Json(payload): Json<DirectManifestRequest>,
+) -> Result<Json<IngestResponse>, AppError> {
+    if payload.items.is_empty() {
+        return Err(AppError::BadRequest("No media items supplied in manifest".into()));
+    }
+
+    let target_folder = payload.folder.unwrap_or_else(|| {
+        format!("{}/{}", payload.platform, payload.author)
+    });
+    let sanitized_folder = StorageService::sanitize_folder_path(&target_folder);
+
+    let post_uuid = Uuid::new_v4();
+    let total_items = payload.items.len();
+    let mut candidate_items = Vec::with_capacity(total_items);
+    let mut db_items = Vec::with_capacity(total_items);
+
+    let parsed_published_at = payload.published_at.as_deref().and_then(|p| {
+        chrono::DateTime::parse_from_rfc3339(p).ok().map(|dt| dt.with_timezone(&Utc))
+    });
+
+    for (idx, item) in payload.items.into_iter().enumerate() {
+        let item_id = Uuid::new_v4();
+        let mime = item.mime_type.unwrap_or_else(|| {
+            if item.media_type == "video" {
+                "video/mp4".to_string()
+            } else {
+                "image/jpeg".to_string()
+            }
+        });
+
+        // Use your existing filename helper
+        let ext = if item.media_type == "video" { "mp4" } else { "jpg" };
+        let caption_for_filename = item.caption.as_deref().unwrap_or(payload.caption.as_deref().unwrap_or(""));
+        let suggested_filename = build_suggested_filename(caption_for_filename, idx, total_items, ext);
+
+        let source_post = item.source_post_url.clone().unwrap_or_else(|| payload.source_url.clone());
+
+        // Prepare DB scrape record to maintain historical cache & metadata injection
+        db_items.push(ScrapedMediaItemRecord {
+            id: item_id,
+            media_type: item.media_type.clone(),
+            cdn_url: item.high_res_url.clone(),
+            audio_url: item.audio_url.clone(),
+            thumbnail_url: item.thumbnail_url.clone(),
+            suggested_filename: suggested_filename.clone(),
+            width: item.width,
+            height: item.height,
+            variants: Vec::new(),
+            caption: item.caption.clone().or_else(|| payload.caption.clone()),
+            published_at: parsed_published_at,
+            location_name: payload.location_name.clone(),
+            latitude: payload.latitude,
+            longitude: payload.longitude,
+            tags: payload.tags.clone(),
+            source_url: Some(source_post.clone()),
+        });
+
+        // Candidate item passed straight to execute_item_downloads
+        candidate_items.push(CandidateItem {
+            id: item_id.to_string(),
+            media_type: item.media_type,
+            mime_type: mime,
+            thumbnail_url: item.thumbnail_url.unwrap_or_default(),
+            thumbnail_base64: None,
+            high_res_url: item.high_res_url,
+            audio_url: item.audio_url,
+            suggested_filename,
+            referer: Some("https://www.instagram.com/".to_string()),
+            caption: item.caption.or_else(|| payload.caption.clone()),
+            published_at: payload.published_at.clone(),
+            location_name: payload.location_name.clone(),
+            latitude: payload.latitude,
+            longitude: payload.longitude,
+            tags: payload.tags.clone(),
+            source_post_url: Some(source_post),
+        });
+    }
+
+    // Persist post and items to PostgreSQL (preserving deduplication and asset lineage)
+    if let Err(e) = ScrapesRepo::save_scraped_post_and_items(
+        &state.db,
+        post_uuid,
+        auth_user.id,
+        &payload.platform,
+        &payload.source_url,
+        &payload.source_url,
+        &payload.author,
+        payload.caption.as_deref(),
+        &payload.tags,
+        payload.location_name.as_deref(),
+        payload.latitude,
+        payload.longitude,
+        parsed_published_at,
+        &[payload.source_url.clone()],
+        None,
+        &db_items,
+    )
+    .await {
+        error!(error = %e, "Failed saving direct manifest scrape record to database");
+    }
+
+    // Spawn download worker directly
+    let state_clone = state.clone();
+    let user_clone = auth_user.clone();
+    let folder_clone = sanitized_folder.clone();
+    let platform_clone = payload.platform.clone();
+
+    tokio::spawn(async move {
+        if let Err(e) = execute_item_downloads(
+            &state_clone,
+            &user_clone,
+            candidate_items,
+            &folder_clone,
+            &platform_clone,
+        )
+        .await {
+            error!(error = %e, "Background item download failed for direct manifest");
+        }
+    });
+
+    Ok(Json(IngestResponse::File(UploadItemResult {
+        file_name: format!("{}_manifest", payload.author),
+        status: "queued".to_string(),
+        id: Some(post_uuid.to_string()),
+        relative_path: Some(sanitized_folder),
+        message: Some("Direct manifest received and downloads initiated".to_string()),
     })))
 }

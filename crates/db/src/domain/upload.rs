@@ -182,3 +182,31 @@ pub struct FinishBatchResponse {
     pub released_jobs: u64,
     pub status: String,
 }
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DirectManifestItem {
+    pub media_type: String,               // "image" | "video"
+    pub mime_type: Option<String>,        // e.g. "image/jpeg", "video/mp4"
+    pub high_res_url: String,             // Direct CDN URL
+    pub thumbnail_url: Option<String>,    // Preview CDN URL
+    pub audio_url: Option<String>,        // If separated audio
+    pub width: Option<i32>,
+    pub height: Option<i32>,
+    pub caption: Option<String>,          // Per-slide caption override
+    pub source_post_url: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DirectManifestRequest {
+    pub platform: String,                 // "instagram" | "reddit"
+    pub author: String,                   // "username"
+    pub source_url: String,               // Original post or profile URL
+    pub folder: Option<String>,           // Optional target folder (e.g., "instagram/username")
+    pub caption: Option<String>,
+    pub published_at: Option<String>,     // ISO 8601 / RFC 3339 string
+    pub tags: Vec<String>,
+    pub location_name: Option<String>,
+    pub latitude: Option<f64>,
+    pub longitude: Option<f64>,
+    pub items: Vec<DirectManifestItem>,
+}

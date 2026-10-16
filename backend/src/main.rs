@@ -273,6 +273,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/upload/chunk/finalize", post(routes::upload::finalize_chunk))
         .route("/api/upload/inspect", post(routes::upload::inspect_link))
         .route("/api/upload/ingest", post(routes::upload::upload_ingest))
+        .route("/api/upload/direct-manifest", post(routes::upload::upload_direct_manifest))
         .route("/api/upload/batch/start", post(routes::upload::start_batch))
         .route("/api/upload/batch/finish", post(routes::upload::finish_batch))
 
