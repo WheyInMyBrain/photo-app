@@ -74,19 +74,15 @@ services:
         condition: service_started
 
   chrome:
-    image: browserless/chrome:latest
+    image: kasmweb/chrome:1.16.0
     restart: unless-stopped
     shm_size: '2gb'
-    entrypoint: ["/usr/bin/google-chrome"]
-    command:
-      - "--no-sandbox"
-      - "--disable-dev-shm-usage"
-      - "--remote-debugging-port=3000"
-      - "--remote-debugging-address=0.0.0.0"
-      - "--user-data-dir=/data/chrome-profile"
-      - "--window-size=1280,800"
-      - "https://www.instagram.com/accounts/login/"
+    environment:
+      - VNC_PW=password123
+      - APP_ARGS=--remote-debugging-port=9222 --remote-debugging-address=0.0.0.0
     volumes:
-      - ./storage/chrome-profile:/data/chrome-profile
+      # Kasm runs as user kasm-user; persistent profile maps here
+      - ./storage/chrome-profile:/home/kasm-user/.config/google-chrome
     ports:
-      - "4002:3000"
+      - "4002:6901"
+      - "9222:9222"
