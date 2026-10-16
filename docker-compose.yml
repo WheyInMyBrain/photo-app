@@ -77,14 +77,15 @@ services:
     image: browserless/chrome:latest
     restart: unless-stopped
     shm_size: '2gb'
-    environment:
-      - MAX_CONCURRENT_SESSIONS=1
-      - PREBOOT_CHROME=true
-      - PREBOOT_QUANTITY=1
-      - CHROME_REFRESH_TIME=0
-      - KEEP_ALIVE=true
-      - DEFAULT_HEADLESS=false
-      - DEFAULT_LAUNCH_ARGS=["--user-data-dir=/data/chrome-profile"]
+    entrypoint: ["/usr/bin/google-chrome"]
+    command:
+      - "--no-sandbox"
+      - "--disable-dev-shm-usage"
+      - "--remote-debugging-port=3000"
+      - "--remote-debugging-address=0.0.0.0"
+      - "--user-data-dir=/data/chrome-profile"
+      - "--window-size=1280,800"
+      - "https://www.instagram.com/accounts/login/"
     volumes:
       - ./storage/chrome-profile:/data/chrome-profile
     ports:
