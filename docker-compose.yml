@@ -81,8 +81,11 @@ services:
       - MAX_CONCURRENT_SESSIONS=2
       - PREBOOT_CHROME=true
       - CHROME_REFRESH_TIME=0
+      - ENABLE_DEBUGGER=true
+      - WORKSPACE_DIR=/data/workspace
       - DEFAULT_LAUNCH_ARGS=["--user-data-dir=/data/chrome-profile"]
     volumes:
       - ./storage/chrome-profile:/data/chrome-profile
+      - ./storage/chrome-workspace:/data/workspace
     ports:
       - "4002:3000"
