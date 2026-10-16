@@ -407,7 +407,7 @@ pub async fn execute_item_downloads(
             let referer = item.referer.as_deref().or_else(|| {
                 let lower_cdn = item.high_res_url.to_lowercase();
                 if lower_cdn.contains("redgifs.com") {
-                    Some("https://www.redgifs.com/")
+                    None
                 } else {
                     match platform_str.as_str() {
                         "instagram" => Some("https://www.instagram.com/"),
