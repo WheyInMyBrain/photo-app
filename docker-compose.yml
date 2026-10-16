@@ -78,9 +78,12 @@ services:
     restart: unless-stopped
     shm_size: '2gb'
     environment:
-      - MAX_CONCURRENT_SESSIONS=2
+      - MAX_CONCURRENT_SESSIONS=1
       - PREBOOT_CHROME=true
+      - PREBOOT_QUANTITY=1
       - CHROME_REFRESH_TIME=0
+      - KEEP_ALIVE=true
+      - DEFAULT_HEADLESS=false
       - DEFAULT_LAUNCH_ARGS=["--user-data-dir=/data/chrome-profile"]
     volumes:
       - ./storage/chrome-profile:/data/chrome-profile
