@@ -10,7 +10,7 @@ use media_processing::StorageService;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio::sync::Semaphore;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use crate::error::AppError;
@@ -393,12 +393,28 @@ pub async fn execute_item_downloads(
         tasks.push(tokio::spawn(async move {
             let _guard = permit.acquire().await.ok();
 
-            let temp_file_path = temp_download_dir.join(format!("{}_{}", Uuid::new_v4(), item.suggested_filename));
+            // Guard against empty suggested filename
+            let resolved_filename = if item.suggested_filename.trim().is_empty() {
+                let ext = if item.media_type == "video" { "mp4" } else { "jpg" };
+                format!("{}.{}", Uuid::new_v4(), ext)
+            } else {
+                item.suggested_filename.clone()
+            };
 
-            let referer = item.referer.as_deref().or_else(|| match platform_str.as_str() {
-                "instagram" => Some("https://www.instagram.com/"),
-                "reddit" => Some("https://www.reddit.com/"),
-                _ => None,
+            let temp_file_path = temp_download_dir.join(format!("{}_{}", Uuid::new_v4(), resolved_filename));
+
+            // Dynamic referer: if media is on redgifs.com, use redgifs referer to prevent 403 hotlink blocks
+            let referer = item.referer.as_deref().or_else(|| {
+                let lower_cdn = item.high_res_url.to_lowercase();
+                if lower_cdn.contains("redgifs.com") {
+                    Some("https://www.redgifs.com/")
+                } else {
+                    match platform_str.as_str() {
+                        "instagram" => Some("https://www.instagram.com/"),
+                        "reddit" => Some("https://www.reddit.com/"),
+                        _ => None,
+                    }
+                }
             });
 
             if let Err(e) = download_media(
@@ -409,9 +425,16 @@ pub async fn execute_item_downloads(
             )
             .await
             {
+                error!(
+                    url = %item.high_res_url,
+                    referer = ?referer,
+                    file = %resolved_filename,
+                    error = %e,
+                    "Download failed in worker queue"
+                );
                 let _ = tokio::fs::remove_file(&temp_file_path).await;
                 return UploadItemResult {
-                    file_name: item.suggested_filename,
+                    file_name: resolved_filename,
                     status: "error".to_string(),
                     id: None,
                     relative_path: None,
@@ -468,7 +491,7 @@ pub async fn execute_item_downloads(
             let final_disk_path = match inject_metadata(&temp_file_path, &meta_payload).await {
                 Ok(new_path) => new_path,
                 Err(err) => {
-                    warn!(file = %item.suggested_filename, error = %err, "Metadata injection skipped");
+                    warn!(file = %resolved_filename, error = %err, "Metadata injection skipped");
                     temp_file_path.clone()
                 }
             };
@@ -480,10 +503,10 @@ pub async fn execute_item_downloads(
                     if let Some((_, orig)) = f.split_once('_') {
                         orig.to_string()
                     } else {
-                        item.suggested_filename.clone()
+                        resolved_filename.clone()
                     }
                 })
-                .unwrap_or(item.suggested_filename.clone());
+                .unwrap_or(resolved_filename.clone());
 
             let asset_id = Uuid::new_v4();
             let file_size_bytes = match tokio::fs::metadata(&final_disk_path).await {
@@ -525,9 +548,10 @@ pub async fn execute_item_downloads(
             };
 
             if let Err(e) = JobRepo::enqueue_with_status(&state.db, &job, "pending", None).await {
+                error!(file = %resolved_filename, error = %e, "Failed to enqueue assemble job into database");
                 let _ = tokio::fs::remove_file(&job.disk_path).await;
                 UploadItemResult {
-                    file_name: item.suggested_filename,
+                    file_name: resolved_filename,
                     status: "error".to_string(),
                     id: None,
                     relative_path: None,
@@ -537,7 +561,7 @@ pub async fn execute_item_downloads(
                 let _ = state.channels.assemble_tx.send(job).await;
 
                 UploadItemResult {
-                    file_name: item.suggested_filename,
+                    file_name: resolved_filename,
                     status: "queued".to_string(),
                     id: Some(asset_id.to_string()),
                     relative_path: None,
