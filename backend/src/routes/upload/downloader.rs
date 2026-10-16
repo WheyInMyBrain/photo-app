@@ -404,18 +404,23 @@ pub async fn execute_item_downloads(
             let temp_file_path = temp_download_dir.join(format!("{}_{}", Uuid::new_v4(), resolved_filename));
 
             // Dynamic referer: if media is on redgifs.com, use redgifs referer to prevent 403 hotlink blocks
-            let referer = item.referer.as_deref().or_else(|| {
-                let lower_cdn = item.high_res_url.to_lowercase();
-                if lower_cdn.contains("redgifs.com") {
+            let lower_cdn = item.high_res_url.to_lowercase();
+            let referer = if lower_cdn.contains("redgifs.com") {
+                // RedGIFs CDN strictly forbids foreign referers like instagram.com or reddit.com
+                None
+            } else if let Some(ref r) = item.referer {
+                if r.trim().is_empty() {
                     None
                 } else {
-                    match platform_str.as_str() {
-                        "instagram" => Some("https://www.instagram.com/"),
-                        "reddit" => Some("https://www.reddit.com/"),
-                        _ => None,
-                    }
+                    Some(r.as_str())
                 }
-            });
+            } else {
+                match platform_str.as_str() {
+                    "instagram" => Some("https://www.instagram.com/"),
+                    "reddit" => Some("https://www.reddit.com/"),
+                    _ => None,
+                }
+            };
 
             if let Err(e) = download_media(
                 &item.high_res_url,
