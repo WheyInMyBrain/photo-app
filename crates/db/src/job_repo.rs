@@ -426,4 +426,124 @@ impl JobRepo {
 
         Ok(())
     }
+
+    /// Fetches the next pending job for a given stage using PostgreSQL partial indexes
+    /// and `FOR UPDATE SKIP LOCKED` for concurrency-safe worker claiming.
+    pub async fn fetch_next_pending_for_stage(
+        pool: &PgPool,
+        stage: &str,
+    ) -> Result<Option<DbJob>, sqlx::Error> {
+        let mut tx = pool.begin().await?;
+
+        // Queries match idx_jobs_pending_assemble, idx_jobs_pending_thumb, and idx_jobs_pending_ai
+        let row = match stage {
+            "assemble" => {
+                sqlx::query(
+                    r#"
+                    SELECT id, user_id, asset_id, file_name, rel_path, folder_path,
+                           disk_path, sha256, file_size_bytes, status, current_stage, payload,
+                           assemble_done, thumb_done, ai_faces_done, ai_clip_done, ai_tags_done, ai_poses_done
+                    FROM processing_jobs
+                    WHERE status = 'pending' 
+                      AND assemble_done = FALSE 
+                      AND attempts < 3
+                    ORDER BY created_at ASC
+                    FOR UPDATE SKIP LOCKED
+                    LIMIT 1
+                    "#,
+                )
+                .fetch_optional(&mut *tx)
+                .await?
+            }
+            "thumbnail" => {
+                sqlx::query(
+                    r#"
+                    SELECT id, user_id, asset_id, file_name, rel_path, folder_path,
+                           disk_path, sha256, file_size_bytes, status, current_stage, payload,
+                           assemble_done, thumb_done, ai_faces_done, ai_clip_done, ai_tags_done, ai_poses_done
+                    FROM processing_jobs
+                    WHERE status = 'pending' 
+                      AND assemble_done = TRUE 
+                      AND thumb_done = FALSE 
+                      AND attempts < 3
+                    ORDER BY created_at ASC
+                    FOR UPDATE SKIP LOCKED
+                    LIMIT 1
+                    "#,
+                )
+                .fetch_optional(&mut *tx)
+                .await?
+            }
+            "ai_enrichment" => {
+                sqlx::query(
+                    r#"
+                    SELECT id, user_id, asset_id, file_name, rel_path, folder_path,
+                           disk_path, sha256, file_size_bytes, status, current_stage, payload,
+                           assemble_done, thumb_done, ai_faces_done, ai_clip_done, ai_tags_done, ai_poses_done
+                    FROM processing_jobs
+                    WHERE status = 'pending' 
+                      AND thumb_done = TRUE 
+                      AND (ai_faces_done = FALSE OR ai_clip_done = FALSE OR ai_tags_done = FALSE OR ai_poses_done = FALSE)
+                      AND attempts < 3
+                    ORDER BY created_at ASC
+                    FOR UPDATE SKIP LOCKED
+                    LIMIT 1
+                    "#,
+                )
+                .fetch_optional(&mut *tx)
+                .await?
+            }
+            _ => None,
+        };
+
+        if let Some(r) = row {
+            let job_id: Uuid = r.get("id");
+
+            let payload: Option<JobPayload> = r
+                .try_get::<serde_json::Value, _>("payload")
+                .ok()
+                .and_then(|val| serde_json::from_value(val).ok());
+
+            let job = DbJob {
+                id: job_id,
+                user_id: r.get("user_id"),
+                asset_id: r.get("asset_id"),
+                file_name: r.get("file_name"),
+                rel_path: r.get("rel_path"),
+                folder_path: r.get("folder_path"),
+                disk_path: PathBuf::from(r.get::<String, _>("disk_path")),
+                sha256: r.get("sha256"),
+                file_size_bytes: r.get("file_size_bytes"),
+                status: "processing".to_string(),
+                current_stage: stage.to_string(),
+                payload,
+                assemble_done: r.get("assemble_done"),
+                thumb_done: r.get("thumb_done"),
+                ai_faces_done: r.get("ai_faces_done"),
+                ai_clip_done: r.get("ai_clip_done"),
+                ai_tags_done: r.get("ai_tags_done"),
+                ai_poses_done: r.get("ai_poses_done"),
+            };
+
+            // Atomically mark job as processing and increment attempt count
+            sqlx::query(
+                r#"
+                UPDATE processing_jobs 
+                SET status = 'processing', 
+                    attempts = attempts + 1, 
+                    updated_at = CURRENT_TIMESTAMP 
+                WHERE id = $1
+                "#,
+            )
+            .bind(job_id)
+            .execute(&mut *tx)
+            .await?;
+
+            tx.commit().await?;
+            Ok(Some(job))
+        } else {
+            tx.rollback().await?;
+            Ok(None)
+        }
+    }
 }

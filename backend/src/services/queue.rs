@@ -3,6 +3,7 @@
 use sqlx::PgPool;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::{broadcast, mpsc, Semaphore};
 use tracing::{error, info, warn};
 use uuid::Uuid;
@@ -28,7 +29,7 @@ pub struct QueueChannels {
 pub struct QueueService;
 
 impl QueueService {
-    /// Bootstraps all three pipeline workers driven strictly by in-memory mpsc channels.
+    /// Bootstraps all three pipeline workers driven by hybrid in-memory mpsc channels + DB backlog polling.
     /// Integrated with a Tokio watch pause gate to prioritize active upload batches.
     pub fn start_pipeline(
         state: AppState,
@@ -52,7 +53,7 @@ impl QueueService {
             ai_clip = state.config.ai.enable_clip,
             ai_tags = state.config.ai.enable_tags,
             ai_poses = state.config.ai.enable_poses,
-            "Three-stage push-driven mpsc media pipeline active with upload pause gate"
+            "Three-stage push/pull self-draining media pipeline active"
         );
 
         // =========================================================================
@@ -65,12 +66,56 @@ impl QueueService {
             let mut pause_rx = pause_rx.clone();
 
             tokio::spawn(async move {
-                while let Some(job) = assemble_rx.recv().await {
+                info!("Worker 0 (Assemble) active: listening to assemble_rx and polling DB backlog");
+
+                loop {
+                    // 1. Acquire job: check in-memory channel first, pull from DB backlog if idle
+                    let (job, source) = tokio::select! {
+                        biased;
+                        Some(j) = assemble_rx.recv() => (Some(j), "PUSH"),
+                        else => {
+                            match JobRepo::fetch_next_pending_for_stage(&pool, "assemble").await {
+                                Ok(Some(db_job)) => (Some(db_job), "DB BACKLOG"),
+                                Ok(None) => {
+                                    tokio::time::sleep(Duration::from_millis(500)).await;
+                                    (None, "")
+                                }
+                                Err(e) => {
+                                    error!("Worker 0 error fetching backlog from DB: {e}");
+                                    tokio::time::sleep(Duration::from_secs(2)).await;
+                                    (None, "")
+                                }
+                            }
+                        }
+                    };
+
+                    let job = match job {
+                        Some(j) => j,
+                        None => continue,
+                    };
+
+                    info!(
+                        source = %source,
+                        job_id = %job.id,
+                        asset_id = %job.asset_id,
+                        file = %job.file_name,
+                        "Worker 0 picked up assemble job"
+                    );
+
                     // PAUSE GATE: If an upload batch is transferring, yield disk I/O
                     if *pause_rx.borrow() {
-                        info!("Worker 0 paused: waiting for active upload transfers to complete...");
-                        let _ = pause_rx.wait_for(|paused| !*paused).await;
-                        info!("Worker 0 resumed");
+                        warn!("Worker 0 paused: waiting for active upload transfers to complete...");
+                        let unpause = tokio::time::timeout(
+                            Duration::from_secs(45),
+                            pause_rx.wait_for(|paused| !*paused),
+                        )
+                        .await;
+
+                        if unpause.is_err() {
+                            error!("Worker 0 pause gate timed out (45s). Resuming operation to avoid deadlock.");
+                        } else {
+                            info!("Worker 0 resumed");
+                        }
                     }
 
                     let job_id = job.id;
@@ -112,11 +157,12 @@ impl QueueService {
                         let mut total_bytes = 0i64;
 
                         if input_path.is_dir() {
-                            // Chunked upload session
                             let meta_path = input_path.join("total_chunks");
                             let total_chunks_str = std::fs::read_to_string(&meta_path)
                                 .map_err(|e| format!("Missing total_chunks metadata: {e}"))?;
-                            let total_chunks: u32 = total_chunks_str.trim().parse()
+                            let total_chunks: u32 = total_chunks_str
+                                .trim()
+                                .parse()
                                 .map_err(|e| format!("Invalid total_chunks value: {e}"))?;
 
                             let mut assembled = std::fs::OpenOptions::new()
@@ -139,12 +185,10 @@ impl QueueService {
                                     total_bytes += n as i64;
                                 }
                             }
-
                             assembled.flush().map_err(|e| e.to_string())?;
                         } else {
-                            // Direct staged file
                             let mut f = std::fs::File::open(&input_path)
-                                .map_err(|e| format!("Failed opening staged file: {e}"))?;
+                                .map_err(|e| format!("Failed opening staged file {}: {e}", input_path.display()))?;
 
                             loop {
                                 let n = f.read(&mut buffer).map_err(|e| e.to_string())?;
@@ -163,7 +207,8 @@ impl QueueService {
 
                         let sha256 = hex::encode(hasher.finalize());
                         Ok((sha256, total_bytes))
-                    }).await;
+                    })
+                    .await;
 
                     let (sha256, file_size_bytes) = match res {
                         Ok(Ok(val)) => val,
@@ -199,7 +244,7 @@ impl QueueService {
                         }
 
                         let _ = JobRepo::mark_completed(&pool, job_id).await;
-                        info!(asset_id = %existing_id, "Duplicate resolved and linked to album");
+                        info!(existing_asset_id = %existing_id, deduplicated = true, "Duplicate resolved and linked to album");
                         continue;
                     }
 
@@ -217,7 +262,7 @@ impl QueueService {
 
                     let rel_path = format!("{}/{}", folder_path, disk_filename);
 
-                    // 1. Mark assemble complete on the single job record
+                    // Mark assemble complete on the single job record
                     if let Err(e) = JobRepo::mark_assemble_done(
                         &pool,
                         job_id,
@@ -232,7 +277,9 @@ impl QueueService {
                         continue;
                     }
 
-                    // 2. Mutate in-memory job handle and push directly to Worker 1
+                    info!(asset_id = %asset_id, sha256 = %sha256, "Stage 0 (Assemble) complete");
+
+                    // Mutate in-memory job handle and push to Worker 1
                     let mut thumb_job = job;
                     thumb_job.folder_path = folder_path;
                     thumb_job.rel_path = rel_path;
@@ -242,7 +289,23 @@ impl QueueService {
                     thumb_job.assemble_done = true;
                     thumb_job.current_stage = "thumbnail".to_string();
 
-                    let _ = thumb_tx.send(thumb_job).await;
+                    // Non-blocking dispatch to thumb_tx
+                    match tokio::time::timeout(Duration::from_secs(3), thumb_tx.send(thumb_job)).await {
+                        Ok(Ok(())) => {
+                            info!(asset_id = %asset_id, "Dispatched assemble job directly to Worker 1 queue");
+                        }
+                        Ok(Err(_)) => {
+                            error!(asset_id = %asset_id, "thumb_tx receiver channel is closed");
+                        }
+                        Err(_) => {
+                            // Channel is full. Safe to ignore because the job is marked assemble_done = TRUE in DB.
+                            // Worker 1 will pick it up via fetch_next_pending_for_stage("thumbnail") as soon as it has capacity.
+                            warn!(
+                                asset_id = %asset_id,
+                                "thumb_tx buffer is saturated. Job remains in DB for Worker 1 backlog pull"
+                            );
+                        }
+                    }
                 }
             });
         }
@@ -260,8 +323,10 @@ impl QueueService {
             let ai_enabled = state.config.ai.enabled;
 
             tokio::spawn(async move {
-                while let Some(job) = thumb_rx.recv().await {
-                    // PAUSE GATE: Yield before acquiring work permits if an upload is active
+                info!("Worker 1 (Thumbnail) active: listening to thumb_rx and polling DB backlog");
+
+                loop {
+                    // Yield before acquiring work permits if an upload is active
                     if *pause_rx.borrow() {
                         let _ = pause_rx.wait_for(|paused| !*paused).await;
                     }
@@ -270,6 +335,42 @@ impl QueueService {
                         Ok(p) => p,
                         Err(_) => break,
                     };
+
+                    // Acquire job: prefer in-memory channel, fallback to DB backlog
+                    let (job, source) = tokio::select! {
+                        biased;
+                        Some(j) = thumb_rx.recv() => (Some(j), "PUSH"),
+                        else => {
+                            match JobRepo::fetch_next_pending_for_stage(&pool, "thumbnail").await {
+                                Ok(Some(db_job)) => (Some(db_job), "DB BACKLOG"),
+                                Ok(None) => {
+                                    tokio::time::sleep(Duration::from_millis(500)).await;
+                                    (None, "")
+                                }
+                                Err(e) => {
+                                    error!("Worker 1 error fetching backlog from DB: {e}");
+                                    tokio::time::sleep(Duration::from_secs(2)).await;
+                                    (None, "")
+                                }
+                            }
+                        }
+                    };
+
+                    let job = match job {
+                        Some(j) => j,
+                        None => {
+                            drop(permit);
+                            continue;
+                        }
+                    };
+
+                    info!(
+                        source = %source,
+                        job_id = %job.id,
+                        asset_id = %job.asset_id,
+                        file = %job.file_name,
+                        "Worker 1 picked up thumbnail job"
+                    );
 
                     let pool = pool.clone();
                     let storage_root = storage_root.clone();
@@ -294,7 +395,6 @@ impl QueueService {
                             .join(shard_1)
                             .join(shard_2);
 
-                        // Ensure the nested directories exist before generating files
                         if let Err(e) = tokio::fs::create_dir_all(&target_shard_dir).await {
                             error!("Failed creating shard directory {:?} for {}: {}", target_shard_dir, user_id, e);
                             let _ = JobRepo::mark_failed(&pool, job_id, &e.to_string()).await;
@@ -342,10 +442,12 @@ impl QueueService {
                             }
                         };
 
-                        // 3. Commit base asset (stores derivatives.thumb_path which now contains "a1/b2/...")
+                        // 3. Commit base asset
                         match Self::commit_base_asset(&pool, &job, derivatives).await {
                             Ok(thumb_path) => {
                                 let _ = JobRepo::mark_thumb_done(&pool, job_id, ai_enabled).await;
+
+                                info!(asset_id = %job.asset_id, "Stage 1 (Thumbnails) complete");
 
                                 let _ = tx_events.send(WsMediaEvent::AssetReady {
                                     asset_id: job.asset_id,
@@ -381,11 +483,15 @@ impl QueueService {
                             ai_job.thumb_done = true;
                             ai_job.current_stage = "ai_enrichment".to_string();
 
-                            let _ = tokio::time::timeout(
-                                std::time::Duration::from_secs(5),
-                                ai_tx.send(ai_job),
-                            )
-                            .await;
+                            match tokio::time::timeout(Duration::from_secs(3), ai_tx.send(ai_job)).await {
+                                Ok(Ok(())) => {},
+                                Ok(Err(_)) => {
+                                    error!(asset_id = %asset_id, "ai_tx channel is closed");
+                                }
+                                Err(_) => {
+                                    warn!(asset_id = %asset_id, "ai_tx channel full; job left for DB backlog pull");
+                                }
+                            }
                         }
                     });
                 }
@@ -404,12 +510,44 @@ impl QueueService {
             let mut pause_rx = pause_rx.clone();
 
             tokio::spawn(async move {
-                while let Some(job) = ai_rx.recv().await {
+                info!("Worker 2 (AI Enrichment) active: listening to ai_rx and polling DB backlog");
+
+                loop {
+                    // Acquire job: prefer in-memory channel, fallback to DB backlog
+                    let (job, source) = tokio::select! {
+                        biased;
+                        Some(j) = ai_rx.recv() => (Some(j), "PUSH"),
+                        else => {
+                            if !config_ai.enabled {
+                                tokio::time::sleep(Duration::from_secs(5)).await;
+                                (None, "")
+                            } else {
+                                match JobRepo::fetch_next_pending_for_stage(&pool, "ai_enrichment").await {
+                                    Ok(Some(db_job)) => (Some(db_job), "DB BACKLOG"),
+                                    Ok(None) => {
+                                        tokio::time::sleep(Duration::from_millis(500)).await;
+                                        (None, "")
+                                    }
+                                    Err(e) => {
+                                        error!("Worker 2 error fetching backlog from DB: {e}");
+                                        tokio::time::sleep(Duration::from_secs(2)).await;
+                                        (None, "")
+                                    }
+                                }
+                            }
+                        }
+                    };
+
+                    let job = match job {
+                        Some(j) => j,
+                        None => continue,
+                    };
+
                     let job_id = job.id;
                     let asset_id = job.asset_id;
                     let user_id = job.user_id;
 
-                    // 1. If AI is globally disabled, skip entirely and leave checkpoints as false
+                    // 1. If AI is globally disabled, leave checkpoints as false
                     if !config_ai.enabled {
                         info!(asset_id = %asset_id, "AI globally disabled: leaving enrichment pending");
                         let _ = sqlx::query(
@@ -420,6 +558,13 @@ impl QueueService {
                         .await;
                         continue;
                     }
+
+                    info!(
+                        source = %source,
+                        job_id = %job_id,
+                        asset_id = %asset_id,
+                        "Worker 2 picked up AI enrichment job"
+                    );
 
                     // 2. Identify remaining work based on config toggles AND boolean job checkpoints
                     let need_faces = config_ai.enable_faces && !job.ai_faces_done;
@@ -554,7 +699,7 @@ impl QueueService {
                     let detected_faces_count = ai_result.detected_faces.len();
                     let tags_count = ai_result.tags.len();
 
-                    // Persist enriched metadata (PostgreSQL automatically writes to assets.clip_embedding and HNSW index)
+                    // Persist enriched metadata
                     if let Err(e) = Self::commit_ai_enrichment(&pool, &job, ai_result).await {
                         warn!("Failed persisting AI metadata for {}: {}", job.asset_id, e);
                     }
@@ -590,7 +735,12 @@ impl QueueService {
                         tags_count,
                     });
 
-                    info!(id = %job.asset_id, user_id = %job.user_id, "Granular AI sub-tasks executed and committed");
+                    info!(
+                        asset_id = %job.asset_id,
+                        faces = detected_faces_count,
+                        tags = tags_count,
+                        "Stage 2 (AI Enrichment) complete"
+                    );
                 }
             });
         }

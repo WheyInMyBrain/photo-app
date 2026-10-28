@@ -172,62 +172,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         LinkIngestService::run_worker_loop(ingest_state).await;
     });
 
-    // =========================================================================
-    // 4. PostgreSQL Startup Recovery: Reclaim stalled jobs & refill channels
-    // =========================================================================
     {
         let pool_rec = worker_pool.clone();
-        if let Ok(reclaimed) = db::JobRepo::reclaim_stalled_jobs(&pool_rec, 15).await {
-            if reclaimed > 0 {
-                info!("Startup recovery: Reclaimed {} stalled background jobs", reclaimed);
+        match db::JobRepo::reclaim_stalled_jobs(&pool_rec, 15).await {
+            Ok(reclaimed) if reclaimed > 0 => {
+                info!("Startup recovery: Reclaimed {} stalled background jobs back to pending", reclaimed);
             }
-        }
-
-        // 1. Assemble jobs
-        let pool_a = worker_pool.clone();
-        let a_tx = assemble_tx.clone();
-        tokio::spawn(async move {
-            if let Ok(jobs) = db::JobRepo::recover_uncompleted_jobs(&pool_a, "assemble").await {
-                info!("Startup recovery: Refilling {} assemble jobs", jobs.len());
-                for job in jobs {
-                    if a_tx.send(job).await.is_err() {
-                        tracing::warn!("assemble channel closed during recovery");
-                        break;
-                    }
-                }
+            Ok(_) => {}
+            Err(e) => {
+                tracing::warn!("Failed reclaiming stalled jobs during startup: {e}");
             }
-        });
-
-        // 2. Thumbnail jobs
-        let pool_t = worker_pool.clone();
-        let t_tx = thumb_tx.clone();
-        tokio::spawn(async move {
-            if let Ok(jobs) = db::JobRepo::recover_uncompleted_jobs(&pool_t, "thumbnail").await {
-                info!("Startup recovery: Refilling {} thumbnail jobs", jobs.len());
-                for job in jobs {
-                    if t_tx.send(job).await.is_err() {
-                        tracing::warn!("thumbnail channel closed during recovery");
-                        break;
-                    }
-                }
-            }
-        });
-
-        // 3. AI Enrichment jobs
-        if state.config.ai.enabled {
-            let pool_ai = worker_pool.clone();
-            let ai_tx_init = ai_tx.clone();
-            tokio::spawn(async move {
-                if let Ok(jobs) = db::JobRepo::recover_uncompleted_jobs(&pool_ai, "ai_enrichment").await {
-                    info!("Startup recovery: Refilling {} AI enrichment jobs", jobs.len());
-                    for job in jobs {
-                        if ai_tx_init.send(job).await.is_err() {
-                            tracing::warn!("AI channel closed during recovery");
-                            break;
-                        }
-                    }
-                }
-            });
         }
     }
 
