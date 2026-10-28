@@ -9,6 +9,7 @@ use media_downloader::{
 use media_processing::StorageService;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::Semaphore;
 use tracing::{error, info, warn};
 use uuid::Uuid;
@@ -313,11 +314,13 @@ pub async fn execute_item_downloads(
 
     let sanitized_folder = StorageService::sanitize_folder_path(target_folder);
     let temp_download_dir = state.config.storage_root.join("temp").join("downloads");
+    
     tokio::fs::create_dir_all(&temp_download_dir)
         .await
         .map_err(|e| AppError::Internal(format!("Failed creating temp dir: {e}")))?;
 
-    let known_downloaded_posts: HashSet<String> = if platform == "instagram" {
+    // Fetch existing post IDs to prevent duplicate work
+    let known_downloaded_posts: HashSet<String> = if platform.eq_ignore_ascii_case("instagram") {
         let downloaded_from_scrapes: Vec<String> = sqlx::query_scalar(
             r#"
             SELECT sp.external_post_id 
@@ -357,29 +360,42 @@ pub async fn execute_item_downloads(
     };
 
     info!(
-        total_candidates = items.len(),
-        already_downloaded = known_downloaded_posts.len(),
+        candidates = items.len(),
+        cached_count = known_downloaded_posts.len(),
         platform = %platform,
-        "Starting download execution queue"
+        folder = %sanitized_folder,
+        "Initiating download queue"
     );
 
     let download_sem = Arc::new(Semaphore::new(4));
     let mut tasks = Vec::with_capacity(items.len());
+    let mut results = Vec::with_capacity(items.len());
 
     for item in items {
-        if let Some(ref post_url) = item.source_post_url {
-            let code_opt = post_url
-                .split("/p/")
+        // Parse Instagram shortcode for deduplication check
+        let shortcode = item.source_post_url.as_deref().and_then(|url| {
+            url.split("/p/")
                 .nth(1)
-                .or_else(|| post_url.split("/reel/").nth(1))
-                .or_else(|| post_url.split("/reels/").nth(1))
-                .and_then(|s| s.split('/').next());
+                .or_else(|| url.split("/reel/").nth(1))
+                .or_else(|| url.split("/reels/").nth(1))
+                .and_then(|s| s.split('/').next())
+        });
 
-            if let Some(code) = code_opt {
-                if known_downloaded_posts.contains(code) {
-                    info!(shortcode = %code, "Skipping already downloaded post");
-                    continue;
-                }
+        if let Some(code) = shortcode {
+            if known_downloaded_posts.contains(code) {
+                info!(
+                    shortcode = %code,
+                    source_url = ?item.source_post_url,
+                    "Skipping duplicate: post already downloaded and processed"
+                );
+                results.push(UploadItemResult {
+                    file_name: item.suggested_filename,
+                    status: "skipped".to_string(),
+                    id: None,
+                    relative_path: None,
+                    message: Some(format!("Post shortcode '{code}' has already been downloaded")),
+                });
+                continue;
             }
         }
 
@@ -391,9 +407,20 @@ pub async fn execute_item_downloads(
         let platform_str = platform.to_string();
 
         tasks.push(tokio::spawn(async move {
-            let _guard = permit.acquire().await.ok();
+            let _guard = match permit.acquire().await {
+                Ok(guard) => guard,
+                Err(_) => {
+                    return UploadItemResult {
+                        file_name: item.suggested_filename.clone(),
+                        status: "error".to_string(),
+                        id: None,
+                        relative_path: None,
+                        message: Some("Download semaphore closed".to_string()),
+                    };
+                }
+            };
 
-            // Guard against empty suggested filename
+            // Ensure valid filename with proper fallback extension
             let resolved_filename = if item.suggested_filename.trim().is_empty() {
                 let ext = if item.media_type == "video" { "mp4" } else { "jpg" };
                 format!("{}.{}", Uuid::new_v4(), ext)
@@ -403,17 +430,12 @@ pub async fn execute_item_downloads(
 
             let temp_file_path = temp_download_dir.join(format!("{}_{}", Uuid::new_v4(), resolved_filename));
 
-            // Dynamic referer: if media is on redgifs.com, use redgifs referer to prevent 403 hotlink blocks
+            // Select referer strategy
             let lower_cdn = item.high_res_url.to_lowercase();
             let referer = if lower_cdn.contains("redgifs.com") {
-                // RedGIFs CDN strictly forbids foreign referers like instagram.com or reddit.com
                 None
             } else if let Some(ref r) = item.referer {
-                if r.trim().is_empty() {
-                    None
-                } else {
-                    Some(r.as_str())
-                }
+                if r.trim().is_empty() { None } else { Some(r.as_str()) }
             } else {
                 match platform_str.as_str() {
                     "instagram" => Some("https://www.instagram.com/"),
@@ -421,6 +443,12 @@ pub async fn execute_item_downloads(
                     _ => None,
                 }
             };
+
+            info!(
+                file = %resolved_filename,
+                url = %item.high_res_url,
+                "Downloading media"
+            );
 
             if let Err(e) = download_media(
                 &item.high_res_url,
@@ -431,11 +459,10 @@ pub async fn execute_item_downloads(
             .await
             {
                 error!(
-                    url = %item.high_res_url,
-                    referer = ?referer,
                     file = %resolved_filename,
+                    url = %item.high_res_url,
                     error = %e,
-                    "Download failed in worker queue"
+                    "Download failed"
                 );
                 let _ = tokio::fs::remove_file(&temp_file_path).await;
                 return UploadItemResult {
@@ -447,7 +474,7 @@ pub async fn execute_item_downloads(
                 };
             }
 
-            // Fetch DB context with native Uuid parsing
+            // Hydrate DB context if available
             let scraped_item_uuid = Uuid::parse_str(&item.id).ok();
             let ctx = match scraped_item_uuid {
                 Some(uid) => ScrapesRepo::get_item_context(&state.db, uid).await.unwrap_or(None),
@@ -458,7 +485,9 @@ pub async fn execute_item_downloads(
             let author = ctx.as_ref().map(|c| c.author.clone());
 
             let caption = item.caption.clone().or_else(|| ctx.as_ref().and_then(|c| c.caption.clone()));
-            let published_at = item.published_at.clone().or_else(|| ctx.as_ref().and_then(|c| c.published_at.map(|d| d.to_rfc3339())));
+            let published_at = item.published_at.clone().or_else(|| {
+                ctx.as_ref().and_then(|c| c.published_at.map(|d| d.to_rfc3339()))
+            });
             let location_name = item.location_name.clone().or_else(|| ctx.as_ref().and_then(|c| c.location_name.clone()));
             let latitude = item.latitude.or_else(|| ctx.as_ref().and_then(|c| c.latitude));
             let longitude = item.longitude.or_else(|| ctx.as_ref().and_then(|c| c.longitude));
@@ -496,7 +525,7 @@ pub async fn execute_item_downloads(
             let final_disk_path = match inject_metadata(&temp_file_path, &meta_payload).await {
                 Ok(new_path) => new_path,
                 Err(err) => {
-                    warn!(file = %resolved_filename, error = %err, "Metadata injection skipped");
+                    warn!(file = %resolved_filename, error = %err, "Metadata injection failed, using original file");
                     temp_file_path.clone()
                 }
             };
@@ -514,10 +543,10 @@ pub async fn execute_item_downloads(
                 .unwrap_or(resolved_filename.clone());
 
             let asset_id = Uuid::new_v4();
-            let file_size_bytes = match tokio::fs::metadata(&final_disk_path).await {
-                Ok(m) => m.len() as i64,
-                Err(_) => 0,
-            };
+            let file_size_bytes = tokio::fs::metadata(&final_disk_path)
+                .await
+                .map(|m| m.len() as i64)
+                .unwrap_or(0);
 
             let job_payload = JobPayload {
                 author,
@@ -553,42 +582,73 @@ pub async fn execute_item_downloads(
             };
 
             if let Err(e) = JobRepo::enqueue_with_status(&state.db, &job, "pending", None).await {
-                error!(file = %resolved_filename, error = %e, "Failed to enqueue assemble job into database");
+                error!(file = %resolved_filename, error = %e, "Failed to persist assemble job to database");
                 let _ = tokio::fs::remove_file(&job.disk_path).await;
-                UploadItemResult {
+                return UploadItemResult {
                     file_name: resolved_filename,
                     status: "error".to_string(),
                     id: None,
                     relative_path: None,
-                    message: Some(format!("Failed to enqueue assemble job: {e}")),
-                }
-            } else {
-                let _ = state.channels.assemble_tx.send(job).await;
+                    message: Some(format!("Database queue error: {e}")),
+                };
+            }
 
-                UploadItemResult {
-                    file_name: resolved_filename,
-                    status: "queued".to_string(),
-                    id: Some(asset_id.to_string()),
-                    relative_path: None,
-                    message: Some("Queued for assemble & derivative processing".to_string()),
+            // Dispatch job with timeout protection against stalled workers
+            match tokio::time::timeout(Duration::from_secs(10), state.channels.assemble_tx.send(job)).await {
+                Ok(Ok(())) => {
+                    info!(file = %resolved_filename, asset_id = %asset_id, "Successfully queued for processing");
+                    UploadItemResult {
+                        file_name: resolved_filename,
+                        status: "queued".to_string(),
+                        id: Some(asset_id.to_string()),
+                        relative_path: None,
+                        message: Some("Queued for assemble & derivative processing".to_string()),
+                    }
+                }
+                Ok(Err(_)) => {
+                    error!(file = %resolved_filename, "Assemble receiver channel closed");
+                    UploadItemResult {
+                        file_name: resolved_filename,
+                        status: "error".to_string(),
+                        id: None,
+                        relative_path: None,
+                        message: Some("Processing channel disconnected".to_string()),
+                    }
+                }
+                Err(_) => {
+                    error!(file = %resolved_filename, "Timed out dispatching to assemble channel");
+                    UploadItemResult {
+                        file_name: resolved_filename,
+                        status: "error".to_string(),
+                        id: None,
+                        relative_path: None,
+                        message: Some("Queue channel dispatch timed out".to_string()),
+                    }
                 }
             }
         }));
     }
 
-    let mut results = Vec::with_capacity(tasks.len());
     for task in tasks {
-        if let Ok(res) = task.await {
-            results.push(res);
+        match task.await {
+            Ok(res) => results.push(res),
+            Err(e) => {
+                error!(error = %e, "Download worker task panicked or aborted");
+            }
         }
     }
 
     let success_count = results.iter().filter(|r| r.status == "queued").count();
+    let skipped_count = results.iter().filter(|r| r.status == "skipped").count();
+    let error_count = results.iter().filter(|r| r.status == "error").count();
+
     info!(
-        total_attempted = results.len(),
-        queued_for_processing = success_count,
+        total = results.len(),
+        queued = success_count,
+        skipped = skipped_count,
+        failed = error_count,
         folder = %sanitized_folder,
-        "Batch download dispatch complete"
+        "Batch execution finished"
     );
 
     Ok(BatchUploadReceipt {
