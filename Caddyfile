@@ -1,8 +1,9 @@
 (app_routes) {
-    # 0. Kasm Chrome VNC Web GUI & WebSockets
-    handle /browser* {
-        reverse_proxy chrome:6901 {
+    # 0. Kasm Chrome VNC GUI & WebSockets
+    handle_path /browser* {
+        reverse_proxy https://chrome:6901 {
             transport http {
+                tls
                 tls_insecure_skip_verify
             }
         }
@@ -49,4 +50,13 @@
     handle {
         reverse_proxy frontend:3000
     }
+}
+
+:80 {
+    import app_routes
+}
+
+:443 {
+    tls /etc/ssl/server.crt /etc/ssl/server.key
+    import app_routes
 }

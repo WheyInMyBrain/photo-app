@@ -78,11 +78,11 @@ services:
     restart: unless-stopped
     shm_size: '2gb'
     environment:
-      - VNC_PW=password123
+      - KASM_SVC_NO_AUTH=1
       - APP_ARGS=--remote-debugging-port=9222 --remote-debugging-address=0.0.0.0
     volumes:
-      # Kasm runs as user kasm-user; persistent profile maps here
       - ./storage/chrome-profile:/home/kasm-user/.config/google-chrome
+    expose:
+      - "6901"
     ports:
-      - "4002:6901"
       - "9222:9222"

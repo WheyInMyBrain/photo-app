@@ -250,7 +250,7 @@
     >
       <slot />
 
-      <!-- Quick Upload Button (Floating at bottom-right, hides on scroll down) -->
+      <!-- Quick Upload Button -->
       <button
         type="button"
         on:click={() => modalStore.openUpload()}
@@ -267,11 +267,11 @@
 
     <!-- Fullscreen Cloud Browser Modal -->
     {#if showBrowserModal}
-      <div class="fixed inset-0 z-50 bg-black flex flex-col animate-in fade-in duration-200">
+      <div class="fixed inset-0 z-50 bg-black flex flex-col">
         <!-- Top Toolbar -->
         <header class="h-10 bg-[var(--bg-primary,#121216)] border-b border-[var(--border-subtle,rgba(255,255,255,0.1))] px-4 flex items-center justify-between z-10 select-none">
           <div class="flex items-center gap-2">
-            <svg xmlns="http://www.w3.org/2000/svg" class="w-4 h-4 text-purple-400" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <svg xmlns="http://www.w3.org/2000/svg" class="w-4 h-4 text-purple-400 stroke-purple-400" viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
               <circle cx="12" cy="12" r="10"></circle>
               <line x1="2" y1="12" x2="22" y2="12"></line>
               <path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"></path>
