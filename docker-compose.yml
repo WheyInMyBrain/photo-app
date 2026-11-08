@@ -78,8 +78,6 @@ services:
     restart: unless-stopped
     shm_size: '2gb'
     environment:
-      - KASM_SVC_USER=0
-      - KASM_SVC_NO_AUTH=1
       - VNC_PW=
       - KASM_SUBPATH=browser
       - APP_ARGS=--remote-debugging-port=9222 --remote-debugging-address=0.0.0.0

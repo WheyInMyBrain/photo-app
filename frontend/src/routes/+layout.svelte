@@ -291,7 +291,7 @@
         <!-- Kasm Chrome Iframe -->
         <div class="flex-1 w-full h-[calc(100%-2.5rem)] relative bg-black">
           <iframe
-            src="/browser/vnc.html?autoconnect=true&password=&path=browser/websockify"
+            src="/browser/vnc.html?autoconnect=true&password=1&path=browser/websockify"
             title="Cloud Browser Session"
             class="w-full h-full border-none"
             allow="clipboard-read; clipboard-write; fullscreen; autoplay"
