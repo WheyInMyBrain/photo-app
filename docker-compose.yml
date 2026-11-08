@@ -79,7 +79,7 @@ services:
     shm_size: '2gb'
     environment:
       - VNC_PW=password123
-      - KASM_SUBPATH=browser/
+      - KASM_SUBPATH=browser
       - APP_ARGS=--remote-debugging-port=9222 --remote-debugging-address=0.0.0.0
     volumes:
       - ./storage/chrome-profile:/home/kasm-user/.config/google-chrome
