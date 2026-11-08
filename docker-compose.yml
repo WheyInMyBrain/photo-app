@@ -78,7 +78,7 @@ services:
     restart: unless-stopped
     shm_size: '2gb'
     environment:
-      - KASM_SVC_NO_AUTH=1
+      - VNC_PW=password123
       - APP_ARGS=--remote-debugging-port=9222 --remote-debugging-address=0.0.0.0
     volumes:
       - ./storage/chrome-profile:/home/kasm-user/.config/google-chrome
