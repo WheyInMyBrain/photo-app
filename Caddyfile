@@ -1,6 +1,6 @@
 (app_routes) {
-    # 0. Kasm Chrome VNC GUI & WebSockets
-    handle_path /browser* {
+    # 0. Kasm Chrome VNC GUI & WebSockets (Preserve /browser path)
+    handle /browser* {
         reverse_proxy https://chrome:6901 {
             transport http {
                 tls
