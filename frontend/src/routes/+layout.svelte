@@ -20,6 +20,7 @@
   import PlacesMapModal from '$lib/components/PlacesMapModal.svelte';
 
   let isSidebarOpen = false;
+  let showBrowserModal = false;
   let isDraggingOverWindow = false;
   let droppedFiles: File[] = [];
 
@@ -157,7 +158,7 @@
     }
   }
 
-  $: if (browser && $authStore.isAuthenticated &&$filterQueryString !== undefined) {
+  $: if (browser && $authStore.isAuthenticated && $filterQueryString !== undefined) {
     filterOptionsStore.scheduleRefresh($filterQueryString);
   }
 
@@ -190,6 +191,10 @@
       isOpen={isSidebarOpen}
       on:close={() => (isSidebarOpen = false)}
       on:openPeople={() => modalStore.openPeople()}
+      on:openBrowser={() => {
+        isSidebarOpen = false;
+        showBrowserModal = true;
+      }}
     />
 
     <!-- Top Left Sidebar Trigger Button (Hides on Scroll Down) -->
@@ -259,6 +264,42 @@
         </svg>
       </button>
     </main>
+
+    <!-- Fullscreen Cloud Browser Modal -->
+    {#if showBrowserModal}
+      <div class="fixed inset-0 z-50 bg-black flex flex-col animate-in fade-in duration-200">
+        <!-- Top Toolbar -->
+        <header class="h-10 bg-[var(--bg-primary,#121216)] border-b border-[var(--border-subtle,rgba(255,255,255,0.1))] px-4 flex items-center justify-between z-10 select-none">
+          <div class="flex items-center gap-2">
+            <svg xmlns="http://www.w3.org/2000/svg" class="w-4 h-4 text-purple-400" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <circle cx="12" cy="12" r="10"></circle>
+              <line x1="2" y1="12" x2="22" y2="12"></line>
+              <path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"></path>
+            </svg>
+            <span class="text-xs font-semibold tracking-tight text-[var(--text-main,#fff)]">Cloud Browser</span>
+          </div>
+
+          <button
+            type="button"
+            on:click={() => (showBrowserModal = false)}
+            class="px-2.5 py-1 text-xs rounded-lg bg-white/10 hover:bg-white/20 text-white transition-colors cursor-pointer"
+          >
+            Close
+          </button>
+        </header>
+
+        <!-- Kasm Chrome Iframe -->
+        <div class="flex-1 w-full h-[calc(100%-2.5rem)] relative bg-black">
+          <iframe
+            src="/browser/"
+            title="Cloud Browser Session"
+            class="w-full h-full border-none"
+            allow="clipboard-read; clipboard-write; fullscreen; autoplay"
+            allowfullscreen
+          ></iframe>
+        </div>
+      </div>
+    {/if}
 
     <!-- Window Drag-and-Drop Overlay -->
     {#if isDraggingOverWindow}

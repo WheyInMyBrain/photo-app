@@ -11,6 +11,7 @@
   const dispatch = createEventDispatcher<{
     close: void;
     openPeople: void;
+    openBrowser: void;
   }>();
 
   $: filters = $filterOptionsStore;
@@ -422,6 +423,28 @@
 
   <!-- Drawer Footer Actions -->
   <div class="pt-3 space-y-2 border-t border-[var(--border-glass)]">
+    <!-- Web Browser (Kasm) Trigger -->
+    <button
+      type="button"
+      on:click={() => {
+        dispatch('close');
+        dispatch('openBrowser');
+      }}
+      class="liquid-card w-full py-2 px-3 text-xs rounded-xl flex items-center justify-between text-[var(--text-muted)] hover:text-[var(--text-main)] transition-all spring-tap cursor-pointer"
+    >
+      <span class="flex items-center gap-2">
+        <svg xmlns="http://www.w3.org/2000/svg" class="w-3.5 h-3.5 text-purple-400 stroke-purple-400" viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <circle cx="12" cy="12" r="10"></circle>
+          <line x1="2" y1="12" x2="22" y2="12"></line>
+          <path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"></path>
+        </svg>
+        <span class="font-medium text-[var(--text-main)]">Web Browser</span>
+      </span>
+      <svg xmlns="http://www.w3.org/2000/svg" class="w-3 h-3 opacity-50" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <polyline points="9 18 15 12 9 6"></polyline>
+      </svg>
+    </button>
+
     <!-- Manage People Modal Trigger -->
     <button
       type="button"
