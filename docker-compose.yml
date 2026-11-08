@@ -80,6 +80,7 @@ services:
     environment:
       - VNC_USER=kasm_user
       - VNC_PW=password123
+      - VNCOPTIONS=-disableBasicAuth
       - KASM_SUBPATH=browser
       - APP_ARGS=--remote-debugging-port=9222 --remote-debugging-address=0.0.0.0
     volumes:
