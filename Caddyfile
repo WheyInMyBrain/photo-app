@@ -3,6 +3,7 @@
     handle /browser* {
         reverse_proxy https://chrome:6901 {
             header_up Host {upstream_hostport}
+            header_up Authorization "Basic a2FzbV91c2VyOnBhc3N3b3JkMTIz"
             transport http {
                 tls
                 tls_insecure_skip_verify
